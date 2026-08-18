@@ -1,13 +1,20 @@
 'use strict';
 
 /* ============================================================
-   State
+   Grok Gateway Console · v2
+   ----------------------------------------------------------
+   Vanilla JS, no frameworks. Communicates with the Go backend
+   via /api/* endpoints. Renders everything client-side.
    ============================================================ */
+
+/* ----------------- State ----------------- */
 const state = {
-  gateways: {},        // id -> GatewayConfig
+  gateways: {},          // id -> GatewayConfig
   listenAddr: '',
   metrics: null,
-  logs: [],
+  logs: [],              // current log list (logs view)
+  recentLogs: [],        // last 12 logs (overview side panel)
+  sparkSeries: [],       // last 30 logs oldest→newest, used for sparklines
   logsOffset: 0,
   logsLimit: 50,
   range: '1h',
@@ -15,13 +22,13 @@ const state = {
   drawerLog: null,
   drawerTab: 'request-compare',
   pollTimer: null,
+  cmdkSelected: 0,
+  cmdkItems: [],
 };
 
 const GW_ORDER = ['oc', 'st', 've'];
 
-/* ============================================================
-   Helpers
-   ============================================================ */
+/* ----------------- Helpers ----------------- */
 function $(sel, root) { return (root || document).querySelector(sel); }
 function $all(sel, root) { return Array.from((root || document).querySelectorAll(sel)); }
 
@@ -29,63 +36,78 @@ function fmtNum(n) {
   if (n === null || n === undefined) return '—';
   return Number(n).toLocaleString('en-US');
 }
-
 function fmtPct(n) {
   if (n === null || n === undefined) return '—';
   return n.toFixed(1) + '%';
 }
-
 function fmtMs(ms) {
   if (ms === null || ms === undefined) return '—';
   if (ms < 1000) return ms + 'ms';
   return (ms / 1000).toFixed(2) + 's';
 }
-
 function fmtTime(iso) {
   if (!iso) return '—';
   const d = new Date(iso);
   if (isNaN(d.getTime())) return iso;
   return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 }
-
 function fmtTimeShort(iso) {
   if (!iso) return '—';
   const d = new Date(iso);
   if (isNaN(d.getTime())) return iso;
   return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 }
+function escapeHtml(str) {
+  return String(str == null ? '' : str).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function escapeAttr(str) { return escapeHtml(str); }
 
 function rangeToFrom(range) {
   const now = new Date();
   if (range === '1h') return new Date(now.getTime() - 60 * 60 * 1000);
   if (range === '24h') return new Date(now.getTime() - 24 * 60 * 60 * 1000);
   if (range === '7d') return new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-  return null; // all
+  return null;
 }
 
-function showToast(message, isError) {
-  const el = $('#toast');
-  el.textContent = message;
-  el.classList.toggle('is-error', !!isError);
-  el.classList.add('is-show');
-  clearTimeout(showToast._t);
-  showToast._t = setTimeout(() => el.classList.remove('is-show'), 2600);
+function rangeLabel(range) {
+  return ({ '1h': '1小时', '24h': '24小时', '7d': '7天', 'all': '全部' })[range] || range;
 }
 
+/* ----------------- API client ----------------- */
 async function api(path, opts) {
   const res = await fetch('/api' + path, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts));
   let body = null;
   try { body = await res.json(); } catch (e) { /* no body */ }
   if (!res.ok) {
-    const msg = (body && body.error && body.error.message) || res.statusText;
+    const msg = (body && body.error && body.error.message) || res.statusText || ('HTTP ' + res.status);
     throw new Error(msg);
   }
   return body;
 }
 
-/* ============================================================
-   View switching
-   ============================================================ */
+/* ----------------- Toast stack ----------------- */
+const toastIcons = {
+  success: '<svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><path d="M3.5 8.5l3 3 6-6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  error: '<svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>',
+  info: '<svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><path d="M8 5.5v6M8 3.5v.01" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/></svg>',
+};
+
+function showToast(message, kind) {
+  const stack = $('#toastStack');
+  if (!stack) return;
+  const t = document.createElement('div');
+  t.className = 'toast' + (kind === 'error' ? ' is-error' : '');
+  t.innerHTML = '<span class="toast-icon">' + (toastIcons[kind] || toastIcons.info) + '</span><span>' + escapeHtml(message) + '</span>';
+  stack.appendChild(t);
+  requestAnimationFrame(() => t.classList.add('is-show'));
+  setTimeout(() => {
+    t.classList.remove('is-show');
+    setTimeout(() => { if (t.parentNode) t.remove(); }, 280);
+  }, 2800);
+}
+
+/* ----------------- View switching ----------------- */
 function switchView(view) {
   state.activeView = view;
   $all('.view').forEach(el => el.classList.toggle('is-active', el.id === 'view-' + view));
@@ -93,12 +115,12 @@ function switchView(view) {
   if (view === 'logs') loadLogs(true);
   if (view === 'gateways') renderGatewayCards();
   if (view === 'setup') loadSetup();
+  closeCmdk();
 }
 
 $all('.rail-nav-item').forEach(btn => {
   btn.addEventListener('click', () => switchView(btn.dataset.view));
 });
-
 $all('[data-goto]').forEach(btn => {
   btn.addEventListener('click', () => switchView(btn.dataset.goto));
 });
@@ -112,19 +134,21 @@ async function loadConfig() {
   state.listenAddr = data.listen_addr || '';
   $('#listenAddr').textContent = state.listenAddr || '—';
   const sel = $('#filterGateway');
-  sel.innerHTML = '<option value="">全部网关</option>';
-  GW_ORDER.forEach(id => {
-    const gw = state.gateways[id];
-    if (!gw) return;
-    const opt = document.createElement('option');
-    opt.value = id;
-    opt.textContent = gw.name + ' (' + gw.prefix + ')';
-    sel.appendChild(opt);
-  });
+  if (sel) {
+    sel.innerHTML = '<option value="">全部网关</option>';
+    GW_ORDER.forEach(id => {
+      const gw = state.gateways[id];
+      if (!gw) return;
+      const opt = document.createElement('option');
+      opt.value = id;
+      opt.textContent = gw.name + ' (' + gw.prefix + ')';
+      sel.appendChild(opt);
+    });
+  }
 }
 
 /* ============================================================
-   Overview: metrics + gateway pulses + recent logs
+   Overview: metrics + sparklines + gateway pulses + recent logs
    ============================================================ */
 function metricsQuery(extra) {
   const params = new URLSearchParams();
@@ -135,7 +159,8 @@ function metricsQuery(extra) {
 }
 
 async function loadOverview() {
-  await Promise.all([loadMetrics(), loadGatewayPulses(), loadRecentLogs()]);
+  await Promise.all([loadMetrics(), loadSparkSeries(), loadGatewayPulses(), loadRecentLogs()]);
+  $('#pulseRange').textContent = rangeLabel(state.range);
 }
 
 async function loadMetrics() {
@@ -144,7 +169,7 @@ async function loadMetrics() {
     state.metrics = m;
     renderMetrics(m);
   } catch (e) {
-    showToast('加载指标失败: ' + e.message, true);
+    showToast('加载指标失败: ' + e.message, 'error');
   }
 }
 
@@ -156,10 +181,10 @@ function renderMetrics(m) {
   $('#statSuccess').textContent = successRate === null ? '—' : fmtPct(successRate);
   $('#statSuccessSub').textContent = fmtNum(m.successes) + ' / ' + fmtNum(m.requests);
 
-  $('#statCacheHit').textContent = m.cache_hit_rate === null || m.cache_hit_rate === undefined ? '—' : fmtPct(m.cache_hit_rate);
+  $('#statCacheHit').textContent = (m.cache_hit_rate === null || m.cache_hit_rate === undefined) ? '—' : fmtPct(m.cache_hit_rate);
   $('#statCacheHitSub').textContent = fmtNum(m.cache_read_tokens) + ' 读取 tok';
 
-  $('#statCacheCoverage').textContent = m.cache_coverage_percent === null || m.cache_coverage_percent === undefined ? '—' : fmtPct(m.cache_coverage_percent);
+  $('#statCacheCoverage').textContent = (m.cache_coverage_percent === null || m.cache_coverage_percent === undefined) ? '—' : fmtPct(m.cache_coverage_percent);
   $('#statCacheCoverageSub').textContent = fmtNum(m.cache_supported_calls) + ' / ' + fmtNum(m.usage_calls) + ' 次调用';
 
   $('#statTokens').textContent = fmtNum(m.input_tokens) + ' / ' + fmtNum(m.output_tokens);
@@ -169,6 +194,69 @@ function renderMetrics(m) {
   $('#statReasoningSub').textContent = 'cache write ' + fmtNum(m.cache_write_tokens);
 }
 
+/* ----------------- Sparklines ----------------- */
+async function loadSparkSeries() {
+  try {
+    const data = await api('/logs?limit=30');
+    state.sparkSeries = (data.items || []).slice().reverse(); // oldest -> newest
+    renderSparklines();
+  } catch (e) { /* silent */ }
+}
+
+function sparkline(svg, values) {
+  const W = 100, H = 28;
+  const pad = 3;
+  if (!values.length) {
+    svg.innerHTML = '';
+    return;
+  }
+  const max = Math.max.apply(null, values);
+  const min = Math.min.apply(null, values);
+  const range = (max - min) || 1;
+  const n = values.length;
+  const points = values.map((v, i) => {
+    const x = n === 1 ? W / 2 : (i / (n - 1)) * (W - 2 * pad) + pad;
+    const y = H - pad - ((v - min) / range) * (H - 2 * pad);
+    return [x, y];
+  });
+  const linePath = 'M' + points.map(p => p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' L');
+  const areaPath = linePath + ' L' + points[points.length - 1][0].toFixed(1) + ' ' + H + ' L' + points[0][0].toFixed(1) + ' ' + H + ' Z';
+  const gid = 'spark-grad-' + Math.random().toString(36).slice(2, 8);
+  svg.innerHTML =
+    '<defs><linearGradient id="' + gid + '" x1="0" y1="0" x2="0" y2="1">' +
+      '<stop offset="0%" stop-color="#4FE2C0" stop-opacity="0.45"/>' +
+      '<stop offset="100%" stop-color="#4FE2C0" stop-opacity="0"/>' +
+    '</linearGradient></defs>' +
+    '<path class="spark-area" d="' + areaPath + '"/>' +
+    '<path class="spark-fill" d="' + areaPath + '" fill="url(#' + gid + ')" stroke="none"/>' +
+    '<path class="spark-line" d="' + linePath + '"/>';
+}
+
+function renderSparklines() {
+  const logs = state.sparkSeries;
+  const reqSeries = logs.map((_, i) => i + 1);
+  const succSeries = logs.map(l => l.success ? 1 : 0);
+  const cacheHitSeries = logs.map(l => {
+    if (!l.usage) return 0;
+    if (!l.usage.cache_supported) return 0;
+    if (!l.usage.prompt_tokens) return 0;
+    return (l.usage.cache_read_tokens / l.usage.prompt_tokens) * 100;
+  });
+  const cacheCovSeries = logs.map(l => (l.usage && l.usage.cache_supported) ? 1 : 0);
+  const tokensSeries = logs.map(l => {
+    if (!l.usage) return 0;
+    return (l.usage.input_tokens || l.usage.prompt_tokens || 0) + (l.usage.output_tokens || 0);
+  });
+  const reasoningSeries = logs.map(l => (l.usage && l.usage.reasoning_tokens) || 0);
+
+  const map = { requests: reqSeries, success: succSeries, cacheHit: cacheHitSeries, cacheCoverage: cacheCovSeries, tokens: tokensSeries, reasoning: reasoningSeries };
+  $all('.stat-spark').forEach(svg => {
+    const key = svg.dataset.stat;
+    if (map[key]) sparkline(svg, map[key]);
+  });
+}
+
+/* ----------------- Gateway pulses ----------------- */
 async function loadGatewayPulses() {
   const container = $('#gatewayPulseList');
   const railContainer = $('#railChannels');
@@ -181,11 +269,13 @@ async function loadGatewayPulses() {
     let logs = [];
     try {
       const data = await api('/logs?' + new URLSearchParams({ gateway: id, limit: '40' }).toString());
-      logs = (data.items || []).slice().reverse(); // oldest -> newest for left-to-right reading
+      logs = (data.items || []).slice().reverse();
     } catch (e) { /* ignore per-gateway error */ }
 
     const successCount = logs.filter(l => l.success).length;
     const total = logs.length;
+    const totalTokens = logs.reduce((acc, l) => acc + ((l.usage && (l.usage.input_tokens || l.usage.prompt_tokens || 0)) + (l.usage && l.usage.output_tokens || 0)), 0);
+    const lastStatus = total ? (logs[total - 1].success ? 'ok' : 'err') : 'idle';
 
     // main panel row
     const row = document.createElement('div');
@@ -193,7 +283,7 @@ async function loadGatewayPulses() {
     row.innerHTML =
       '<div class="gw-pulse-top">' +
         '<span><span class="gw-pulse-name">' + escapeHtml(gw.name) + '</span><span class="gw-pulse-prefix">' + gw.prefix + '</span></span>' +
-        '<span class="gw-pulse-stat">' + (total ? successCount + '/' + total + ' 成功' : '暂无数据') + '</span>' +
+        '<span class="gw-pulse-stat">' + (total ? successCount + '/' + total + ' 成功 · ' + fmtNum(totalTokens) + ' tok' : '暂无数据') + '</span>' +
       '</div>' +
       '<div class="gw-pulse-bar">' + renderTicks(logs, 40) + '</div>';
     container.appendChild(row);
@@ -218,32 +308,39 @@ function renderTicks(logs, count) {
     if (!l) return '<span class="tick"></span>';
     const cls = l.success ? 'ok' : 'err';
     const height = 35 + Math.min(65, Math.round(((l.duration_ms || 0) / 3000) * 65));
-    return '<span class="tick ' + cls + '" style="height:' + height + '%" title="' + (l.model || '') + ' · ' + (l.status_code || '') + '"></span>';
+    return '<span class="tick ' + cls + '" style="height:' + height + '%" title="' + escapeHtml(l.model || '') + ' · ' + (l.status_code || '') + ' · ' + fmtMs(l.duration_ms) + '"></span>';
   }).join('');
 }
+
+/* ----------------- Recent logs ----------------- */
+const EMPTY_RECENT_SVG = '<svg viewBox="0 0 60 60" width="48" height="48" fill="none"><circle cx="30" cy="30" r="26" stroke="currentColor" stroke-width="1.4" stroke-dasharray="2 4"/><path d="M20 32l5 5 15-15" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
 async function loadRecentLogs() {
   const container = $('#recentLogList');
   try {
     const data = await api('/logs?limit=12');
     const items = data.items || [];
+    state.recentLogs = items;
     if (!items.length) {
-      container.innerHTML = '<div class="empty-state">暂无请求记录，等待流量接入…</div>';
+      container.innerHTML = '<div class="empty-state">' + EMPTY_RECENT_SVG + '<span>暂无请求记录，等待流量接入…</span></div>';
       return;
     }
-    container.innerHTML = items.map(l => (
-      '<div class="recent-log-item" data-id="' + l.id + '">' +
-        '<span class="rli-gw ' + '">' + (l.gateway_id || '?') + '</span>' +
-        '<span class="rli-model" title="' + escapeHtml(l.model || '') + '">' + escapeHtml(l.model || '(未知模型)') + '</span>' +
-        '<span class="rli-time">' + fmtTimeShort(l.started_at) + '</span>' +
-        '<span class="rli-status" style="background:' + (l.success ? 'var(--signal)' : 'var(--coral)') + '"></span>' +
-      '</div>'
-    )).join('');
+    container.innerHTML = items.map(l => {
+      const gwClass = l.gateway_id || '';
+      return (
+        '<div class="recent-log-item" data-id="' + l.id + '">' +
+          '<span class="rli-gw ' + gwClass + '">' + escapeHtml(l.gateway_id || '?') + '</span>' +
+          '<span class="rli-model" title="' + escapeHtml(l.model || '') + '">' + escapeHtml(l.model || '(未知模型)') + '</span>' +
+          '<span class="rli-time">' + fmtTimeShort(l.started_at) + '</span>' +
+          '<span class="rli-status" style="background:' + (l.success ? 'var(--signal)' : 'var(--coral)') + ';color:' + (l.success ? 'var(--signal)' : 'var(--coral)') + '"></span>' +
+        '</div>'
+      );
+    }).join('');
     $all('.recent-log-item', container).forEach(el => {
       el.addEventListener('click', () => openDrawer(el.dataset.id));
     });
   } catch (e) {
-    container.innerHTML = '<div class="empty-state">加载失败：' + escapeHtml(e.message) + '</div>';
+    container.innerHTML = '<div class="empty-state"><span>加载失败：' + escapeHtml(e.message) + '</span></div>';
   }
 }
 
@@ -252,6 +349,7 @@ $('#rangePicker').addEventListener('click', (e) => {
   if (!btn) return;
   state.range = btn.dataset.range;
   $all('#rangePicker button').forEach(b => b.classList.toggle('is-active', b === btn));
+  $('#pulseRange').textContent = rangeLabel(state.range);
   loadMetrics();
 });
 
@@ -267,6 +365,14 @@ function currentFilters() {
   };
 }
 
+function renderSkeletons(n) {
+  let html = '';
+  for (let i = 0; i < n; i++) {
+    html += '<tr><td colspan="8" style="padding:11px 14px;"><span class="skeleton-row" style="width:' + (50 + Math.random() * 50) + '%"></span></td></tr>';
+  }
+  return html;
+}
+
 async function loadLogs(reset) {
   if (reset) state.logsOffset = 0;
   const f = currentFilters();
@@ -278,7 +384,7 @@ async function loadLogs(reset) {
   params.set('offset', String(state.logsOffset));
 
   const tbody = $('#logTableBody');
-  if (reset) tbody.innerHTML = '<tr class="empty-row"><td colspan="8">加载中…</td></tr>';
+  if (reset) tbody.innerHTML = renderSkeletons(8);
 
   try {
     const data = await api('/logs?' + params.toString());
@@ -293,10 +399,12 @@ async function loadLogs(reset) {
   }
 }
 
+const EMPTY_LOGS_SVG = '<svg viewBox="0 0 60 60" width="44" height="44" fill="none"><rect x="10" y="10" width="40" height="40" rx="4" stroke="currentColor" stroke-width="1.4"/><path d="M16 22h28M16 30h28M16 38h18" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
+
 function renderLogTable(logs) {
   const tbody = $('#logTableBody');
   if (!logs.length) {
-    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">没有匹配的请求记录</td></tr>';
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="8"><div style="display:flex;flex-direction:column;align-items:center;gap:10px;padding:8px;">' + EMPTY_LOGS_SVG + '<span>没有匹配的请求记录</span></div></td></tr>';
     return;
   }
   tbody.innerHTML = logs.map(l => {
@@ -307,9 +415,9 @@ function renderLogTable(logs) {
     return (
       '<tr data-id="' + l.id + '">' +
         '<td>' + fmtTime(l.started_at) + '</td>' +
-        '<td><span class="gw-tag ' + gwClass + '">' + (l.gateway_name || l.gateway_id || '?') + '</span></td>' +
+        '<td><span class="gw-tag ' + gwClass + '">' + escapeHtml(l.gateway_name || l.gateway_id || '?') + '</span></td>' +
         '<td>' + escapeHtml(l.model || '—') + '</td>' +
-        '<td><span class="status-pill ' + (l.success ? 'ok' : 'err') + '">' + (l.success ? '● ' + l.status_code : '● ' + (l.status_code || '错误')) + '</span></td>' +
+        '<td><span class="status-pill ' + (l.success ? 'ok' : 'err') + '">' + (l.success ? l.status_code : (l.status_code || '错误')) + '</span></td>' +
         '<td>' + fmtMs(l.duration_ms) + '</td>' +
         '<td>' + (l.stream ? '是' : '否') + '</td>' +
         '<td>' + (l.usage ? fmtNum(l.usage.input_tokens || l.usage.prompt_tokens) + ' / ' + fmtNum(l.usage.output_tokens) : '—') + '</td>' +
@@ -337,11 +445,11 @@ $('#logsClearBtn').addEventListener('click', async () => {
   if (!confirm('确定要清空全部请求日志吗？此操作无法撤销。')) return;
   try {
     const res = await api('/logs', { method: 'DELETE' });
-    showToast('已清空 ' + (res.deleted || 0) + ' 条日志');
+    showToast('已清空 ' + (res.deleted || 0) + ' 条日志', 'success');
     loadLogs(true);
     loadOverview();
   } catch (e) {
-    showToast('清空失败: ' + e.message, true);
+    showToast('清空失败: ' + e.message, 'error');
   }
 });
 
@@ -353,10 +461,12 @@ async function openDrawer(id) {
   const drawer = $('#logDrawer');
   backdrop.classList.add('is-open');
   drawer.classList.add('is-open');
+  drawer.setAttribute('aria-hidden', 'false');
   $('#drawerId').textContent = id;
   $('#drawerTitle').textContent = '加载中…';
   $('#drawerMeta').innerHTML = '';
   $('#drawerCode').textContent = '加载中…';
+  $('#drawerCompare').innerHTML = '';
 
   try {
     const log = await api('/logs/' + id);
@@ -367,6 +477,7 @@ async function openDrawer(id) {
   } catch (e) {
     $('#drawerTitle').textContent = '加载失败';
     $('#drawerCode').textContent = e.message;
+    showToast('加载请求详情失败: ' + e.message, 'error');
   }
 }
 
@@ -379,9 +490,9 @@ function renderDrawer(log) {
     ['流式', log.stream ? '是' : '否'],
     ['方法', log.method + ' ' + log.request_path],
     ['上游', log.upstream_url || '—'],
-  ].map(([k, v]) => '<span class="meta-chip">' + k + ': <b>' + escapeHtml(String(v)) + '</b></span>').join('');
+  ].map(([k, v]) => '<span class="meta-chip">' + escapeHtml(k) + ': <b>' + escapeHtml(String(v)) + '</b></span>').join('');
   if (log.error) {
-    $('#drawerMeta').innerHTML += '<span class="meta-chip" style="color:var(--coral)">错误: <b>' + escapeHtml(log.error) + '</b></span>';
+    $('#drawerMeta').innerHTML += '<span class="meta-chip error">错误: <b>' + escapeHtml(log.error) + '</b></span>';
   }
   renderDrawerTab(state.drawerTab);
 }
@@ -404,7 +515,11 @@ function renderDrawerTab(tab) {
   else if (tab === 'upstream') content = tryPretty(log.upstream_body);
   else if (tab === 'upstream-response') content = tryPretty(log.upstream_response_body || log.response_body);
   else if (tab === 'response') content = tryPretty(log.response_body);
-  else if (tab === 'headers') content = tryPretty(log.request_headers_actual || log.request_headers) + '\n\n--- upstream request headers ---\n\n' + tryPretty(log.upstream_headers_actual || log.upstream_headers) + '\n\n--- upstream response headers ---\n\n' + tryPretty(log.upstream_response_headers_actual || log.upstream_response_headers) + '\n\n--- client response headers ---\n\n' + tryPretty(log.response_headers_actual || log.response_headers);
+  else if (tab === 'headers') content =
+    tryPretty(log.request_headers_actual || log.request_headers) +
+    '\n\n--- upstream request headers ---\n\n' + tryPretty(log.upstream_headers_actual || log.upstream_headers) +
+    '\n\n--- upstream response headers ---\n\n' + tryPretty(log.upstream_response_headers_actual || log.upstream_response_headers) +
+    '\n\n--- client response headers ---\n\n' + tryPretty(log.response_headers_actual || log.response_headers);
   code.textContent = content || '(空)';
 }
 
@@ -455,7 +570,6 @@ function renderComparison(tab, log) {
 function diffSummaryBadge(label, count, kind) {
   return count ? '<span class="diff-summary-badge ' + kind + '">' + label + ' ' + count + '</span>' : '';
 }
-
 function diffStats(diffs) {
   return diffs.filter(Boolean).reduce((total, diff) => {
     for (const row of diff.rows) {
@@ -467,31 +581,23 @@ function diffStats(diffs) {
     return total;
   }, { added: 0, modified: 0, deleted: 0, total: 0 });
 }
-
 function buildValueDiff(path, before, after) {
   if (String(before) === String(after)) return { rows: [] };
   return { rows: [{ kind: 'modified', path, before: String(before), after: String(after), explanation: path + ' 从 ' + before + ' 变为 ' + after }] };
 }
-
 function buildDiff(beforeRaw, afterRaw, category) {
   const before = String(beforeRaw || '');
   const after = String(afterRaw || '');
   if (before === after) return { rows: [] };
-
   const beforeJSON = tryParseJSON(before);
   const afterJSON = tryParseJSON(after);
-  if (beforeJSON.ok && afterJSON.ok) {
-    return { rows: buildJSONDiff(beforeJSON.value, afterJSON.value, category) };
-  }
+  if (beforeJSON.ok && afterJSON.ok) return { rows: buildJSONDiff(beforeJSON.value, afterJSON.value, category) };
   return { rows: buildTextDiff(before, after) };
 }
-
 function tryParseJSON(raw) {
   if (!raw.trim()) return { ok: false };
-  try { return { ok: true, value: JSON.parse(raw) }; }
-  catch (e) { return { ok: false }; }
+  try { return { ok: true, value: JSON.parse(raw) }; } catch (e) { return { ok: false }; }
 }
-
 function flattenJSON(value, path, result) {
   result = result || [];
   path = path || '$';
@@ -512,7 +618,6 @@ function flattenJSON(value, path, result) {
   result.push({ path, value });
   return result;
 }
-
 function buildJSONDiff(before, after, category) {
   const beforeMap = new Map(flattenJSON(before).map(item => [item.path, item.value]));
   const afterMap = new Map(flattenJSON(after).map(item => [item.path, item.value]));
@@ -528,68 +633,43 @@ function buildJSONDiff(before, after, category) {
     } else if (JSON.stringify(beforeMap.get(path)) !== JSON.stringify(afterMap.get(path))) {
       const beforeValue = formatDiffValue(beforeMap.get(path));
       const afterValue = formatDiffValue(afterMap.get(path));
-      rows.push({
-        kind: 'modified',
-        path,
-        before: beforeValue,
-        after: afterValue,
-        explanation: explainJSONChange(path, 'modified', beforeValue, afterValue, category),
-      });
+      rows.push({ kind: 'modified', path, before: beforeValue, after: afterValue, explanation: explainJSONChange(path, 'modified', beforeValue, afterValue, category) });
     }
   });
   return rows;
 }
-
 function explainJSONChange(path, kind, before, after, category) {
   if (category === 'headers') {
     const header = headerNameFromPath(path);
     const lower = header.toLowerCase();
-    if (kind === 'deleted' && hopByHopHeaderNames().includes(lower)) {
-      return '删除请求头 ' + header + '：HTTP hop-by-hop 头只属于当前连接，不应转发到下一跳';
-    }
-    if (kind === 'deleted' && lower === 'content-length') {
-      return '删除请求头 Content-Length：代理会根据实际发送的正文重新管理长度';
-    }
-    if (kind === 'deleted' && lower.startsWith('x-grok-')) {
-      return '删除请求头 ' + header + '：这是客户端/代理内部头，代理不会转发';
-    }
-    if (kind === 'deleted') {
-      return '删除请求头 ' + header + '：未包含在当前网关的 Forward Headers 白名单中';
-    }
-    if (kind === 'added' && lower === 'user-agent') {
-      return '新增请求头 User-Agent：当前网关启用了 User-Agent 覆盖或客户端头被代理补齐';
-    }
+    if (kind === 'deleted' && hopByHopHeaderNames().includes(lower)) return '删除请求头 ' + header + '：HTTP hop-by-hop 头只属于当前连接，不应转发到下一跳';
+    if (kind === 'deleted' && lower === 'content-length') return '删除请求头 Content-Length：代理会根据实际发送的正文重新管理长度';
+    if (kind === 'deleted' && lower.startsWith('x-grok-')) return '删除请求头 ' + header + '：这是客户端/代理内部头，代理不会转发';
+    if (kind === 'deleted') return '删除请求头 ' + header + '：未包含在当前网关的 Forward Headers 白名单中';
+    if (kind === 'added' && lower === 'user-agent') return '新增请求头 User-Agent：当前网关启用了 User-Agent 覆盖或客户端头被代理补齐';
     if (kind === 'added') return '新增请求头 ' + header + '：由代理转发白名单或代理策略加入';
     return '修改请求头 ' + header + '：代理策略改变了该值';
   }
-  if (path.endsWith('.type') && path.includes('.tool_calls[') && before === '"function"' && after === '"function_call"') {
-    return '商汤协议兼容：将客户端 tool_calls 类型 function 转为上游要求的 function_call';
-  }
-  if (path.endsWith('.type') && path.includes('.tool_calls[') && before === '"function_call"' && after === '"function"') {
-    return '客户端协议兼容：将商汤返回的 function_call 转回客户端使用的 function';
-  }
+  if (path.endsWith('.type') && path.includes('.tool_calls[') && before === '"function"' && after === '"function_call"') return '商汤协议兼容：将客户端 tool_calls 类型 function 转为上游要求的 function_call';
+  if (path.endsWith('.type') && path.includes('.tool_calls[') && before === '"function_call"' && after === '"function"') return '客户端协议兼容：将商汤返回的 function_call 转回客户端使用的 function';
   if (kind === 'added') return '新增字段 ' + path;
   if (kind === 'deleted') return '删除字段 ' + path;
   return '修改字段 ' + path;
 }
-
 function headerNameFromPath(path) {
   const dotMatch = path.match(/^\$\.([A-Za-z0-9_-]+)/);
   if (dotMatch) return dotMatch[1];
-  const bracketMatch = path.match(/^\$\[\"([^\"]+)\"\]/);
+  const bracketMatch = path.match(/^\$\["([^"]+)"\]/);
   return bracketMatch ? bracketMatch[1] : path;
 }
-
 function hopByHopHeaderNames() {
   return ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'host'];
 }
-
 function formatDiffValue(value) {
   if (typeof value === 'string') return JSON.stringify(value);
   const encoded = JSON.stringify(value);
   return encoded === undefined ? String(value) : encoded;
 }
-
 function buildTextDiff(before, after) {
   const oldLines = before.split(/\r?\n/);
   const newLines = after.split(/\r?\n/);
@@ -630,23 +710,20 @@ function buildTextDiff(before, after) {
   }
   return rows;
 }
-
 function truncateDiffText(text) {
   return text.length > 4000 ? text.slice(0, 4000) + '\n… (已折叠)' : text;
 }
-
 function renderDiffSection(diff, title, subtitle) {
   const changedRows = diff.rows.filter(row => row.kind !== 'same');
   if (!changedRows.length) {
-    return '<section class="diff-section diff-section-empty"><div class="diff-section-head"><div><strong>' + title + '</strong><span>' + subtitle + '</span></div><span class="diff-no-change">无变化</span></div></section>';
+    return '<section class="diff-section diff-section-empty"><div class="diff-section-head"><div><strong>' + escapeHtml(title) + '</strong><span>' + escapeHtml(subtitle) + '</span></div><span class="diff-no-change">无变化</span></div></section>';
   }
   return '<section class="diff-section">' +
-    '<div class="diff-section-head"><div><strong>' + title + '</strong><span>' + subtitle + '</span></div><span class="diff-change-count">' + changedRows.length + ' 处变更</span></div>' +
+    '<div class="diff-section-head"><div><strong>' + escapeHtml(title) + '</strong><span>' + escapeHtml(subtitle) + '</span></div><span class="diff-change-count">' + changedRows.length + ' 处变更</span></div>' +
     '<div class="diff-column-head"><span>原始</span><span>代理实际</span></div>' +
     '<div class="diff-rows">' + renderDiffRows(diff.rows) + '</div>' +
   '</section>';
 }
-
 function renderDiffRows(rows) {
   const output = [];
   const changedIndexes = rows.map((row, index) => row.kind !== 'same' ? index : -1).filter(index => index >= 0);
@@ -668,12 +745,10 @@ function renderDiffRows(rows) {
   });
   return output.join('');
 }
-
 function diffLineText(row, value) {
   if (row.kind === 'same' || !row.path) return value;
   return row.path + ' = ' + value;
 }
-
 function renderDiffRow(row) {
   const oldLine = row.kind === 'added' ? '' : diffLineText(row, row.before || '');
   const newLine = row.kind === 'deleted' ? '' : diffLineText(row, row.after || '');
@@ -686,14 +761,9 @@ function renderDiffRow(row) {
     (row.kind === 'same' ? '' : '<div class="diff-explanation">' + escapeHtml(row.explanation || '') + (row.path ? ' <code>' + escapeHtml(row.path) + '</code>' : '') + '</div>') +
   '</div>';
 }
-
 function tryPretty(raw) {
   if (!raw) return '';
-  try {
-    return JSON.stringify(JSON.parse(raw), null, 2);
-  } catch (e) {
-    return raw;
-  }
+  try { return JSON.stringify(JSON.parse(raw), null, 2); } catch (e) { return raw; }
 }
 
 $('#drawerTabs').addEventListener('click', (e) => {
@@ -704,13 +774,20 @@ $('#drawerTabs').addEventListener('click', (e) => {
   renderDrawerTab(state.drawerTab);
 });
 
+$('#drawerCopyIdBtn').addEventListener('click', () => {
+  const id = $('#drawerId').textContent.trim();
+  if (!id || id === '—') return;
+  navigator.clipboard.writeText(id).then(() => showToast('已复制请求 ID: ' + id, 'success'));
+});
+
 function closeDrawer() {
   $('#drawerBackdrop').classList.remove('is-open');
-  $('#logDrawer').classList.remove('is-open');
+  const drawer = $('#logDrawer');
+  drawer.classList.remove('is-open');
+  drawer.setAttribute('aria-hidden', 'true');
 }
 $('#drawerCloseBtn').addEventListener('click', closeDrawer);
 $('#drawerBackdrop').addEventListener('click', closeDrawer);
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
 
 /* ============================================================
    Gateway config view
@@ -764,16 +841,18 @@ function renderGatewayCards() {
         '<textarea class="f-headers" rows="4" placeholder="Authorization&#10;X-Api-Key">' + escapeHtml(headers) + '</textarea>' +
       '</div>' +
       '<div class="gw-card-foot">' +
-        '<button class="btn-ghost small save-gw-btn" style="width:auto;padding:8px 18px;">保存更改</button>' +
+        '<button class="btn-primary small save-gw-btn" style="width:auto;padding:8px 18px;font-size:12px;">' +
+          '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M4 8l3 3 5-6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+          '保存更改</button>' +
       '</div>';
     container.appendChild(card);
-
     card.querySelector('.save-gw-btn').addEventListener('click', () => saveGateway(id, card));
   });
 }
 
 async function saveGateway(id, card) {
   const btn = card.querySelector('.save-gw-btn');
+  const original = btn.innerHTML;
   const payload = {
     name: card.querySelector('.f-name').value.trim(),
     base_url: card.querySelector('.f-baseurl').value.trim(),
@@ -782,22 +861,28 @@ async function saveGateway(id, card) {
     user_agent_override: card.querySelector('.f-ua').value.trim(),
     forward_headers: card.querySelector('.f-headers').value.split('\n').map(s => s.trim()).filter(Boolean),
   };
-  btn.textContent = '保存中…';
   btn.disabled = true;
+  btn.innerHTML = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M8 2v3M8 11v3M2 8h3M11 8h3" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/></svg>保存中…';
   try {
     const gateways = {};
     gateways[id] = Object.assign({}, state.gateways[id], payload);
     const res = await api('/gateways', { method: 'PUT', body: JSON.stringify({ gateways }) });
     state.gateways = res.gateways;
-    showToast('网关 ' + payload.name + ' 已更新');
+    showToast('网关 ' + payload.name + ' 已更新', 'success');
     renderGatewayCards();
   } catch (e) {
-    showToast('保存失败: ' + e.message, true);
+    showToast('保存失败: ' + e.message, 'error');
   } finally {
-    btn.textContent = '保存更改';
     btn.disabled = false;
+    btn.innerHTML = original;
   }
 }
+
+$('#gatewaysReloadBtn').addEventListener('click', async () => {
+  await loadConfig();
+  renderGatewayCards();
+  showToast('已重新加载网关配置', 'success');
+});
 
 /* ============================================================
    Setup snippets view
@@ -816,13 +901,15 @@ async function loadSetup() {
       card.className = 'setup-card';
       card.innerHTML =
         '<div class="setup-card-head">' +
-          '<strong>' + escapeHtml(gw.name || id) + ' <span class="gw-card-prefix" style="font-size:10.5px;">' + (gw.prefix || '') + '</span></strong>' +
-          '<button class="btn-ghost small copy-btn" style="width:auto;padding:6px 12px;">复制</button>' +
+          '<strong>' + escapeHtml(gw.name || id) + ' <span class="gw-card-prefix" style="font-size:10.5px;">' + escapeHtml(gw.prefix || '') + '</span></strong>' +
+          '<button class="btn-ghost small copy-btn" style="width:auto;padding:6px 12px;">' +
+            '<svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><rect x="5" y="5" width="8" height="8" rx="1.5" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M3 11V3.5A1.5 1.5 0 0 1 4.5 2H11" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>' +
+            '复制</button>' +
         '</div>' +
         '<pre class="setup-pre">' + escapeHtml(snippet) + '</pre>';
       container.appendChild(card);
       card.querySelector('.copy-btn').addEventListener('click', () => {
-        navigator.clipboard.writeText(snippet).then(() => showToast('已复制到剪贴板'));
+        navigator.clipboard.writeText(snippet).then(() => showToast('已复制到剪贴板', 'success'));
       });
     });
   } catch (e) {
@@ -830,37 +917,172 @@ async function loadSetup() {
   }
 }
 
-/* ============================================================
-   Escaping utils
-   ============================================================ */
-function escapeHtml(str) {
-  return String(str).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
-function escapeAttr(str) { return escapeHtml(str); }
+$('#setupReloadBtn').addEventListener('click', () => {
+  loadSetup();
+  showToast('已重新加载接入代码', 'success');
+});
 
 /* ============================================================
-   Boot
+   Command palette (Cmd+K)
    ============================================================ */
-$('#refreshAllBtn').addEventListener('click', () => {
-  loadConfig().then(() => {
-    if (state.activeView === 'overview') loadOverview();
-    if (state.activeView === 'logs') loadLogs(true);
-    if (state.activeView === 'gateways') renderGatewayCards();
+function buildCmdkItems() {
+  const items = [
+    { group: '导航', icon: '<svg viewBox="0 0 16 16" width="13" height="13"><rect x="2" y="2" width="5" height="5" rx="1" fill="currentColor"/><rect x="9" y="2" width="5" height="5" rx="1" fill="currentColor" opacity="0.55"/><rect x="2" y="9" width="5" height="5" rx="1" fill="currentColor" opacity="0.55"/><rect x="9" y="9" width="5" height="5" rx="1" fill="currentColor"/></svg>', label: '前往 总览', hint: '1', run: () => switchView('overview') },
+    { group: '导航', icon: '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M3 3.5h10M3 6h10M3 8.5h7M3 11h5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" fill="none"/></svg>', label: '前往 请求日志', hint: '2', run: () => switchView('logs') },
+    { group: '导航', icon: '<svg viewBox="0 0 16 16" width="13" height="13"><circle cx="8" cy="8" r="2" fill="currentColor"/><path d="M8 1.5v2.5M8 12v2.5M1.5 8h2.5M12 8h2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" fill="none"/></svg>', label: '前往 网关配置', hint: '3', run: () => switchView('gateways') },
+    { group: '导航', icon: '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M5 4l-3 4 3 4M11 4l3 4-3 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>', label: '前往 接入代码', hint: '4', run: () => switchView('setup') },
+    { group: '操作', icon: '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M2.5 8a5.5 5.5 0 0 1 9.4-3.9M13.5 8a5.5 5.5 0 0 1-9.4 3.9" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/><path d="M11 1.5v3h-3M5 14.5v-3h3" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>', label: '刷新全部数据', hint: 'r', run: () => { refreshAll(); } },
+    { group: '操作', icon: '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M3 4h10M5.5 4V2.5h5V4M5 4l.5 9h5l.5-9" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>', label: '清空请求日志', hint: '', run: async () => {
+      if (!confirm('确定要清空全部请求日志吗？此操作无法撤销。')) return;
+      try {
+        const res = await api('/logs', { method: 'DELETE' });
+        showToast('已清空 ' + (res.deleted || 0) + ' 条日志', 'success');
+        if (state.activeView === 'logs') loadLogs(true);
+        loadOverview();
+      } catch (e) { showToast('清空失败: ' + e.message, 'error'); }
+    } },
+  ];
+  GW_ORDER.forEach(id => {
+    const gw = state.gateways[id];
+    if (!gw) return;
+    items.push({
+      group: '复制接入片段',
+      icon: '<svg viewBox="0 0 16 16" width="13" height="13"><rect x="5" y="5" width="8" height="8" rx="1.5" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M3 11V3.5A1.5 1.5 0 0 1 4.5 2H11" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>',
+      label: '复制 ' + gw.name + ' 接入片段 (' + gw.prefix + ')',
+      hint: '',
+      run: async () => {
+        try {
+          const data = await api('/setup');
+          if (data[id]) {
+            navigator.clipboard.writeText(data[id]).then(() => showToast('已复制 ' + gw.name + ' 接入片段', 'success'));
+          }
+        } catch (e) { showToast('复制失败: ' + e.message, 'error'); }
+      },
+    });
   });
-  showToast('已刷新');
+  return items;
+}
+
+function openCmdk() {
+  const backdrop = $('#cmdkBackdrop');
+  const cmdk = $('#cmdk');
+  state.cmdkItems = buildCmdkItems();
+  state.cmdkSelected = 0;
+  $('#cmdkInput').value = '';
+  renderCmdk('');
+  backdrop.classList.add('is-open');
+  cmdk.classList.add('is-open');
+  cmdk.setAttribute('aria-hidden', 'false');
+  setTimeout(() => $('#cmdkInput').focus(), 80);
+}
+function closeCmdk() {
+  const backdrop = $('#cmdkBackdrop');
+  const cmdk = $('#cmdk');
+  backdrop.classList.remove('is-open');
+  cmdk.classList.remove('is-open');
+  cmdk.setAttribute('aria-hidden', 'true');
+}
+
+function renderCmdk(query) {
+  const list = $('#cmdkList');
+  const q = query.trim().toLowerCase();
+  const filtered = q ? state.cmdkItems.filter(it => it.label.toLowerCase().includes(q) || it.group.toLowerCase().includes(q)) : state.cmdkItems;
+  if (!filtered.length) {
+    list.innerHTML = '<div class="cmdk-empty">没有匹配的操作</div>';
+    return;
+  }
+  let lastGroup = '';
+  let html = '';
+  filtered.forEach((it, i) => {
+    if (it.group !== lastGroup) {
+      html += '<div class="cmdk-group">' + escapeHtml(it.group) + '</div>';
+      lastGroup = it.group;
+    }
+    const isActive = i === state.cmdkSelected ? ' is-active' : '';
+    html += '<div class="cmdk-item' + isActive + '" data-index="' + i + '"><span class="cmdk-item-icon">' + it.icon + '</span><span class="cmdk-item-label">' + escapeHtml(it.label) + '</span>' + (it.hint ? '<kbd>' + escapeHtml(it.hint) + '</kbd>' : '') + '</div>';
+  });
+  list.innerHTML = html;
+  $all('.cmdk-item', list).forEach(el => {
+    el.addEventListener('click', () => {
+      const i = Number(el.dataset.index);
+      const item = filtered[i];
+      if (item) { closeCmdk(); item.run(); }
+    });
+    el.addEventListener('mouseenter', () => {
+      state.cmdkSelected = Number(el.dataset.index);
+      $all('.cmdk-item', list).forEach(x => x.classList.toggle('is-active', x === el));
+    });
+  });
+}
+
+$('#cmdKBtn').addEventListener('click', openCmdk);
+$('#cmdkBackdrop').addEventListener('click', closeCmdk);
+$('#cmdkInput').addEventListener('input', (e) => {
+  state.cmdkSelected = 0;
+  renderCmdk(e.target.value);
 });
+$('#cmdkInput').addEventListener('keydown', (e) => {
+  const q = e.target.value.trim().toLowerCase();
+  const filtered = q ? state.cmdkItems.filter(it => it.label.toLowerCase().includes(q) || it.group.toLowerCase().includes(q)) : state.cmdkItems;
+  if (e.key === 'ArrowDown') { e.preventDefault(); state.cmdkSelected = (state.cmdkSelected + 1) % filtered.length; renderCmdk(e.target.value); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); state.cmdkSelected = (state.cmdkSelected - 1 + filtered.length) % filtered.length; renderCmdk(e.target.value); }
+  else if (e.key === 'Enter') {
+    e.preventDefault();
+    const item = filtered[state.cmdkSelected];
+    if (item) { closeCmdk(); item.run(); }
+  }
+});
+
+/* ============================================================
+   Keyboard shortcuts
+   ============================================================ */
+document.addEventListener('keydown', (e) => {
+  // Cmd/Ctrl+K → open command palette
+  if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+    e.preventDefault();
+    if ($('#cmdk').classList.contains('is-open')) closeCmdk(); else openCmdk();
+    return;
+  }
+  // Esc → close drawer / cmdk
+  if (e.key === 'Escape') {
+    if ($('#cmdk').classList.contains('is-open')) { closeCmdk(); return; }
+    if ($('#logDrawer').classList.contains('is-open')) { closeDrawer(); return; }
+  }
+  // Number shortcuts → switch view (only if not focused in input)
+  const tag = (e.target.tagName || '').toLowerCase();
+  const inField = tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable;
+  if (inField) return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === '1') switchView('overview');
+  else if (e.key === '2') switchView('logs');
+  else if (e.key === '3') switchView('gateways');
+  else if (e.key === '4') switchView('setup');
+  else if (e.key === 'r' || e.key === 'R') refreshAll();
+  else if (e.key === '?') { /* reserved for shortcuts overlay */ }
+});
+
+/* ============================================================
+   Refresh + boot
+   ============================================================ */
+async function refreshAll() {
+  await loadConfig();
+  if (state.activeView === 'overview') loadOverview();
+  if (state.activeView === 'logs') loadLogs(true);
+  if (state.activeView === 'gateways') renderGatewayCards();
+  if (state.activeView === 'setup') loadSetup();
+  showToast('已刷新', 'success');
+}
+$('#refreshAllBtn').addEventListener('click', refreshAll);
 
 async function boot() {
   try {
     await loadConfig();
     await loadOverview();
   } catch (e) {
-    showToast('初始化失败: ' + e.message, true);
+    showToast('初始化失败: ' + e.message, 'error');
   }
-  // light polling for overview while visible
   state.pollTimer = setInterval(() => {
     if (state.activeView === 'overview') loadOverview();
-    if (state.activeView === 'logs') { /* don't auto-reset user's scroll; skip */ }
   }, 15000);
 }
 
