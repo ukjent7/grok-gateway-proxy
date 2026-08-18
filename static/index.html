@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Grok Gateway · 控制台</title>
+<link rel="icon" href="data:," />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ============ SIDEBAR ============ -->
+  <aside class="rail">
+    <div class="rail-brand">
+      <span class="rail-brand-mark">◈</span>
+      <div class="rail-brand-text">
+        <strong>GROK GATEWAY</strong>
+        <small>本地代理控制台</small>
+      </div>
+    </div>
+
+    <div class="rail-status" id="connStatus">
+      <span class="dot dot-live"></span>
+      <span class="rail-status-text">监听中</span>
+      <code id="listenAddr">—</code>
+    </div>
+
+    <nav class="rail-nav">
+      <button class="rail-nav-item is-active" data-view="overview">
+        <span class="rail-nav-icon">▤</span> 总览
+      </button>
+      <button class="rail-nav-item" data-view="logs">
+        <span class="rail-nav-icon">≋</span> 请求日志
+      </button>
+      <button class="rail-nav-item" data-view="gateways">
+        <span class="rail-nav-icon">⚙</span> 网关配置
+      </button>
+      <button class="rail-nav-item" data-view="setup">
+        <span class="rail-nav-icon">⧉</span> 接入代码
+      </button>
+    </nav>
+
+    <div class="rail-channels" id="railChannels">
+      <!-- populated by JS: per-gateway pulse strip -->
+    </div>
+
+    <div class="rail-foot">
+      <button class="btn-ghost small" id="refreshAllBtn" title="刷新全部数据">⟳ 刷新</button>
+    </div>
+  </aside>
+
+  <!-- ============ MAIN ============ -->
+  <main class="main">
+
+    <!-- ---------- OVERVIEW ---------- -->
+    <section class="view is-active" id="view-overview">
+      <header class="view-head">
+        <div>
+          <h1>总览</h1>
+          <p class="muted">最近请求活动与缓存命中情况</p>
+        </div>
+        <div class="range-picker" id="rangePicker">
+          <button data-range="1h" class="is-active">1小时</button>
+          <button data-range="24h">24小时</button>
+          <button data-range="7d">7天</button>
+          <button data-range="all">全部</button>
+        </div>
+      </header>
+
+      <div class="stat-grid" id="statGrid">
+        <div class="stat-card">
+          <span class="stat-label">总请求数</span>
+          <span class="stat-value" id="statRequests">—</span>
+          <span class="stat-sub" id="statRequestsSub">&nbsp;</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">成功率</span>
+          <span class="stat-value" id="statSuccess">—</span>
+          <span class="stat-sub" id="statSuccessSub">&nbsp;</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">缓存命中率</span>
+          <span class="stat-value" id="statCacheHit">—</span>
+          <span class="stat-sub" id="statCacheHitSub">&nbsp;</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">缓存覆盖率</span>
+          <span class="stat-value" id="statCacheCoverage">—</span>
+          <span class="stat-sub" id="statCacheCoverageSub">&nbsp;</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">输入 / 输出 Token</span>
+          <span class="stat-value" id="statTokens">—</span>
+          <span class="stat-sub" id="statTokensSub">&nbsp;</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">推理 Token</span>
+          <span class="stat-value" id="statReasoning">—</span>
+          <span class="stat-sub" id="statReasoningSub">&nbsp;</span>
+        </div>
+      </div>
+
+      <div class="panel-row">
+        <div class="panel gateway-overview">
+          <div class="panel-head">
+            <h2>网关实时信号</h2>
+            <span class="muted small">最近 40 次请求 · 每个刻度代表一次调用</span>
+          </div>
+          <div id="gatewayPulseList" class="gw-pulse-list"><!-- JS --></div>
+        </div>
+
+        <div class="panel recent-panel">
+          <div class="panel-head">
+            <h2>最近请求</h2>
+            <button class="btn-ghost small" data-goto="logs">查看全部 →</button>
+          </div>
+          <div id="recentLogList" class="recent-log-list"><!-- JS --></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- LOGS ---------- -->
+    <section class="view" id="view-logs">
+      <header class="view-head">
+        <div>
+          <h1>请求日志</h1>
+          <p class="muted">按网关 / 模型 / 状态筛选，点击行查看完整报文</p>
+        </div>
+        <div class="head-actions">
+          <button class="btn-ghost small" id="logsRefreshBtn">⟳ 刷新</button>
+          <button class="btn-danger small" id="logsClearBtn">清空日志</button>
+        </div>
+      </header>
+
+      <div class="filter-bar">
+        <select id="filterGateway">
+          <option value="">全部网关</option>
+        </select>
+        <input id="filterModel" type="text" placeholder="按模型名筛选…" />
+        <select id="filterStatus">
+          <option value="">全部状态</option>
+          <option value="success">仅成功</option>
+          <option value="error">仅失败</option>
+        </select>
+        <select id="filterLimit">
+          <option value="50">显示 50 条</option>
+          <option value="100">显示 100 条</option>
+          <option value="200">显示 200 条</option>
+          <option value="500">显示 500 条</option>
+        </select>
+      </div>
+
+      <div class="table-wrap panel">
+        <table class="log-table">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>网关</th>
+              <th>模型</th>
+              <th>状态</th>
+              <th>耗时</th>
+              <th>流式</th>
+              <th>Token (in/out)</th>
+              <th>缓存命中</th>
+            </tr>
+          </thead>
+          <tbody id="logTableBody">
+            <tr class="empty-row"><td colspan="8">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="table-foot">
+        <button class="btn-ghost small" id="logsLoadMoreBtn">加载更多</button>
+      </div>
+    </section>
+
+    <!-- ---------- GATEWAYS ---------- -->
+    <section class="view" id="view-gateways">
+      <header class="view-head">
+        <div>
+          <h1>网关配置</h1>
+          <p class="muted">编辑三个固定网关前缀的上游地址与请求头白名单</p>
+        </div>
+      </header>
+
+      <div id="gatewayCards" class="gw-config-grid"><!-- JS --></div>
+    </section>
+
+    <!-- ---------- SETUP ---------- -->
+    <section class="view" id="view-setup">
+      <header class="view-head">
+        <div>
+          <h1>接入代码</h1>
+          <p class="muted">复制以下配置片段到 Grok Build，指向对应本地网关</p>
+        </div>
+      </header>
+      <div id="setupSnippets" class="setup-grid"><!-- JS --></div>
+    </section>
+
+  </main>
+</div>
+
+<!-- ============ LOG DETAIL DRAWER ============ -->
+<div class="drawer-backdrop" id="drawerBackdrop"></div>
+<aside class="drawer" id="logDrawer">
+  <div class="drawer-head">
+    <div>
+      <h2 id="drawerTitle">请求详情</h2>
+      <code id="drawerId" class="muted small">—</code>
+    </div>
+    <button class="btn-icon" id="drawerCloseBtn">✕</button>
+  </div>
+  <div class="drawer-meta" id="drawerMeta"><!-- JS --></div>
+  <div class="drawer-tabs" id="drawerTabs">
+    <button class="drawer-tab is-active" data-tab="request">请求</button>
+    <button class="drawer-tab" data-tab="upstream">上游响应</button>
+    <button class="drawer-tab" data-tab="response">返回客户端</button>
+    <button class="drawer-tab" data-tab="headers">请求头</button>
+  </div>
+  <div class="drawer-body">
+    <pre class="code-block" id="drawerCode">—</pre>
+  </div>
+</aside>
+
+<!-- ============ TOAST ============ -->
+<div class="toast" id="toast"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
