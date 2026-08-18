@@ -183,9 +183,30 @@
       <header class="view-head">
         <div>
           <h1>网关配置</h1>
-          <p class="muted">编辑三个固定网关前缀的上游地址与请求头白名单</p>
+          <p class="muted">编辑上游地址、请求头白名单，以及代理实际发送的 User-Agent</p>
         </div>
       </header>
+
+      <div class="panel settings-card">
+        <div class="panel-head">
+          <div>
+            <h2>User-Agent 覆盖</h2>
+            <p class="muted small">开启后覆盖所有网关发往上游的 User-Agent；关闭则沿用客户端请求头。</p>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="userAgentOverrideEnabled" />
+            <span class="toggle-track"></span>
+          </label>
+        </div>
+        <div class="settings-form">
+          <div class="field">
+            <label for="userAgentOverride">覆盖值</label>
+            <input id="userAgentOverride" type="text" placeholder="grok-gateway-proxy/dev" />
+            <span class="field-hint">示例：grok-gateway-proxy/dev 或你需要伪装的客户端标识</span>
+          </div>
+          <button class="btn-ghost small settings-save-btn" id="saveUserAgentBtn">保存 User-Agent 设置</button>
+        </div>
+      </div>
 
       <div id="gatewayCards" class="gw-config-grid"><!-- JS --></div>
     </section>
@@ -216,12 +237,16 @@
   </div>
   <div class="drawer-meta" id="drawerMeta"><!-- JS --></div>
   <div class="drawer-tabs" id="drawerTabs">
-    <button class="drawer-tab is-active" data-tab="request">请求</button>
-    <button class="drawer-tab" data-tab="upstream">上游响应</button>
-    <button class="drawer-tab" data-tab="response">返回客户端</button>
+    <button class="drawer-tab is-active" data-tab="request-compare">请求对比</button>
+    <button class="drawer-tab" data-tab="response-compare">响应对比</button>
+    <button class="drawer-tab" data-tab="request">客户端请求</button>
+    <button class="drawer-tab" data-tab="upstream">上游请求</button>
+    <button class="drawer-tab" data-tab="upstream-response">上游原始响应</button>
+    <button class="drawer-tab" data-tab="response">最终客户端响应</button>
     <button class="drawer-tab" data-tab="headers">请求头</button>
   </div>
   <div class="drawer-body">
+    <div class="compare-view" id="drawerCompare"></div>
     <pre class="code-block" id="drawerCode">—</pre>
   </div>
 </aside>

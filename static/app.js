@@ -13,7 +13,9 @@ const state = {
   range: '1h',
   activeView: 'overview',
   drawerLog: null,
-  drawerTab: 'request',
+  drawerTab: 'request-compare',
+  userAgentOverrideEnabled: false,
+  userAgentOverride: '',
   pollTimer: null,
 };
 
@@ -110,7 +112,11 @@ async function loadConfig() {
   const data = await api('/config');
   state.gateways = data.gateways || {};
   state.listenAddr = data.listen_addr || '';
+  state.userAgentOverrideEnabled = !!data.user_agent_override_enabled;
+  state.userAgentOverride = data.user_agent_override || '';
   $('#listenAddr').textContent = state.listenAddr || '—';
+  $('#userAgentOverrideEnabled').checked = state.userAgentOverrideEnabled;
+  $('#userAgentOverride').value = state.userAgentOverride;
   const sel = $('#filterGateway');
   sel.innerHTML = '<option value="">全部网关</option>';
   GW_ORDER.forEach(id => {
@@ -361,8 +367,8 @@ async function openDrawer(id) {
   try {
     const log = await api('/logs/' + id);
     state.drawerLog = log;
-    state.drawerTab = 'request';
-    $all('.drawer-tab').forEach(t => t.classList.toggle('is-active', t.dataset.tab === 'request'));
+    state.drawerTab = 'request-compare';
+    $all('.drawer-tab').forEach(t => t.classList.toggle('is-active', t.dataset.tab === 'request-compare'));
     renderDrawer(log);
   } catch (e) {
     $('#drawerTitle').textContent = '加载失败';
@@ -389,12 +395,65 @@ function renderDrawer(log) {
 function renderDrawerTab(tab) {
   const log = state.drawerLog;
   if (!log) return;
+  const compare = $('#drawerCompare');
+  const code = $('#drawerCode');
+  if (tab === 'request-compare' || tab === 'response-compare') {
+    compare.style.display = 'grid';
+    code.style.display = 'none';
+    renderComparison(tab, log);
+    return;
+  }
+  compare.style.display = 'none';
+  code.style.display = 'block';
   let content = '';
   if (tab === 'request') content = tryPretty(log.request_body);
   else if (tab === 'upstream') content = tryPretty(log.upstream_body);
+  else if (tab === 'upstream-response') content = tryPretty(log.upstream_response_body || log.response_body);
   else if (tab === 'response') content = tryPretty(log.response_body);
-  else if (tab === 'headers') content = tryPretty(log.request_headers) + '\n\n--- upstream response headers ---\n\n' + tryPretty(log.upstream_headers);
-  $('#drawerCode').textContent = content || '(空)';
+  else if (tab === 'headers') content = tryPretty(log.request_headers_actual || log.request_headers) + '\n\n--- upstream request headers ---\n\n' + tryPretty(log.upstream_headers_actual || log.upstream_headers) + '\n\n--- upstream response headers ---\n\n' + tryPretty(log.upstream_response_headers_actual || log.upstream_response_headers) + '\n\n--- client response headers ---\n\n' + tryPretty(log.response_headers_actual || log.response_headers);
+  code.textContent = content || '(空)';
+}
+
+function renderComparison(tab, log) {
+  const request = tab === 'request-compare';
+  const left = request ? {
+    label: '客户端原请求',
+    url: (log.method || 'POST') + ' ' + (log.request_url || log.request_path || '—'),
+    headers: log.request_headers_actual || log.request_headers,
+    body: log.request_body,
+  } : {
+    label: '上游 API 原始响应',
+    url: 'HTTP ' + (log.upstream_response_status_code || log.status_code || '—'),
+    headers: log.upstream_response_headers_actual || log.upstream_response_headers,
+    body: log.upstream_response_body || log.response_body,
+  };
+  const right = request ? {
+    label: '代理实际发送',
+    url: (log.method || 'POST') + ' ' + (log.upstream_url || '—'),
+    headers: log.upstream_headers_actual || log.upstream_headers,
+    body: log.upstream_body,
+  } : {
+    label: '代理实际返回客户端',
+    url: 'HTTP ' + (log.client_response_status_code || log.status_code || '—'),
+    headers: log.response_headers_actual || log.response_headers,
+    body: log.response_body,
+  };
+  const bodySame = String(left.body || '') === String(right.body || '');
+  const headersSame = String(left.headers || '') === String(right.headers || '');
+  $('#drawerCompare').innerHTML =
+    '<div class="compare-summary">' +
+      '<span class="compare-badge ' + (bodySame ? 'same' : 'changed') + '">' + (bodySame ? '正文一致' : '正文已变化') + '</span>' +
+      '<span class="compare-badge ' + (headersSame ? 'same' : 'changed') + '">' + (headersSame ? '请求头一致' : '请求头已变化') + '</span>' +
+    '</div>' +
+    comparePane(left) + comparePane(right);
+}
+
+function comparePane(side) {
+  return '<section class="compare-pane">' +
+    '<div class="compare-pane-head"><strong>' + escapeHtml(side.label) + '</strong><code>' + escapeHtml(side.url) + '</code></div>' +
+    '<h4>Headers</h4><pre class="code-block compare-code">' + escapeHtml(tryPretty(side.headers) || '(空)') + '</pre>' +
+    '<h4>Body</h4><pre class="code-block compare-code">' + escapeHtml(tryPretty(side.body) || '(空)') + '</pre>' +
+  '</section>';
 }
 
 function tryPretty(raw) {
@@ -468,6 +527,29 @@ function renderGatewayCards() {
     card.querySelector('.save-gw-btn').addEventListener('click', () => saveGateway(id, card));
   });
 }
+
+async function saveUserAgentOverride() {
+  const btn = $('#saveUserAgentBtn');
+  const payload = {
+    user_agent_override_enabled: $('#userAgentOverrideEnabled').checked,
+    user_agent_override: $('#userAgentOverride').value.trim(),
+  };
+  btn.textContent = '保存中…';
+  btn.disabled = true;
+  try {
+    const res = await api('/config', { method: 'PUT', body: JSON.stringify(payload) });
+    state.userAgentOverrideEnabled = !!res.user_agent_override_enabled;
+    state.userAgentOverride = res.user_agent_override || '';
+    showToast('User-Agent 设置已保存');
+  } catch (e) {
+    showToast('保存失败: ' + e.message, true);
+  } finally {
+    btn.textContent = '保存 User-Agent 设置';
+    btn.disabled = false;
+  }
+}
+
+$('#saveUserAgentBtn').addEventListener('click', saveUserAgentOverride);
 
 async function saveGateway(id, card) {
   const btn = card.querySelector('.save-gw-btn');
