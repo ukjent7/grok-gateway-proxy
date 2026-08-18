@@ -63,7 +63,11 @@ func (SenseNovaChatAdapter) NormalizeError(status int, body []byte) []byte {
 // variant, while the client-facing Chat Completions format uses function.
 // Keep the conversion scoped to tool_calls so tools[].type remains function.
 func (SenseNovaChatAdapter) TransformRequestBody(body []byte) ([]byte, error) {
-	return transformToolCallType(body, "function", "function_call")
+	transformed, err := transformToolCallType(body, "function", "function_call")
+	if err != nil {
+		return nil, err
+	}
+	return sanitizeSenseNovaToolCallHistory(transformed)
 }
 
 func (SenseNovaChatAdapter) TransformResponseBody(body []byte) ([]byte, error) {
@@ -110,6 +114,116 @@ func transformToolCallType(body []byte, from, to string) ([]byte, error) {
 		return nil, err
 	}
 	return result, nil
+}
+
+// sanitizeSenseNovaToolCallHistory removes incomplete tool-call records from
+// the request history. A partially emitted client-side tool call has no
+// function name to execute, so forwarding it makes SenseNova reject the
+// entire request with "function/name/arguments cannot be empty". Its matching
+// tool result is removed as well because it would otherwise be an orphan.
+func sanitizeSenseNovaToolCallHistory(body []byte) ([]byte, error) {
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body, nil
+	}
+	root, ok := payload.(map[string]any)
+	if !ok {
+		return body, nil
+	}
+	messages, ok := root["messages"].([]any)
+	if !ok {
+		return body, nil
+	}
+
+	validCallIDs := make(map[string]struct{})
+	changed := false
+	for _, item := range messages {
+		message, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		calls, ok := message["tool_calls"].([]any)
+		if !ok {
+			continue
+		}
+
+		filtered := make([]any, 0, len(calls))
+		for _, item := range calls {
+			call, ok := item.(map[string]any)
+			if !ok || !validSenseNovaToolCall(call) {
+				changed = true
+				continue
+			}
+			filtered = append(filtered, item)
+			if id, ok := nonEmptyString(call["id"]); ok {
+				validCallIDs[id] = struct{}{}
+			}
+		}
+		if len(filtered) == 0 {
+			delete(message, "tool_calls")
+			if len(calls) > 0 {
+				changed = true
+			}
+		} else if len(filtered) != len(calls) {
+			message["tool_calls"] = filtered
+			changed = true
+		}
+	}
+
+	filteredMessages := make([]any, 0, len(messages))
+	for _, item := range messages {
+		message, ok := item.(map[string]any)
+		if ok && message["role"] == "tool" {
+			id, hasID := nonEmptyString(message["tool_call_id"])
+			if !hasID {
+				changed = true
+				continue
+			}
+			if _, exists := validCallIDs[id]; !exists {
+				changed = true
+				continue
+			}
+		}
+		filteredMessages = append(filteredMessages, item)
+	}
+	if len(filteredMessages) != len(messages) {
+		root["messages"] = filteredMessages
+	}
+	if !changed {
+		return body, nil
+	}
+
+	result, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func validSenseNovaToolCall(call map[string]any) bool {
+	if _, ok := nonEmptyString(call["id"]); !ok {
+		return false
+	}
+	function, ok := call["function"].(map[string]any)
+	if !ok {
+		return false
+	}
+	if _, ok := nonEmptyString(function["name"]); !ok {
+		return false
+	}
+	if _, ok := nonEmptyString(function["arguments"]); !ok {
+		return false
+	}
+	return true
+}
+
+func nonEmptyString(value any) (string, bool) {
+	text, ok := value.(string)
+	if !ok {
+		return "", false
+	}
+	text = strings.TrimSpace(text)
+	return text, text != ""
 }
 
 func transformSenseNovaResponseBody(body []byte) ([]byte, error) {

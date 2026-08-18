@@ -40,6 +40,63 @@ func TestSenseNovaTransformsToolCallTypesWithoutChangingToolDefinitions(t *testi
 	}
 }
 
+func TestSenseNovaDropsIncompleteToolCallHistory(t *testing.T) {
+	body := []byte(`{"model":"demo","messages":[` +
+		`{"role":"user","content":"inspect the project"},` +
+		`{"role":"assistant","content":"I will inspect it.","tool_calls":[` +
+		`{"id":"","type":"function","function":{"name":"","arguments":"{}"}},` +
+		`{"id":"call-valid","type":"function","function":{"name":"lookup","arguments":"{}"}}]},` +
+		`{"role":"tool","tool_call_id":"","content":"orphan result"},` +
+		`{"role":"tool","tool_call_id":"call-valid","content":"valid result"}` + `]}`)
+
+	adapter := SenseNovaChatAdapter{}
+	upstreamBody, err := adapter.TransformRequestBody(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(upstreamBody, &payload); err != nil {
+		t.Fatal(err)
+	}
+	messages := payload["messages"].([]any)
+	if len(messages) != 3 {
+		t.Fatalf("incomplete tool history was not removed: %s", upstreamBody)
+	}
+	assistant := messages[1].(map[string]any)
+	calls := assistant["tool_calls"].([]any)
+	if len(calls) != 1 {
+		t.Fatalf("expected one valid tool call, got %d: %s", len(calls), upstreamBody)
+	}
+	call := calls[0].(map[string]any)
+	if call["id"] != "call-valid" || call["type"] != "function_call" {
+		t.Fatalf("valid tool call was changed incorrectly: %s", upstreamBody)
+	}
+	if strings.Contains(string(upstreamBody), `"name":""`) || strings.Contains(string(upstreamBody), `"tool_call_id":""`) {
+		t.Fatalf("empty tool-call fields survived sanitization: %s", upstreamBody)
+	}
+	toolMessage := messages[2].(map[string]any)
+	if toolMessage["role"] != "tool" || toolMessage["tool_call_id"] != "call-valid" {
+		t.Fatalf("valid tool result was removed or changed: %s", upstreamBody)
+	}
+}
+
+func TestSenseNovaDropsToolMessagesForRemovedCalls(t *testing.T) {
+	body := []byte(`{"messages":[` +
+		`{"role":"assistant","tool_calls":[{"id":"call-bad","type":"function","function":{"name":"lookup","arguments":""}}]},` +
+		`{"role":"tool","tool_call_id":"call-bad","content":"result"}` +
+		`]}`)
+
+	adapter := SenseNovaChatAdapter{}
+	upstreamBody, err := adapter.TransformRequestBody(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(upstreamBody), `tool_calls`) || strings.Contains(string(upstreamBody), `"role":"tool"`) {
+		t.Fatalf("orphaned incomplete tool history survived: %s", upstreamBody)
+	}
+}
+
 // The response-side conversion must only rewrite tool-call entries inside
 // tool_calls arrays; any other "type" property (e.g. echoed tool definitions)
 // is left byte-for-byte intact.
