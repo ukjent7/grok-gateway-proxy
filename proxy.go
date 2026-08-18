@@ -22,10 +22,79 @@ type Proxy struct {
 	client *http.Client
 }
 
+type responseCapture struct {
+	http.ResponseWriter
+	statusCode int
+	headers    http.Header
+	body       bytes.Buffer
+}
+
+func (w *responseCapture) WriteHeader(statusCode int) {
+	if w.statusCode != 0 {
+		return
+	}
+	w.statusCode = statusCode
+	w.headers = cloneHeaders(w.ResponseWriter.Header())
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *responseCapture) Write(data []byte) (int, error) {
+	if w.statusCode == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	n, err := w.ResponseWriter.Write(data)
+	if n > 0 {
+		_, _ = w.body.Write(data[:n])
+	}
+	return n, err
+}
+
+func (w *responseCapture) Flush() {
+	if w.statusCode == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func cloneHeaders(src http.Header) http.Header {
+	dst := make(http.Header, len(src))
+	for name, values := range src {
+		dst[name] = append([]string(nil), values...)
+	}
+	return dst
+}
+
 const maxRequestBodySize int64 = 64 << 20
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
+	capturedResponse := &responseCapture{ResponseWriter: w}
+	w = capturedResponse
+	logEntry := RequestLog{
+		ID:                   newRequestID(),
+		StartedAt:            started,
+		Method:               r.Method,
+		RequestPath:          r.URL.Path,
+		RequestURL:           r.URL.RequestURI(),
+		RequestHeaders:       headersJSON(r.Header),
+		RequestHeadersActual: headersJSONActual(r.Header),
+	}
+	defer func() {
+		logEntry.ClientResponseStatusCode = capturedResponse.statusCode
+		if logEntry.StatusCode == 0 && capturedResponse.statusCode != 0 {
+			logEntry.StatusCode = capturedResponse.statusCode
+		}
+		if logEntry.StatusCode == 0 {
+			logEntry.StatusCode = http.StatusInternalServerError
+		}
+		logEntry.ResponseHeaders = headersJSON(capturedResponse.headers)
+		logEntry.ResponseHeadersActual = headersJSONActual(capturedResponse.headers)
+		logEntry.ResponseBody = append([]byte(nil), capturedResponse.body.Bytes()...)
+		p.finishLog(r.Context(), &logEntry, started)
+	}()
+
 	requestBody, readErr := io.ReadAll(io.LimitReader(r.Body, maxRequestBodySize+1))
 	if readErr != nil {
 		writeError(w, http.StatusBadRequest, readErr)
@@ -37,23 +106,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	model := ParseModel(requestBody)
 	stream := requestStream(requestBody)
-	logEntry := RequestLog{
-		ID:             newRequestID(),
-		StartedAt:      started,
-		Method:         r.Method,
-		RequestPath:    r.URL.Path,
-		RequestHeaders: headersJSON(r.Header),
-		RequestBody:    append([]byte(nil), requestBody...),
-		Model:          model,
-		Stream:         stream,
-	}
+	logEntry.RequestBody = append([]byte(nil), requestBody...)
+	logEntry.Model = model
+	logEntry.Stream = stream
 
 	gateway, subpath, ok := p.gatewayForPath(r.URL.Path)
 	if !ok {
 		writeError(w, http.StatusNotFound, fmt.Errorf("unknown proxy path %s", r.URL.Path))
 		logEntry.Error = "unknown proxy path"
 		logEntry.StatusCode = http.StatusNotFound
-		p.finishLog(r.Context(), &logEntry, started)
 		return
 	}
 	logEntry.GatewayID = gateway.ID
@@ -65,7 +126,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotImplemented, fmt.Errorf("adapter not implemented for %s", gateway.ID))
 		logEntry.Error = "adapter not implemented"
 		logEntry.StatusCode = http.StatusNotImplemented
-		p.finishLog(r.Context(), &logEntry, started)
 		return
 	}
 	logEntry.IngressProtocol = protocolForPath(subpath)
@@ -73,28 +133,24 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("%s requires POST", r.URL.Path))
 		logEntry.Error = "method not allowed"
 		logEntry.StatusCode = http.StatusMethodNotAllowed
-		p.finishLog(r.Context(), &logEntry, started)
 		return
 	}
 	if !adapter.AcceptsPath(subpath) {
 		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("%s", adapter.RejectMessage(subpath)))
 		logEntry.Error = adapter.RejectMessage(subpath)
 		logEntry.StatusCode = http.StatusMethodNotAllowed
-		p.finishLog(r.Context(), &logEntry, started)
 		return
 	}
 	if err := adapter.ValidateRequest(requestBody); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		logEntry.Error = err.Error()
 		logEntry.StatusCode = http.StatusBadRequest
-		p.finishLog(r.Context(), &logEntry, started)
 		return
 	}
 	if !gateway.Enabled {
 		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("gateway %s is disabled", gateway.ID))
 		logEntry.Error = "gateway disabled"
 		logEntry.StatusCode = http.StatusServiceUnavailable
-		p.finishLog(r.Context(), &logEntry, started)
 		return
 	}
 
@@ -103,11 +159,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err)
 		logEntry.Error = err.Error()
 		logEntry.StatusCode = http.StatusBadGateway
-		p.finishLog(r.Context(), &logEntry, started)
 		return
 	}
 	logEntry.UpstreamURL = upstreamURL
-	logEntry.UpstreamHeaders = headersJSON(r.Header)
 	logEntry.UpstreamBody = append([]byte(nil), requestBody...)
 
 	upstreamRequest, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(requestBody))
@@ -115,7 +169,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err)
 		logEntry.Error = err.Error()
 		logEntry.StatusCode = http.StatusBadGateway
-		p.finishLog(r.Context(), &logEntry, started)
 		return
 	}
 	allowlist := gateway.ForwardHeaders
@@ -125,21 +178,27 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	copyForwardHeaders(upstreamRequest.Header, r.Header, allowlist)
 	upstreamRequest.Header.Set("Content-Type", "application/json")
 	upstreamRequest.Header.Del("Content-Length")
+	if enabled, value := p.config.UserAgentOverrideSnapshot(); enabled {
+		upstreamRequest.Header.Set("User-Agent", value)
+	}
+	logEntry.UpstreamHeaders = headersJSON(upstreamRequest.Header)
+	logEntry.UpstreamHeadersActual = headersJSONActual(upstreamRequest.Header)
 
 	upstreamResponse, err := p.client.Do(upstreamRequest)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		logEntry.Error = err.Error()
 		logEntry.StatusCode = http.StatusBadGateway
-		p.finishLog(r.Context(), &logEntry, started)
 		return
 	}
 	defer upstreamResponse.Body.Close()
 	logEntry.StatusCode = upstreamResponse.StatusCode
-	logEntry.UpstreamHeaders = headersJSON(upstreamRequest.Header)
-	logEntry.ResponseHeaders = headersJSON(upstreamResponse.Header)
+	logEntry.UpstreamResponseStatusCode = upstreamResponse.StatusCode
+	logEntry.UpstreamResponseHeaders = headersJSON(upstreamResponse.Header)
+	logEntry.UpstreamResponseHeadersActual = headersJSONActual(upstreamResponse.Header)
 	if upstreamResponse.StatusCode >= http.StatusBadRequest {
 		rawError, readErr := io.ReadAll(upstreamResponse.Body)
+		logEntry.UpstreamResponseBody = append([]byte(nil), rawError...)
 		if readErr != nil {
 			logEntry.Error = readErr.Error()
 		}
@@ -153,14 +212,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(upstreamResponse.StatusCode)
 		_, _ = w.Write(responseBody)
-		p.finishLog(r.Context(), &logEntry, started)
 		return
 	}
 
 	copyResponseHeaders(w.Header(), upstreamResponse.Header)
 	w.WriteHeader(upstreamResponse.StatusCode)
 	responseBody, copyErr := copyAndCapture(w, upstreamResponse.Body, stream || isEventStream(upstreamResponse.Header))
-	logEntry.ResponseBody = responseBody
 	if copyErr != nil {
 		logEntry.Error = copyErr.Error()
 	}
@@ -171,7 +228,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if logEntry.StatusCode >= 400 && logEntry.Error == "" {
 		logEntry.Error = fmt.Sprintf("upstream returned HTTP %d", logEntry.StatusCode)
 	}
-	p.finishLog(r.Context(), &logEntry, started)
+	logEntry.UpstreamResponseBody = append([]byte(nil), responseBody...)
 }
 
 func (p *Proxy) gatewayForPath(path string) (GatewayConfig, string, bool) {

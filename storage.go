@@ -46,17 +46,26 @@ CREATE TABLE IF NOT EXISTS request_logs (
     upstream_protocol TEXT NOT NULL,
     model TEXT NOT NULL,
     request_path TEXT NOT NULL,
+    request_url TEXT NOT NULL DEFAULT '',
     upstream_url TEXT NOT NULL,
     method TEXT NOT NULL,
     status_code INTEGER NOT NULL DEFAULT 0,
+    client_response_status_code INTEGER NOT NULL DEFAULT 0,
+    upstream_response_status_code INTEGER NOT NULL DEFAULT 0,
     success INTEGER NOT NULL DEFAULT 0,
     stream INTEGER NOT NULL DEFAULT 0,
     duration_ms INTEGER NOT NULL DEFAULT 0,
     request_headers TEXT NOT NULL,
+    request_headers_actual TEXT NOT NULL DEFAULT '',
     request_body BLOB NOT NULL,
     upstream_headers TEXT NOT NULL,
+    upstream_headers_actual TEXT NOT NULL DEFAULT '',
     upstream_body BLOB NOT NULL,
+    upstream_response_headers TEXT NOT NULL DEFAULT '',
+    upstream_response_headers_actual TEXT NOT NULL DEFAULT '',
+    upstream_response_body BLOB NOT NULL DEFAULT X'',
     response_headers TEXT NOT NULL,
+    response_headers_actual TEXT NOT NULL DEFAULT '',
     response_body BLOB NOT NULL,
     error TEXT NOT NULL DEFAULT '',
     input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -73,6 +82,60 @@ CREATE INDEX IF NOT EXISTS idx_request_logs_started_at ON request_logs(started_a
 CREATE INDEX IF NOT EXISTS idx_request_logs_gateway_id ON request_logs(gateway_id);
 CREATE INDEX IF NOT EXISTS idx_request_logs_model ON request_logs(model);
 `)
+	if err != nil {
+		return err
+	}
+	for _, column := range []struct {
+		name       string
+		definition string
+	}{
+		{name: "request_url", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "client_response_status_code", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "upstream_response_status_code", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "request_headers_actual", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "upstream_headers_actual", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "upstream_response_headers", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "upstream_response_headers_actual", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "upstream_response_body", definition: "BLOB NOT NULL DEFAULT X''"},
+		{name: "response_headers_actual", definition: "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := s.addColumnIfMissing(column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	_, err = s.db.Exec(`
+UPDATE request_logs
+SET client_response_status_code = CASE WHEN client_response_status_code = 0 THEN status_code ELSE client_response_status_code END,
+    upstream_response_status_code = CASE WHEN upstream_response_status_code = 0 THEN status_code ELSE upstream_response_status_code END,
+    upstream_response_headers = CASE WHEN upstream_response_headers = '' THEN response_headers ELSE upstream_response_headers END,
+    upstream_response_body = CASE WHEN length(upstream_response_body) = 0 THEN response_body ELSE upstream_response_body END
+WHERE client_response_status_code = 0 OR upstream_response_status_code = 0
+`)
+	return err
+}
+
+func (s *Store) addColumnIfMissing(name, definition string) error {
+	rows, err := s.db.Query(`PRAGMA table_info(request_logs)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var existingName, columnType string
+		var notNull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &existingName, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if existingName == name {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`ALTER TABLE request_logs ADD COLUMN ` + name + ` ` + definition)
 	return err
 }
 
@@ -82,17 +145,23 @@ func (s *Store) Insert(ctx context.Context, log RequestLog) error {
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO request_logs (
     id, started_at, gateway_id, gateway_name, prefix, ingress_protocol,
-    upstream_protocol, model, request_path, upstream_url, method, status_code,
-    success, stream, duration_ms, request_headers, request_body,
-    upstream_headers, upstream_body, response_headers, response_body, error,
+    upstream_protocol, model, request_path, request_url, upstream_url, method,
+    status_code, client_response_status_code, upstream_response_status_code,
+    success, stream, duration_ms, request_headers, request_headers_actual,
+    request_body, upstream_headers, upstream_headers_actual, upstream_body,
+    upstream_response_headers, upstream_response_headers_actual, upstream_response_body,
+    response_headers, response_headers_actual, response_body, error,
     input_tokens, cache_read_tokens, cache_write_tokens, prompt_tokens,
     output_tokens, reasoning_tokens, cache_supported, usage_present, cache_source
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `, log.ID, log.StartedAt.UTC().Format(time.RFC3339Nano), log.GatewayID,
 		log.GatewayName, log.Prefix, log.IngressProtocol, log.UpstreamProtocol,
-		log.Model, log.RequestPath, log.UpstreamURL, log.Method, log.StatusCode,
-		boolInt(log.Success), boolInt(log.Stream), log.DurationMS, log.RequestHeaders,
-		emptyBlob(log.RequestBody), log.UpstreamHeaders, emptyBlob(log.UpstreamBody), log.ResponseHeaders,
+		log.Model, log.RequestPath, log.RequestURL, log.UpstreamURL, log.Method, log.StatusCode,
+		log.ClientResponseStatusCode, log.UpstreamResponseStatusCode, boolInt(log.Success),
+		boolInt(log.Stream), log.DurationMS, log.RequestHeaders, log.RequestHeadersActual,
+		emptyBlob(log.RequestBody), log.UpstreamHeaders, log.UpstreamHeadersActual,
+		emptyBlob(log.UpstreamBody), log.UpstreamResponseHeaders, log.UpstreamResponseHeadersActual,
+		emptyBlob(log.UpstreamResponseBody), log.ResponseHeaders, log.ResponseHeadersActual,
 		emptyBlob(log.ResponseBody), log.Error, log.Usage.InputTokens, log.Usage.CacheReadTokens,
 		log.Usage.CacheWriteTokens, log.Usage.PromptTokens, log.Usage.OutputTokens,
 		log.Usage.ReasoningTokens, boolInt(log.Usage.CacheSupported),
@@ -135,9 +204,11 @@ FROM request_logs` + where + ` ORDER BY started_at DESC LIMIT ? OFFSET ?`
 func (s *Store) Get(ctx context.Context, id string) (RequestLog, error) {
 	row := s.db.QueryRowContext(ctx, `
 SELECT id, started_at, gateway_id, gateway_name, prefix, ingress_protocol,
-upstream_protocol, model, request_path, upstream_url, method, status_code,
-success, stream, duration_ms, request_headers, request_body, upstream_headers,
-upstream_body, response_headers, response_body, error, input_tokens,
+upstream_protocol, model, request_path, request_url, upstream_url, method, status_code,
+client_response_status_code, upstream_response_status_code, success, stream, duration_ms,
+request_headers, request_headers_actual, request_body, upstream_headers, upstream_headers_actual,
+upstream_body, upstream_response_headers, upstream_response_headers_actual, upstream_response_body,
+response_headers, response_headers_actual, response_body, error, input_tokens,
 cache_read_tokens, cache_write_tokens, prompt_tokens, output_tokens,
 reasoning_tokens, cache_supported, usage_present, cache_source
 FROM request_logs WHERE id = ?`, id)
@@ -269,9 +340,12 @@ func scanFull(row scanner) (RequestLog, error) {
 	var ingress, upstream string
 	if err := row.Scan(&log.ID, &started, &log.GatewayID, &log.GatewayName,
 		&log.Prefix, &ingress, &upstream, &log.Model, &log.RequestPath,
-		&log.UpstreamURL, &log.Method, &log.StatusCode, &success, &stream,
-		&log.DurationMS, &log.RequestHeaders, &log.RequestBody,
-		&log.UpstreamHeaders, &log.UpstreamBody, &log.ResponseHeaders,
+		&log.RequestURL, &log.UpstreamURL, &log.Method, &log.StatusCode,
+		&log.ClientResponseStatusCode, &log.UpstreamResponseStatusCode, &success, &stream,
+		&log.DurationMS, &log.RequestHeaders, &log.RequestHeadersActual, &log.RequestBody,
+		&log.UpstreamHeaders, &log.UpstreamHeadersActual, &log.UpstreamBody,
+		&log.UpstreamResponseHeaders, &log.UpstreamResponseHeadersActual,
+		&log.UpstreamResponseBody, &log.ResponseHeaders, &log.ResponseHeadersActual,
 		&log.ResponseBody, &log.Error, &log.Usage.InputTokens,
 		&log.Usage.CacheReadTokens, &log.Usage.CacheWriteTokens,
 		&log.Usage.PromptTokens, &log.Usage.OutputTokens,

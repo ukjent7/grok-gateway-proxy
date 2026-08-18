@@ -70,6 +70,10 @@ func headersJSON(headers http.Header) string {
 	return marshalJSON(sanitizeHeaders(headers))
 }
 
+func headersJSONActual(headers http.Header) string {
+	return marshalJSON(headers)
+}
+
 func marshalJSON(value any) string {
 	b, err := json.Marshal(value)
 	if err != nil {
