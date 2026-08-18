@@ -1,376 +1,374 @@
-<!doctype html>
-<html lang="zh">
+<!DOCTYPE html>
+<html lang="zh-CN">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<meta name="theme-color" content="#0A0B0D" />
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Grok Gateway · 控制台</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230E1014'/%3E%3Cpath d='M9 11 L16 21 L23 11' stroke='%234FE2C0' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230d9488'/%3E%3Cpath d='M8 16h4l2-5 4 10 2-5h4' stroke='%23f0fdfa' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/static/style.css" />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
 
-<!-- ============ AMBIENT BACKGROUND ============ -->
+<!-- 氛围背景 -->
 <div class="ambient" aria-hidden="true">
-  <div class="ambient-mesh"></div>
+  <div class="ambient-aurora"></div>
   <div class="ambient-grid"></div>
+  <div class="ambient-noise"></div>
 </div>
 
 <div class="app">
 
-  <!-- ============ SIDEBAR ============ -->
-  <aside class="rail" id="sidebar">
+  <!-- ===================== 侧栏 ===================== -->
+  <aside class="rail">
     <div class="rail-brand">
-      <span class="rail-brand-mark" aria-hidden="true">
-        <svg viewBox="0 0 24 24" width="22" height="22"><path d="M5 7 L12 17 L19 7" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      </span>
+      <div class="rail-brand-mark">
+        <svg viewBox="0 0 20 20" width="18" height="18" fill="none" aria-hidden="true">
+          <path d="M2.5 10h3.2l1.8-4.5 3 9 1.8-4.5h5.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
       <div class="rail-brand-text">
         <strong>GROK GATEWAY</strong>
         <small>本地代理控制台</small>
       </div>
     </div>
 
-    <div class="rail-status" id="connStatus" title="代理监听地址">
-      <span class="dot dot-live" id="connDot"></span>
-      <span class="rail-status-text">监听中</span>
-      <code id="listenAddr">—</code>
+    <div class="rail-status">
+      <span class="dot dot-live"></span>
+      <span class="rail-status-text">代理监听中</span>
+      <code>online</code>
     </div>
 
-    <nav class="rail-nav" aria-label="主导航">
+    <nav class="rail-nav">
       <button class="rail-nav-item is-active" data-view="overview">
-        <span class="rail-nav-icon" aria-hidden="true">
-          <svg viewBox="0 0 16 16" width="16" height="16"><rect x="2" y="2" width="5" height="5" rx="1" fill="currentColor"/><rect x="9" y="2" width="5" height="5" rx="1" fill="currentColor" opacity="0.55"/><rect x="2" y="9" width="5" height="5" rx="1" fill="currentColor" opacity="0.55"/><rect x="9" y="9" width="5" height="5" rx="1" fill="currentColor"/></svg>
-        </span>
-        <span class="rail-nav-label">总览</span>
-        <kbd>1</kbd>
+        <span class="rail-nav-icon"><svg viewBox="0 0 16 16" width="15" height="15" fill="none"><rect x="2" y="2" width="5" height="5" rx="1.4" fill="currentColor"/><rect x="9" y="2" width="5" height="5" rx="1.4" fill="currentColor" opacity=".5"/><rect x="2" y="9" width="5" height="5" rx="1.4" fill="currentColor" opacity=".5"/><rect x="9" y="9" width="5" height="5" rx="1.4" fill="currentColor"/></svg></span>
+        总览 <kbd>1</kbd>
       </button>
       <button class="rail-nav-item" data-view="logs">
-        <span class="rail-nav-icon" aria-hidden="true">
-          <svg viewBox="0 0 16 16" width="16" height="16"><path d="M3 3.5h10M3 6h10M3 8.5h7M3 11h5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" fill="none"/></svg>
-        </span>
-        <span class="rail-nav-label">请求日志</span>
-        <kbd>2</kbd>
+        <span class="rail-nav-icon"><svg viewBox="0 0 16 16" width="15" height="15" fill="none"><path d="M3 3.5h10M3 6.2h10M3 8.9h7M3 11.6h5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></span>
+        请求日志 <kbd>2</kbd>
       </button>
       <button class="rail-nav-item" data-view="gateways">
-        <span class="rail-nav-icon" aria-hidden="true">
-          <svg viewBox="0 0 16 16" width="16" height="16"><circle cx="8" cy="8" r="2" fill="currentColor"/><path d="M8 1.5v2.5M8 12v2.5M1.5 8h2.5M12 8h2.5M3.7 3.7l1.7 1.7M10.6 10.6l1.7 1.7M3.7 12.3l1.7-1.7M10.6 5.4l1.7-1.7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" fill="none"/></svg>
-        </span>
-        <span class="rail-nav-label">网关配置</span>
-        <kbd>3</kbd>
+        <span class="rail-nav-icon"><svg viewBox="0 0 16 16" width="15" height="15" fill="none"><circle cx="8" cy="8" r="2.1" fill="currentColor"/><path d="M8 1.6v2.6M8 11.8v2.6M1.6 8h2.6M11.8 8h2.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></span>
+        网关配置 <kbd>3</kbd>
       </button>
       <button class="rail-nav-item" data-view="setup">
-        <span class="rail-nav-icon" aria-hidden="true">
-          <svg viewBox="0 0 16 16" width="16" height="16"><path d="M5 4l-3 4 3 4M11 4l3 4-3 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
-        </span>
-        <span class="rail-nav-label">接入代码</span>
-        <kbd>4</kbd>
+        <span class="rail-nav-icon"><svg viewBox="0 0 16 16" width="15" height="15" fill="none"><path d="M5.5 4 2.5 8l3 4M10.5 4l3 4-3 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        接入代码 <kbd>4</kbd>
       </button>
     </nav>
 
-    <div class="rail-divider"><span>网关实时信号</span></div>
-    <div class="rail-channels" id="railChannels">
-      <!-- populated by JS: per-gateway pulse strip -->
-    </div>
+    <div class="rail-divider">实时通道</div>
+    <div class="rail-channels" id="railChannels"></div>
 
     <div class="rail-foot">
-      <button class="rail-foot-btn" id="cmdKBtn" title="打开命令面板">
-        <span class="rail-foot-icon" aria-hidden="true">
-          <svg viewBox="0 0 16 16" width="14" height="14"><circle cx="7" cy="7" r="4.5" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="M10.5 10.5l3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-        </span>
-        <span>快速操作</span>
-        <kbd class="kbd-combo">⌘K</kbd>
-      </button>
-      <button class="rail-foot-btn" id="refreshAllBtn" title="刷新全部数据">
-        <span class="rail-foot-icon" aria-hidden="true">
-          <svg viewBox="0 0 16 16" width="14" height="14"><path d="M2.5 8a5.5 5.5 0 0 1 9.4-3.9M13.5 8a5.5 5.5 0 0 1-9.4 3.9" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/><path d="M11 1.5v3h-3M5 14.5v-3h3" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </span>
-        <span>刷新</span>
-      </button>
+      <div class="rail-foot-meta">v2.0 · 本地模式 · Grok Build 就绪</div>
     </div>
   </aside>
 
-  <!-- ============ MAIN ============ -->
+  <!-- ===================== 主区域 ===================== -->
   <main class="main">
 
-    <!-- ---------- OVERVIEW ---------- -->
-    <section class="view is-active" id="view-overview">
-      <header class="view-head">
-        <div class="view-head-title">
-          <h1>总览</h1>
-          <p>最近请求活动、缓存命中率与网关健康状态</p>
+    <header class="topbar">
+      <button id="cmdKBtn" class="search-pill">
+        <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="4.4" stroke="currentColor" stroke-width="1.5"/><path d="m10.5 10.5 3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        <span class="search-pill-text">搜索或输入命令…</span>
+        <span class="kbd-combo"><kbd>⌘</kbd><kbd>K</kbd></span>
+      </button>
+      <div class="topbar-actions">
+        <div class="addr-chip">
+          <span class="dot dot-live"></span>
+          <span class="addr-label">监听</span>
+          <code id="listenAddr">—</code>
         </div>
-        <div class="range-picker" id="rangePicker" role="tablist">
-          <button data-range="1h" class="is-active" role="tab">1小时</button>
-          <button data-range="24h" role="tab">24小时</button>
-          <button data-range="7d" role="tab">7天</button>
-          <button data-range="all" role="tab">全部</button>
-        </div>
-      </header>
-
-      <div class="stat-grid" id="statGrid">
-        <div class="stat-card" data-stat="requests">
-          <div class="stat-card-head">
-            <span class="stat-label">总请求数</span>
-            <span class="stat-icon" aria-hidden="true">
-              <svg viewBox="0 0 16 16" width="14" height="14"><path d="M2 4l6-2 6 2-6 2-6-2zM2 8l6 2 6-2M2 12l6 2 6-2" stroke="currentColor" stroke-width="1.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            </span>
-          </div>
-          <span class="stat-value" id="statRequests">—</span>
-          <span class="stat-sub" id="statRequestsSub">&nbsp;</span>
-          <svg class="stat-spark" data-stat="requests" viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true"></svg>
-        </div>
-        <div class="stat-card" data-stat="success">
-          <div class="stat-card-head">
-            <span class="stat-label">成功率</span>
-            <span class="stat-icon" aria-hidden="true">
-              <svg viewBox="0 0 16 16" width="14" height="14"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="M5.5 8l1.8 1.8L11 6.5" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            </span>
-          </div>
-          <span class="stat-value" id="statSuccess">—</span>
-          <span class="stat-sub" id="statSuccessSub">&nbsp;</span>
-          <svg class="stat-spark" data-stat="success" viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true"></svg>
-        </div>
-        <div class="stat-card" data-stat="cacheHit">
-          <div class="stat-card-head">
-            <span class="stat-label">缓存命中率</span>
-            <span class="stat-icon" aria-hidden="true">
-              <svg viewBox="0 0 16 16" width="14" height="14"><rect x="2" y="6" width="3" height="6" rx="0.5" fill="currentColor"/><rect x="6.5" y="3" width="3" height="9" rx="0.5" fill="currentColor"/><rect x="11" y="7" width="3" height="5" rx="0.5" fill="currentColor"/></svg>
-            </span>
-          </div>
-          <span class="stat-value" id="statCacheHit">—</span>
-          <span class="stat-sub" id="statCacheHitSub">&nbsp;</span>
-          <svg class="stat-spark" data-stat="cacheHit" viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true"></svg>
-        </div>
-        <div class="stat-card" data-stat="cacheCoverage">
-          <div class="stat-card-head">
-            <span class="stat-label">缓存覆盖率</span>
-            <span class="stat-icon" aria-hidden="true">
-              <svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 2a6 6 0 1 0 6 6" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/><path d="M8 2v6h6" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            </span>
-          </div>
-          <span class="stat-value" id="statCacheCoverage">—</span>
-          <span class="stat-sub" id="statCacheCoverageSub">&nbsp;</span>
-          <svg class="stat-spark" data-stat="cacheCoverage" viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true"></svg>
-        </div>
-        <div class="stat-card" data-stat="tokens">
-          <div class="stat-card-head">
-            <span class="stat-label">输入 / 输出 Token</span>
-            <span class="stat-icon" aria-hidden="true">
-              <svg viewBox="0 0 16 16" width="14" height="14"><path d="M3 5h10M3 8h10M3 11h6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-            </span>
-          </div>
-          <span class="stat-value" id="statTokens">—</span>
-          <span class="stat-sub" id="statTokensSub">&nbsp;</span>
-          <svg class="stat-spark" data-stat="tokens" viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true"></svg>
-        </div>
-        <div class="stat-card" data-stat="reasoning">
-          <div class="stat-card-head">
-            <span class="stat-label">推理 Token</span>
-            <span class="stat-icon" aria-hidden="true">
-              <svg viewBox="0 0 16 16" width="14" height="14"><path d="M8 2l1.5 4.5L14 8l-4.5 1.5L8 14l-1.5-4.5L2 8l4.5-1.5z" fill="currentColor"/></svg>
-            </span>
-          </div>
-          <span class="stat-value" id="statReasoning">—</span>
-          <span class="stat-sub" id="statReasoningSub">&nbsp;</span>
-          <svg class="stat-spark" data-stat="reasoning" viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true"></svg>
-        </div>
+        <button id="refreshAllBtn" class="btn-ghost" title="刷新全部数据">
+          <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true"><path d="M2.7 8a5.3 5.3 0 0 1 9-3.8M13.3 8a5.3 5.3 0 0 1-9 3.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M11.9 1.7v2.7h-2.7M4.1 14.3v-2.7h2.7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          刷新
+        </button>
       </div>
+    </header>
 
-      <div class="panel-row">
-        <div class="panel gateway-overview">
-          <div class="panel-head">
-            <div>
-              <h2>网关实时信号</h2>
-              <span class="muted small">最近 40 次请求 · 每个刻度代表一次调用，高度反映耗时</span>
+    <div class="content">
+
+      <!-- ========== 总览 ========== -->
+      <section id="view-overview" class="view is-active">
+        <div class="view-head">
+          <div class="view-head-title">
+            <h1>总览</h1>
+            <p>最近请求活动、缓存命中率与网关健康状态</p>
+          </div>
+          <div class="head-actions">
+            <div class="range-picker" id="rangePicker">
+              <button data-range="1h" class="is-active">1小时</button>
+              <button data-range="24h">24小时</button>
+              <button data-range="7d">7天</button>
+              <button data-range="all">全部</button>
             </div>
-            <span class="panel-tag" id="pulseRange">1h</span>
           </div>
-          <div id="gatewayPulseList" class="gw-pulse-list"><!-- JS --></div>
         </div>
 
-        <div class="panel recent-panel">
-          <div class="panel-head">
-            <div>
-              <h2>最近请求</h2>
-              <span class="muted small">最新 12 条流量入口</span>
+        <div class="stat-grid">
+          <article class="stat-card a-teal">
+            <div class="stat-card-head">
+              <span class="stat-label">总请求数</span>
+              <span class="stat-icon"><svg viewBox="0 0 16 16" width="13" height="13" fill="none"><path d="M1.5 8h2.6l1.5-3.8 2.6 7.6 1.5-3.8h4.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
             </div>
-            <button class="btn-ghost small" data-goto="logs">查看全部 →</button>
+            <div class="stat-value" id="statRequests">—</div>
+            <div class="stat-sub" id="statRequestsSub">—</div>
+            <svg class="stat-spark" data-stat="requests" viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true"></svg>
+          </article>
+
+          <article class="stat-card a-emerald">
+            <div class="stat-card-head">
+              <span class="stat-label">成功率</span>
+              <span class="stat-icon"><svg viewBox="0 0 16 16" width="13" height="13" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.4"/><path d="m5.4 8.2 1.8 1.8 3.4-3.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+            </div>
+            <div class="stat-body">
+              <div class="stat-main">
+                <div class="stat-value" id="statSuccess">—</div>
+                <div class="stat-sub" id="statSuccessSub">—</div>
+              </div>
+              <div class="stat-gauge" id="gaugeSuccess" aria-hidden="true"></div>
+            </div>
+            <svg class="stat-spark" data-stat="success" viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true"></svg>
+          </article>
+
+          <article class="stat-card a-sky">
+            <div class="stat-card-head">
+              <span class="stat-label">缓存命中率</span>
+              <span class="stat-icon"><svg viewBox="0 0 16 16" width="13" height="13" fill="none"><path d="M8.7 1.5 3.5 9h3.2l-.7 5.5L11.5 7H8.3l.4-5.5Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg></span>
+            </div>
+            <div class="stat-body">
+              <div class="stat-main">
+                <div class="stat-value" id="statCacheHit">—</div>
+                <div class="stat-sub" id="statCacheHitSub">—</div>
+              </div>
+              <div class="stat-gauge" id="gaugeCacheHit" aria-hidden="true"></div>
+            </div>
+            <svg class="stat-spark" data-stat="cacheHit" viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true"></svg>
+          </article>
+
+          <article class="stat-card a-violet">
+            <div class="stat-card-head">
+              <span class="stat-label">缓存覆盖率</span>
+              <span class="stat-icon"><svg viewBox="0 0 16 16" width="13" height="13" fill="none"><path d="m8 2 6 3-6 3-6-3 6-3Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="m2 8.5 6 3 6-3M2 11.5l6 3 6-3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+            </div>
+            <div class="stat-body">
+              <div class="stat-main">
+                <div class="stat-value" id="statCacheCoverage">—</div>
+                <div class="stat-sub" id="statCacheCoverageSub">—</div>
+              </div>
+              <div class="stat-gauge" id="gaugeCoverage" aria-hidden="true"></div>
+            </div>
+            <svg class="stat-spark" data-stat="cacheCoverage" viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true"></svg>
+          </article>
+
+          <article class="stat-card a-amber">
+            <div class="stat-card-head">
+              <span class="stat-label">输入 / 输出 Token</span>
+              <span class="stat-icon"><svg viewBox="0 0 16 16" width="13" height="13" fill="none"><path d="M5.5 2 3.5 8l2 6M10.5 2l2 6-2 6M2 6h12M2 10h12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+            </div>
+            <div class="stat-value" id="statTokens">—</div>
+            <div class="stat-sub" id="statTokensSub">—</div>
+            <svg class="stat-spark" data-stat="tokens" viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true"></svg>
+          </article>
+
+          <article class="stat-card a-rose">
+            <div class="stat-card-head">
+              <span class="stat-label">推理 Token</span>
+              <span class="stat-icon"><svg viewBox="0 0 16 16" width="13" height="13" fill="none"><rect x="4" y="4" width="8" height="8" rx="1.6" stroke="currentColor" stroke-width="1.3"/><path d="M6.5 1.5v2M9.5 1.5v2M6.5 12.5v2M9.5 12.5v2M1.5 6.5h2M1.5 9.5h2M12.5 6.5h2M12.5 9.5h2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg></span>
+            </div>
+            <div class="stat-value" id="statReasoning">—</div>
+            <div class="stat-sub" id="statReasoningSub">—</div>
+            <svg class="stat-spark" data-stat="reasoning" viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true"></svg>
+          </article>
+        </div>
+
+        <div class="panel-row">
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>网关实时信号</h2>
+                <span class="muted">最近 40 次请求 · 每个刻度代表一次调用，高度反映耗时</span>
+              </div>
+              <span class="panel-tag" id="pulseRange">1小时</span>
+            </div>
+            <div class="gw-pulse-list" id="gatewayPulseList"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>最近请求</h2>
+                <span class="muted">最新 12 条流量入口</span>
+              </div>
+              <button class="btn-ghost small" data-goto="logs">查看全部 →</button>
+            </div>
+            <div class="recent-log-list" id="recentLogList"></div>
+          </section>
+        </div>
+      </section>
+
+      <!-- ========== 请求日志 ========== -->
+      <section id="view-logs" class="view">
+        <div class="view-head">
+          <div class="view-head-title">
+            <h1>请求日志</h1>
+            <p>按网关 / 模型 / 状态筛选，点击行查看完整报文与变更对比</p>
           </div>
-          <div id="recentLogList" class="recent-log-list"><!-- JS --></div>
+          <div class="head-actions">
+            <button id="logsRefreshBtn" class="btn-ghost">
+              <svg viewBox="0 0 16 16" width="13" height="13" fill="none"><path d="M2.7 8a5.3 5.3 0 0 1 9-3.8M13.3 8a5.3 5.3 0 0 1-9 3.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M11.9 1.7v2.7h-2.7M4.1 14.3v-2.7h2.7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              刷新
+            </button>
+            <button id="logsClearBtn" class="btn-danger">
+              <svg viewBox="0 0 16 16" width="13" height="13" fill="none"><path d="M3 4h10M5.5 4V2.6h5V4M5 4l.4 9.4h5.2L11 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              清空日志
+            </button>
+          </div>
         </div>
-      </div>
-    </section>
 
-    <!-- ---------- LOGS ---------- -->
-    <section class="view" id="view-logs">
-      <header class="view-head">
-        <div class="view-head-title">
-          <h1>请求日志</h1>
-          <p>按网关 / 模型 / 状态筛选，点击行查看完整报文与变更对比</p>
-        </div>
-        <div class="head-actions">
-          <button class="btn-ghost small" id="logsRefreshBtn">
-            <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M2.5 8a5.5 5.5 0 0 1 9.4-3.9M13.5 8a5.5 5.5 0 0 1-9.4 3.9" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/><path d="M11 1.5v3h-3M5 14.5v-3h3" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            刷新
-          </button>
-          <button class="btn-danger small" id="logsClearBtn">
-            <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M3 4h10M5.5 4V2.5h5V4M5 4l.5 9h5l.5-9" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            清空日志
-          </button>
-        </div>
-      </header>
+        <div class="panel table-panel">
+          <div class="filter-bar">
+            <div class="select-wrap">
+              <select id="filterGateway"><option value="">全部网关</option></select>
+              <span class="select-caret"><svg viewBox="0 0 16 16" width="11" height="11" fill="none"><path d="m4 6.5 4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+            </div>
+            <div class="select-wrap">
+              <select id="filterStatus">
+                <option value="">全部状态</option>
+                <option value="success">仅成功</option>
+                <option value="failure">仅失败</option>
+              </select>
+              <span class="select-caret"><svg viewBox="0 0 16 16" width="11" height="11" fill="none"><path d="m4 6.5 4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+            </div>
+            <div class="input-wrap">
+              <svg viewBox="0 0 16 16" width="13" height="13" fill="none"><circle cx="7" cy="7" r="4.4" stroke="currentColor" stroke-width="1.5"/><path d="m10.5 10.5 3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+              <input id="filterModel" type="text" placeholder="搜索模型名称，如 grok-4" autocomplete="off">
+            </div>
+            <div class="select-wrap">
+              <select id="filterLimit">
+                <option value="50">显示 50 条</option>
+                <option value="100">显示 100 条</option>
+                <option value="200">显示 200 条</option>
+                <option value="500">显示 500 条</option>
+              </select>
+              <span class="select-caret"><svg viewBox="0 0 16 16" width="11" height="11" fill="none"><path d="m4 6.5 4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+            </div>
+          </div>
 
-      <div class="filter-bar">
-        <div class="select-wrap">
-          <select id="filterGateway" aria-label="按网关筛选">
-            <option value="">全部网关</option>
-          </select>
-          <span class="select-caret" aria-hidden="true"><svg viewBox="0 0 12 12" width="10" height="10"><path d="M3 5l3 3 3-3" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/></svg></span>
-        </div>
-        <div class="input-wrap">
-          <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><circle cx="7" cy="7" r="4.5" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="M10.5 10.5l3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-          <input id="filterModel" type="text" placeholder="按模型名筛选…" />
-        </div>
-        <div class="select-wrap">
-          <select id="filterStatus" aria-label="按状态筛选">
-            <option value="">全部状态</option>
-            <option value="success">仅成功</option>
-            <option value="error">仅失败</option>
-          </select>
-          <span class="select-caret" aria-hidden="true"><svg viewBox="0 0 12 12" width="10" height="10"><path d="M3 5l3 3 3-3" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/></svg></span>
-        </div>
-        <div class="select-wrap">
-          <select id="filterLimit" aria-label="每页条数">
-            <option value="50">显示 50 条</option>
-            <option value="100">显示 100 条</option>
-            <option value="200">显示 200 条</option>
-            <option value="500">显示 500 条</option>
-          </select>
-          <span class="select-caret" aria-hidden="true"><svg viewBox="0 0 12 12" width="10" height="10"><path d="M3 5l3 3 3-3" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/></svg></span>
-        </div>
-      </div>
+          <div class="table-wrap">
+            <table class="log-table">
+              <thead>
+                <tr>
+                  <th>时间</th><th>网关</th><th>模型</th><th>状态</th>
+                  <th>耗时</th><th>流式</th><th>Token (in/out)</th><th>缓存命中</th>
+                </tr>
+              </thead>
+              <tbody id="logTableBody"></tbody>
+            </table>
+          </div>
 
-      <div class="table-wrap panel">
-        <table class="log-table">
-          <thead>
-            <tr>
-              <th>时间</th>
-              <th>网关</th>
-              <th>模型</th>
-              <th>状态</th>
-              <th>耗时</th>
-              <th>流式</th>
-              <th>Token (in/out)</th>
-              <th>缓存命中</th>
-            </tr>
-          </thead>
-          <tbody id="logTableBody">
-            <tr class="empty-row"><td colspan="8">
-              <div class="skeleton-line"></div>
-              <div class="skeleton-line"></div>
-              <div class="skeleton-line"></div>
-            </td></tr>
-          </tbody>
-        </table>
-      </div>
-      <div class="table-foot">
-        <button class="btn-ghost small" id="logsLoadMoreBtn">加载更多</button>
-      </div>
-    </section>
+          <div class="table-foot">
+            <button id="logsLoadMoreBtn" class="btn-ghost">加载更多</button>
+          </div>
+        </div>
+      </section>
 
-    <!-- ---------- GATEWAYS ---------- -->
-    <section class="view" id="view-gateways">
-      <header class="view-head">
-        <div class="view-head-title">
-          <h1>网关配置</h1>
-          <p>分别编辑每个网关的上游地址、请求头白名单和 User-Agent 覆盖</p>
+      <!-- ========== 网关配置 ========== -->
+      <section id="view-gateways" class="view">
+        <div class="view-head">
+          <div class="view-head-title">
+            <h1>网关配置</h1>
+            <p>分别编辑每个网关的上游地址、请求头白名单和 User-Agent 覆盖</p>
+          </div>
+          <div class="head-actions">
+            <button id="gatewaysReloadBtn" class="btn-ghost">
+              <svg viewBox="0 0 16 16" width="13" height="13" fill="none"><path d="M2.7 8a5.3 5.3 0 0 1 9-3.8M13.3 8a5.3 5.3 0 0 1-9 3.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M11.9 1.7v2.7h-2.7M4.1 14.3v-2.7h2.7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              重新加载
+            </button>
+          </div>
         </div>
-        <div class="head-actions">
-          <button class="btn-ghost small" id="gatewaysReloadBtn">
-            <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M2.5 8a5.5 5.5 0 0 1 9.4-3.9M13.5 8a5.5 5.5 0 0 1-9.4 3.9" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/></svg>
-            重新加载
-          </button>
-        </div>
-      </header>
-      <div id="gatewayCards" class="gw-config-grid"><!-- JS --></div>
-    </section>
+        <div class="gw-config-grid" id="gatewayCards"></div>
+      </section>
 
-    <!-- ---------- SETUP ---------- -->
-    <section class="view" id="view-setup">
-      <header class="view-head">
-        <div class="view-head-title">
-          <h1>接入代码</h1>
-          <p>复制以下配置片段到 Grok Build，指向对应本地网关</p>
+      <!-- ========== 接入代码 ========== -->
+      <section id="view-setup" class="view">
+        <div class="view-head">
+          <div class="view-head-title">
+            <h1>接入代码</h1>
+            <p>复制以下配置片段到 Grok Build，指向对应本地网关</p>
+          </div>
+          <div class="head-actions">
+            <button id="setupReloadBtn" class="btn-ghost">
+              <svg viewBox="0 0 16 16" width="13" height="13" fill="none"><path d="M2.7 8a5.3 5.3 0 0 1 9-3.8M13.3 8a5.3 5.3 0 0 1-9 3.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M11.9 1.7v2.7h-2.7M4.1 14.3v-2.7h2.7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              重新加载
+            </button>
+          </div>
         </div>
-        <div class="head-actions">
-          <button class="btn-ghost small" id="setupReloadBtn">
-            <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M2.5 8a5.5 5.5 0 0 1 9.4-3.9M13.5 8a5.5 5.5 0 0 1-9.4 3.9" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/></svg>
-            重新加载
-          </button>
-        </div>
-      </header>
-      <div id="setupSnippets" class="setup-grid"><!-- JS --></div>
-    </section>
+        <div class="setup-grid" id="setupSnippets"></div>
+      </section>
 
+    </div>
   </main>
 </div>
 
-<!-- ============ LOG DETAIL DRAWER ============ -->
+<!-- ===================== 请求详情抽屉 ===================== -->
 <div class="drawer-backdrop" id="drawerBackdrop"></div>
 <aside class="drawer" id="logDrawer" aria-hidden="true">
   <div class="drawer-head">
     <div class="drawer-head-main">
-      <h2 id="drawerTitle">请求详情</h2>
-      <code id="drawerId" class="muted small">—</code>
+      <div class="drawer-eyebrow">请求详情 <code id="drawerId">—</code></div>
+      <h2 id="drawerTitle">—</h2>
     </div>
     <div class="drawer-head-actions">
-      <button class="btn-icon" id="drawerCopyIdBtn" title="复制请求 ID">
-        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><rect x="5" y="5" width="8" height="8" rx="1.5" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M3 11V3.5A1.5 1.5 0 0 1 4.5 2H11" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>
+      <button id="drawerCopyIdBtn" class="btn-ghost small">
+        <svg viewBox="0 0 16 16" width="11" height="11" fill="none"><rect x="5" y="5" width="8" height="8" rx="1.6" stroke="currentColor" stroke-width="1.4"/><path d="M3 11V3.6A1.6 1.6 0 0 1 4.6 2H11" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        复制 ID
       </button>
-      <button class="btn-icon" id="drawerCloseBtn" title="关闭 (Esc)">
-        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/></svg>
+      <button id="drawerCloseBtn" class="btn-icon" title="关闭 (esc)">
+        <svg viewBox="0 0 16 16" width="13" height="13" fill="none"><path d="m4 4 8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
       </button>
     </div>
   </div>
-  <div class="drawer-meta" id="drawerMeta"><!-- JS --></div>
+
+  <div class="drawer-meta" id="drawerMeta"></div>
+
   <div class="drawer-tabs" id="drawerTabs">
-    <button class="drawer-tab is-active" data-tab="request-compare">
-      <svg viewBox="0 0 14 14" width="11" height="11" aria-hidden="true"><path d="M2 4l3-3 3 3M5 1v6M12 10l-3 3-3-3M9 13V7" stroke="currentColor" stroke-width="1.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      请求对比
-    </button>
-    <button class="drawer-tab" data-tab="response-compare">
-      <svg viewBox="0 0 14 14" width="11" height="11" aria-hidden="true"><path d="M2 4l3-3 3 3M5 1v6M12 10l-3 3-3-3M9 13V7" stroke="currentColor" stroke-width="1.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      响应对比
-    </button>
+    <button class="drawer-tab is-active" data-tab="request-compare">请求对比</button>
+    <button class="drawer-tab" data-tab="response-compare">响应对比</button>
     <button class="drawer-tab" data-tab="request">客户端请求</button>
     <button class="drawer-tab" data-tab="upstream">上游请求</button>
     <button class="drawer-tab" data-tab="upstream-response">上游原始响应</button>
     <button class="drawer-tab" data-tab="response">最终客户端响应</button>
     <button class="drawer-tab" data-tab="headers">请求头</button>
   </div>
+
   <div class="drawer-body">
     <div class="compare-view" id="drawerCompare"></div>
-    <pre class="code-block" id="drawerCode">—</pre>
+    <pre class="code-block" id="drawerCode" style="display:none"></pre>
   </div>
 </aside>
 
-<!-- ============ COMMAND PALETTE ============ -->
-<div class="cmdk-backdrop" id="cmdkBackdrop" aria-hidden="true"></div>
-<div class="cmdk" id="cmdk" role="dialog" aria-modal="true" aria-label="命令面板" aria-hidden="true">
+<!-- ===================== 命令面板 ===================== -->
+<div class="cmdk-backdrop" id="cmdkBackdrop"></div>
+<div class="cmdk" id="cmdk" aria-hidden="true">
   <div class="cmdk-input-wrap">
-    <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><circle cx="7" cy="7" r="4.5" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="M10.5 10.5l3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-    <input id="cmdkInput" type="text" placeholder="跳转到视图、刷新数据或清空日志…" autocomplete="off" />
-    <kbd class="kbd-combo">esc</kbd>
+    <svg viewBox="0 0 16 16" width="15" height="15" fill="none"><circle cx="7" cy="7" r="4.4" stroke="currentColor" stroke-width="1.5"/><path d="m10.5 10.5 3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+    <input id="cmdkInput" type="text" placeholder="输入命令或搜索…" autocomplete="off" spellcheck="false">
   </div>
-  <div class="cmdk-list" id="cmdkList" role="listbox"></div>
+  <div class="cmdk-list" id="cmdkList"></div>
+  <div class="cmdk-foot">
+    <span><kbd>↑</kbd><kbd>↓</kbd> 导航</span>
+    <span><kbd>↵</kbd> 执行</span>
+    <span><kbd>esc</kbd> 关闭</span>
+  </div>
 </div>
 
-<!-- ============ TOAST STACK ============ -->
-<div class="toast-stack" id="toastStack" aria-live="polite" aria-atomic="true"></div>
+<div class="toast-stack" id="toastStack"></div>
 
-<script src="/static/app.js"></script>
+<script src="app.js"></script>
 </body>
 </html>
