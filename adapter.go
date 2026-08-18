@@ -307,6 +307,95 @@ func (VercelResponsesAdapter) NormalizeError(status int, body []byte) []byte {
 	return normalizeUpstreamError(status, body)
 }
 
+// Vercel's AI Gateway keeps long-running SSE responses alive with periodic
+// ping events (data: {"type":"ping"}). Clients with a strict Responses event
+// enum (e.g. Grok Build) fail to deserialize those, so drop them before the
+// stream reaches the client. Every other event is passed through untouched.
+func (VercelResponsesAdapter) TransformSSE(reader io.Reader) io.Reader {
+	return &vercelSSEReader{reader: bufio.NewReaderSize(reader, 64*1024)}
+}
+
+type vercelSSEReader struct {
+	reader    *bufio.Reader
+	pending   bytes.Buffer
+	eventLine []byte
+	skipBlank bool
+	done      bool
+	err       error
+}
+
+func (r *vercelSSEReader) Read(p []byte) (int, error) {
+	for {
+		if r.pending.Len() > 0 {
+			return r.pending.Read(p)
+		}
+		if r.done {
+			return 0, r.err
+		}
+		line, err := r.reader.ReadBytes('\n')
+		if len(line) == 0 && err != nil {
+			r.done = true
+			r.err = err
+			r.flushEventLine()
+			if r.pending.Len() > 0 {
+				return r.pending.Read(p)
+			}
+			return 0, err
+		}
+		if len(line) == 0 {
+			continue
+		}
+		trimmed := bytes.TrimRight(line, "\r\n")
+		switch {
+		case bytes.HasPrefix(trimmed, []byte("event:")):
+			r.flushEventLine()
+			r.eventLine = append(r.eventLine[:0], line...)
+		case bytes.HasPrefix(trimmed, []byte("data:")):
+			payload := bytes.TrimSpace(trimmed[len("data:"):])
+			if isVercelPing(payload) {
+				r.eventLine = nil
+				r.skipBlank = true
+				continue
+			}
+			r.flushEventLine()
+			r.pending.Write(line)
+		default:
+			// Drop the blank line that terminates a dropped ping event so the
+			// stream stays byte-identical apart from the removed event.
+			if r.skipBlank && len(trimmed) == 0 {
+				r.skipBlank = false
+				continue
+			}
+			r.skipBlank = false
+			r.flushEventLine()
+			r.pending.Write(line)
+		}
+	}
+}
+
+func (r *vercelSSEReader) flushEventLine() {
+	if len(r.eventLine) > 0 {
+		r.pending.Write(r.eventLine)
+		r.eventLine = nil
+	}
+}
+
+func isVercelPing(payload []byte) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	if bytes.Equal(payload, []byte("ping")) {
+		return true
+	}
+	var event struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(payload, &event) != nil {
+		return false
+	}
+	return event.Type == "ping"
+}
+
 func validateJSONRequest(body []byte, protocolName string) error {
 	if len(strings.TrimSpace(string(body))) == 0 {
 		return fmt.Errorf("%s request body cannot be empty", protocolName)

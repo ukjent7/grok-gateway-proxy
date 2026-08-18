@@ -40,6 +40,42 @@ func TestSenseNovaTransformsToolCallTypesWithoutChangingToolDefinitions(t *testi
 	}
 }
 
+func TestVercelFiltersPingEventsFromResponsesStream(t *testing.T) {
+	adapter := VercelResponsesAdapter{}
+	input := "event: ping\ndata: {\"type\":\"ping\"}\n\n" +
+		"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r1\"}}\n\n" +
+		"event: ping\ndata: {\"type\":\"ping\"}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\"}}\n\n" +
+		"data: [DONE]\n\n"
+	want := "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r1\"}}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\"}}\n\n" +
+		"data: [DONE]\n\n"
+	reader := adapter.TransformSSE(strings.NewReader(input))
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != want {
+		t.Fatalf("ping events were not filtered:\nwant: %q\ngot:  %q", want, body)
+	}
+}
+
+func TestVercelPassesResponsesStreamThroughUnchanged(t *testing.T) {
+	adapter := VercelResponsesAdapter{}
+	input := "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r1\",\"status\":\"in_progress\"}}\n\n" +
+		"event: response.reasoning.delta\ndata: {\"type\":\"response.reasoning.delta\",\"delta\":\"think\"}\n\n" +
+		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\"}}\n\n"
+	reader := adapter.TransformSSE(strings.NewReader(input))
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != input {
+		t.Fatalf("stream was reserialized or changed unexpectedly:\nwant: %q\ngot:  %q", input, body)
+	}
+}
+
 func TestSenseNovaTransformsStreamingToolCalls(t *testing.T) {
 	adapter := SenseNovaChatAdapter{}
 	input := "data: {\"id\":\"chunk-1\",\"created\":1,\"model\":\"demo\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"type\":\"function_call\"}]},\"finish_reason\":\"\"}],\"request_id\":\"chunk-1\"}\n\ndata: [DONE]\n\n"
