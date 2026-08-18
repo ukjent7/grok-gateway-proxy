@@ -1,20 +1,18 @@
 'use strict';
 
 /* ============================================================
-   Grok Gateway Console · v2
-   ----------------------------------------------------------
-   Vanilla JS, no frameworks. Communicates with the Go backend
-   via /api/* endpoints. Renders everything client-side.
+   Grok Gateway Console · v3
+   Vanilla JS，通过 /api/* 与 Go 后端通信，全部客户端渲染。
    ============================================================ */
 
-/* ----------------- State ----------------- */
+/* ---------------- State ---------------- */
 const state = {
-  gateways: {},          // id -> GatewayConfig
+  gateways: {},
   listenAddr: '',
   metrics: null,
-  logs: [],              // current log list (logs view)
-  recentLogs: [],        // last 12 logs (overview side panel)
-  sparkSeries: [],       // last 30 logs oldest→newest, used for sparklines
+  logs: [],
+  recentLogs: [],
+  sparkSeries: [],
   logsOffset: 0,
   logsLimit: 50,
   range: '1h',
@@ -23,12 +21,12 @@ const state = {
   drawerTab: 'request-compare',
   pollTimer: null,
   cmdkSelected: 0,
-  cmdkItems: [],
+  cmdkItems: []
 };
 
 const GW_ORDER = ['oc', 'st', 've'];
 
-/* ----------------- Helpers ----------------- */
+/* ---------------- Helpers ---------------- */
 function $(sel, root) { return (root || document).querySelector(sel); }
 function $all(sel, root) { return Array.from((root || document).querySelectorAll(sel)); }
 
@@ -58,10 +56,11 @@ function fmtTimeShort(iso) {
   return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 }
 function escapeHtml(str) {
-  return String(str == null ? '' : str).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  return String(str == null ? '' : str).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
 }
 function escapeAttr(str) { return escapeHtml(str); }
-
 function rangeToFrom(range) {
   const now = new Date();
   if (range === '1h') return new Date(now.getTime() - 60 * 60 * 1000);
@@ -69,12 +68,11 @@ function rangeToFrom(range) {
   if (range === '7d') return new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
   return null;
 }
-
 function rangeLabel(range) {
   return ({ '1h': '1小时', '24h': '24小时', '7d': '7天', 'all': '全部' })[range] || range;
 }
 
-/* ----------------- API client ----------------- */
+/* ---------------- API client ---------------- */
 async function api(path, opts) {
   const res = await fetch('/api' + path, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts));
   let body = null;
@@ -86,13 +84,12 @@ async function api(path, opts) {
   return body;
 }
 
-/* ----------------- Toast stack ----------------- */
+/* ---------------- Toast ---------------- */
 const toastIcons = {
   success: '<svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><path d="M3.5 8.5l3 3 6-6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   error: '<svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>',
-  info: '<svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><path d="M8 5.5v6M8 3.5v.01" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/></svg>',
+  info: '<svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><path d="M8 5.5v6M8 3.5v.01" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/></svg>'
 };
-
 function showToast(message, kind) {
   const stack = $('#toastStack');
   if (!stack) return;
@@ -103,11 +100,11 @@ function showToast(message, kind) {
   requestAnimationFrame(() => t.classList.add('is-show'));
   setTimeout(() => {
     t.classList.remove('is-show');
-    setTimeout(() => { if (t.parentNode) t.remove(); }, 280);
+    setTimeout(() => { if (t.parentNode) t.remove(); }, 300);
   }, 2800);
 }
 
-/* ----------------- View switching ----------------- */
+/* ---------------- 视图切换 ---------------- */
 function switchView(view) {
   state.activeView = view;
   $all('.view').forEach(el => el.classList.toggle('is-active', el.id === 'view-' + view));
@@ -117,7 +114,6 @@ function switchView(view) {
   if (view === 'setup') loadSetup();
   closeCmdk();
 }
-
 $all('.rail-nav-item').forEach(btn => {
   btn.addEventListener('click', () => switchView(btn.dataset.view));
 });
@@ -126,7 +122,7 @@ $all('[data-goto]').forEach(btn => {
 });
 
 /* ============================================================
-   Config load
+   Config
    ============================================================ */
 async function loadConfig() {
   const data = await api('/config');
@@ -148,7 +144,7 @@ async function loadConfig() {
 }
 
 /* ============================================================
-   Overview: metrics + sparklines + gateway pulses + recent logs
+   Overview：指标 + 仪表 + 趋势线 + 脉冲 + 最近请求
    ============================================================ */
 function metricsQuery(extra) {
   const params = new URLSearchParams();
@@ -173,6 +169,14 @@ async function loadMetrics() {
   }
 }
 
+function setGauge(sel, pct) {
+  const el = document.querySelector(sel);
+  if (!el) return;
+  const valid = pct !== null && pct !== undefined;
+  const v = valid ? Math.max(0, Math.min(100, Number(pct))) : 0;
+  el.style.setProperty('--p', String(v));
+}
+
 function renderMetrics(m) {
   $('#statRequests').textContent = fmtNum(m.requests);
   $('#statRequestsSub').textContent = m.failures ? fmtNum(m.failures) + ' 次失败' : '无失败';
@@ -180,36 +184,34 @@ function renderMetrics(m) {
   const successRate = m.requests > 0 ? (m.successes / m.requests) * 100 : null;
   $('#statSuccess').textContent = successRate === null ? '—' : fmtPct(successRate);
   $('#statSuccessSub').textContent = fmtNum(m.successes) + ' / ' + fmtNum(m.requests);
+  setGauge('#gaugeSuccess', successRate);
 
   $('#statCacheHit').textContent = (m.cache_hit_rate === null || m.cache_hit_rate === undefined) ? '—' : fmtPct(m.cache_hit_rate);
   $('#statCacheHitSub').textContent = fmtNum(m.cache_read_tokens) + ' 读取 tok';
+  setGauge('#gaugeCacheHit', m.cache_hit_rate);
 
   $('#statCacheCoverage').textContent = (m.cache_coverage_percent === null || m.cache_coverage_percent === undefined) ? '—' : fmtPct(m.cache_coverage_percent);
   $('#statCacheCoverageSub').textContent = fmtNum(m.cache_supported_calls) + ' / ' + fmtNum(m.usage_calls) + ' 次调用';
+  setGauge('#gaugeCoverage', m.cache_coverage_percent);
 
   $('#statTokens').textContent = fmtNum(m.input_tokens) + ' / ' + fmtNum(m.output_tokens);
   $('#statTokensSub').textContent = 'prompt ' + fmtNum(m.prompt_tokens);
-
   $('#statReasoning').textContent = fmtNum(m.reasoning_tokens);
   $('#statReasoningSub').textContent = 'cache write ' + fmtNum(m.cache_write_tokens);
 }
 
-/* ----------------- Sparklines ----------------- */
+/* ---------------- Sparklines ---------------- */
 async function loadSparkSeries() {
   try {
     const data = await api('/logs?limit=30');
-    state.sparkSeries = (data.items || []).slice().reverse(); // oldest -> newest
+    state.sparkSeries = (data.items || []).slice().reverse();
     renderSparklines();
   } catch (e) { /* silent */ }
 }
 
 function sparkline(svg, values) {
-  const W = 100, H = 28;
-  const pad = 3;
-  if (!values.length) {
-    svg.innerHTML = '';
-    return;
-  }
+  const W = 100, H = 28, pad = 3;
+  if (!values.length) { svg.innerHTML = ''; return; }
   const max = Math.max.apply(null, values);
   const min = Math.min.apply(null, values);
   const range = (max - min) || 1;
@@ -224,8 +226,8 @@ function sparkline(svg, values) {
   const gid = 'spark-grad-' + Math.random().toString(36).slice(2, 8);
   svg.innerHTML =
     '<defs><linearGradient id="' + gid + '" x1="0" y1="0" x2="0" y2="1">' +
-      '<stop offset="0%" stop-color="#4FE2C0" stop-opacity="0.45"/>' +
-      '<stop offset="100%" stop-color="#4FE2C0" stop-opacity="0"/>' +
+    '<stop offset="0%" stop-color="#2dd4bf" stop-opacity="0.5"/>' +
+    '<stop offset="100%" stop-color="#2dd4bf" stop-opacity="0"/>' +
     '</linearGradient></defs>' +
     '<path class="spark-area" d="' + areaPath + '"/>' +
     '<path class="spark-fill" d="' + areaPath + '" fill="url(#' + gid + ')" stroke="none"/>' +
@@ -234,35 +236,32 @@ function sparkline(svg, values) {
 
 function renderSparklines() {
   const logs = state.sparkSeries;
-  const reqSeries = logs.map((_, i) => i + 1);
-  const succSeries = logs.map(l => l.success ? 1 : 0);
-  const cacheHitSeries = logs.map(l => {
-    if (!l.usage) return 0;
-    if (!l.usage.cache_supported) return 0;
-    if (!l.usage.prompt_tokens) return 0;
-    return (l.usage.cache_read_tokens / l.usage.prompt_tokens) * 100;
-  });
-  const cacheCovSeries = logs.map(l => (l.usage && l.usage.cache_supported) ? 1 : 0);
-  const tokensSeries = logs.map(l => {
-    if (!l.usage) return 0;
-    return (l.usage.input_tokens || l.usage.prompt_tokens || 0) + (l.usage.output_tokens || 0);
-  });
-  const reasoningSeries = logs.map(l => (l.usage && l.usage.reasoning_tokens) || 0);
-
-  const map = { requests: reqSeries, success: succSeries, cacheHit: cacheHitSeries, cacheCoverage: cacheCovSeries, tokens: tokensSeries, reasoning: reasoningSeries };
+  const map = {
+    requests: logs.map((_, i) => i + 1),
+    success: logs.map(l => l.success ? 1 : 0),
+    cacheHit: logs.map(l => {
+      if (!l.usage || !l.usage.cache_supported || !l.usage.prompt_tokens) return 0;
+      return (l.usage.cache_read_tokens / l.usage.prompt_tokens) * 100;
+    }),
+    cacheCoverage: logs.map(l => (l.usage && l.usage.cache_supported) ? 1 : 0),
+    tokens: logs.map(l => {
+      if (!l.usage) return 0;
+      return (l.usage.input_tokens || l.usage.prompt_tokens || 0) + (l.usage.output_tokens || 0);
+    }),
+    reasoning: logs.map(l => (l.usage && l.usage.reasoning_tokens) || 0)
+  };
   $all('.stat-spark').forEach(svg => {
     const key = svg.dataset.stat;
     if (map[key]) sparkline(svg, map[key]);
   });
 }
 
-/* ----------------- Gateway pulses ----------------- */
+/* ---------------- 网关脉冲 ---------------- */
 async function loadGatewayPulses() {
   const container = $('#gatewayPulseList');
   const railContainer = $('#railChannels');
   container.innerHTML = '';
   railContainer.innerHTML = '';
-
   for (const id of GW_ORDER) {
     const gw = state.gateways[id];
     if (!gw) continue;
@@ -271,30 +270,26 @@ async function loadGatewayPulses() {
       const data = await api('/logs?' + new URLSearchParams({ gateway: id, limit: '40' }).toString());
       logs = (data.items || []).slice().reverse();
     } catch (e) { /* ignore per-gateway error */ }
-
     const successCount = logs.filter(l => l.success).length;
     const total = logs.length;
-    const totalTokens = logs.reduce((acc, l) => acc + ((l.usage && (l.usage.input_tokens || l.usage.prompt_tokens || 0)) + (l.usage && l.usage.output_tokens || 0)), 0);
-    const lastStatus = total ? (logs[total - 1].success ? 'ok' : 'err') : 'idle';
+    const totalTokens = logs.reduce((acc, l) => acc + ((l.usage && (l.usage.input_tokens || l.usage.prompt_tokens || 0)) + ((l.usage && l.usage.output_tokens) || 0)), 0);
 
-    // main panel row
     const row = document.createElement('div');
     row.className = 'gw-pulse-row';
     row.innerHTML =
       '<div class="gw-pulse-top">' +
-        '<span><span class="gw-pulse-name">' + escapeHtml(gw.name) + '</span><span class="gw-pulse-prefix">' + gw.prefix + '</span></span>' +
+        '<span><span class="gw-pulse-name">' + escapeHtml(gw.name) + '</span><span class="gw-pulse-prefix">' + escapeHtml(gw.prefix || '') + '</span></span>' +
         '<span class="gw-pulse-stat">' + (total ? successCount + '/' + total + ' 成功 · ' + fmtNum(totalTokens) + ' tok' : '暂无数据') + '</span>' +
       '</div>' +
       '<div class="gw-pulse-bar">' + renderTicks(logs, 40) + '</div>';
     container.appendChild(row);
 
-    // rail mini strip
     const chan = document.createElement('div');
     chan.className = 'rail-channel';
     chan.innerHTML =
       '<div class="rail-channel-top">' +
         '<span class="rail-channel-name">' + escapeHtml(gw.name) + '</span>' +
-        '<span class="rail-channel-prefix">' + gw.prefix + '</span>' +
+        '<span class="rail-channel-prefix">' + escapeHtml(gw.prefix || '') + '</span>' +
       '</div>' +
       '<div class="rail-channel-ticks">' + renderTicks(logs, 18) + '</div>';
     railContainer.appendChild(chan);
@@ -312,7 +307,7 @@ function renderTicks(logs, count) {
   }).join('');
 }
 
-/* ----------------- Recent logs ----------------- */
+/* ---------------- 最近请求 ---------------- */
 const EMPTY_RECENT_SVG = '<svg viewBox="0 0 60 60" width="48" height="48" fill="none"><circle cx="30" cy="30" r="26" stroke="currentColor" stroke-width="1.4" stroke-dasharray="2 4"/><path d="M20 32l5 5 15-15" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
 async function loadRecentLogs() {
@@ -332,7 +327,7 @@ async function loadRecentLogs() {
           '<span class="rli-gw ' + gwClass + '">' + escapeHtml(l.gateway_id || '?') + '</span>' +
           '<span class="rli-model" title="' + escapeHtml(l.model || '') + '">' + escapeHtml(l.model || '(未知模型)') + '</span>' +
           '<span class="rli-time">' + fmtTimeShort(l.started_at) + '</span>' +
-          '<span class="rli-status" style="background:' + (l.success ? 'var(--signal)' : 'var(--coral)') + ';color:' + (l.success ? 'var(--signal)' : 'var(--coral)') + '"></span>' +
+          '<span class="rli-status" style="background:' + (l.success ? 'var(--emerald)' : 'var(--rose)') + ';color:' + (l.success ? 'var(--emerald)' : 'var(--rose)') + '"></span>' +
         '</div>'
       );
     }).join('');
@@ -354,14 +349,14 @@ $('#rangePicker').addEventListener('click', (e) => {
 });
 
 /* ============================================================
-   Logs view
+   Logs 视图
    ============================================================ */
 function currentFilters() {
   return {
     gateway: $('#filterGateway').value,
     model: $('#filterModel').value.trim(),
     status: $('#filterStatus').value,
-    limit: $('#filterLimit').value,
+    limit: $('#filterLimit').value
   };
 }
 
@@ -382,10 +377,8 @@ async function loadLogs(reset) {
   if (f.status) params.set('status', f.status);
   params.set('limit', f.limit);
   params.set('offset', String(state.logsOffset));
-
   const tbody = $('#logTableBody');
   if (reset) tbody.innerHTML = renderSkeletons(8);
-
   try {
     const data = await api('/logs?' + params.toString());
     const items = data.items || [];
@@ -399,7 +392,7 @@ async function loadLogs(reset) {
   }
 }
 
-const EMPTY_LOGS_SVG = '<svg viewBox="0 0 60 60" width="44" height="44" fill="none"><rect x="10" y="10" width="40" height="40" rx="4" stroke="currentColor" stroke-width="1.4"/><path d="M16 22h28M16 30h28M16 38h18" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
+const EMPTY_LOGS_SVG = '<svg viewBox="0 0 60 60" width="44" height="44" fill="none"><rect x="10" y="10" width="40" height="40" rx="6" stroke="currentColor" stroke-width="1.4"/><path d="M16 22h28M16 30h28M16 38h18" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
 
 function renderLogTable(logs) {
   const tbody = $('#logTableBody');
@@ -440,7 +433,6 @@ $('#filterModel').addEventListener('input', () => {
   clearTimeout(modelDebounce);
   modelDebounce = setTimeout(() => loadLogs(true), 350);
 });
-
 $('#logsClearBtn').addEventListener('click', async () => {
   if (!confirm('确定要清空全部请求日志吗？此操作无法撤销。')) return;
   try {
@@ -454,12 +446,11 @@ $('#logsClearBtn').addEventListener('click', async () => {
 });
 
 /* ============================================================
-   Log detail drawer
+   请求详情抽屉
    ============================================================ */
 async function openDrawer(id) {
-  const backdrop = $('#drawerBackdrop');
+  $('#drawerBackdrop').classList.add('is-open');
   const drawer = $('#logDrawer');
-  backdrop.classList.add('is-open');
   drawer.classList.add('is-open');
   drawer.setAttribute('aria-hidden', 'false');
   $('#drawerId').textContent = id;
@@ -467,7 +458,6 @@ async function openDrawer(id) {
   $('#drawerMeta').innerHTML = '';
   $('#drawerCode').textContent = '加载中…';
   $('#drawerCompare').innerHTML = '';
-
   try {
     const log = await api('/logs/' + id);
     state.drawerLog = log;
@@ -482,14 +472,14 @@ async function openDrawer(id) {
 }
 
 function renderDrawer(log) {
-  $('#drawerTitle').textContent = (log.model || '(未知模型)') + '  ·  ' + (log.gateway_name || log.gateway_id);
+  $('#drawerTitle').textContent = (log.model || '(未知模型)') + ' · ' + (log.gateway_name || log.gateway_id);
   $('#drawerMeta').innerHTML = [
     ['时间', fmtTime(log.started_at)],
     ['状态', (log.success ? '成功 ' : '失败 ') + (log.status_code || '')],
     ['耗时', fmtMs(log.duration_ms)],
     ['流式', log.stream ? '是' : '否'],
-    ['方法', log.method + ' ' + log.request_path],
-    ['上游', log.upstream_url || '—'],
+    ['方法', (log.method || '—') + ' ' + (log.request_path || '')],
+    ['上游', log.upstream_url || '—']
   ].map(([k, v]) => '<span class="meta-chip">' + escapeHtml(k) + ': <b>' + escapeHtml(String(v)) + '</b></span>').join('');
   if (log.error) {
     $('#drawerMeta').innerHTML += '<span class="meta-chip error">错误: <b>' + escapeHtml(log.error) + '</b></span>';
@@ -529,23 +519,23 @@ function renderComparison(tab, log) {
     label: '客户端原请求',
     url: (log.method || 'POST') + ' ' + (log.request_url || log.request_path || '—'),
     headers: log.request_headers_actual || log.request_headers,
-    body: log.request_body,
+    body: log.request_body
   } : {
     label: '上游 API 原始响应',
     url: 'HTTP ' + (log.upstream_response_status_code || log.status_code || '—'),
     headers: log.upstream_response_headers_actual || log.upstream_response_headers,
-    body: log.upstream_response_body || log.response_body,
+    body: log.upstream_response_body || log.response_body
   };
   const right = request ? {
     label: '代理实际发送',
     url: (log.method || 'POST') + ' ' + (log.upstream_url || '—'),
     headers: log.upstream_headers_actual || log.upstream_headers,
-    body: log.upstream_body,
+    body: log.upstream_body
   } : {
     label: '代理实际返回客户端',
     url: 'HTTP ' + (log.client_response_status_code || log.status_code || '—'),
     headers: log.response_headers_actual || log.response_headers,
-    body: log.response_body,
+    body: log.response_body
   };
   const headerDiff = buildDiff(left.headers, right.headers, 'headers');
   const bodyDiff = buildDiff(left.body, right.body, 'body');
@@ -553,8 +543,8 @@ function renderComparison(tab, log) {
   const total = diffStats([headerDiff, bodyDiff, statusDiff]);
   $('#drawerCompare').innerHTML =
     '<div class="diff-overview">' +
-      '<div class="diff-route"><span>' + escapeHtml(left.label) + '</span><b>→</b><span>' + escapeHtml(right.label) + '</span></div>' +
-      '<div class="diff-endpoints"><code>' + escapeHtml(left.url) + '</code><b>→</b><code>' + escapeHtml(right.url) + '</code></div>' +
+      '<div class="diff-route"><span>' + escapeHtml(left.label) + '</span> <b>→</b> <span>' + escapeHtml(right.label) + '</span></div>' +
+      '<div class="diff-endpoints"><code>' + escapeHtml(left.url) + '</code> <b>→</b> <code>' + escapeHtml(right.url) + '</code></div>' +
       '<div class="diff-summary">' +
         diffSummaryBadge('新增', total.added, 'added') +
         diffSummaryBadge('修改', total.modified, 'modified') +
@@ -692,7 +682,6 @@ function buildTextDiff(before, after) {
   }
   while (i < oldLines.length) operations.push({ kind: 'deleted', text: oldLines[i++] });
   while (j < newLines.length) operations.push({ kind: 'added', text: newLines[j++] });
-
   const rows = [];
   for (let index = 0; index < operations.length; index++) {
     const current = operations[index];
@@ -773,13 +762,11 @@ $('#drawerTabs').addEventListener('click', (e) => {
   $all('.drawer-tab').forEach(t => t.classList.toggle('is-active', t === btn));
   renderDrawerTab(state.drawerTab);
 });
-
 $('#drawerCopyIdBtn').addEventListener('click', () => {
   const id = $('#drawerId').textContent.trim();
   if (!id || id === '—') return;
   navigator.clipboard.writeText(id).then(() => showToast('已复制请求 ID: ' + id, 'success'));
 });
-
 function closeDrawer() {
   $('#drawerBackdrop').classList.remove('is-open');
   const drawer = $('#logDrawer');
@@ -790,10 +777,11 @@ $('#drawerCloseBtn').addEventListener('click', closeDrawer);
 $('#drawerBackdrop').addEventListener('click', closeDrawer);
 
 /* ============================================================
-   Gateway config view
+   网关配置
    ============================================================ */
 function renderGatewayCards() {
   const container = $('#gatewayCards');
+  if (!container) return;
   container.innerHTML = '';
   GW_ORDER.forEach(id => {
     const gw = state.gateways[id];
@@ -806,35 +794,30 @@ function renderGatewayCards() {
       '<div class="gw-card-head">' +
         '<div class="gw-card-title">' +
           '<strong>' + escapeHtml(gw.name) + '</strong>' +
-          '<span class="gw-card-prefix">' + gw.prefix + '</span>' +
+          '<span class="gw-card-prefix">' + escapeHtml(gw.prefix || '') + '</span>' +
         '</div>' +
-        '<div class="toggle-row compact-toggle-row"><span class="switch-label">网关启用</span>' +
-          '<label class="toggle">' +
-            '<input type="checkbox" class="f-enabled" ' + (gw.enabled ? 'checked' : '') + ' />' +
-            '<span class="toggle-track"></span>' +
-          '</label>' +
+        '<div class="toggle-row compact-toggle-row">' +
+          '<span class="switch-label">网关启用</span>' +
+          '<label class="toggle"><input type="checkbox" class="f-enabled" ' + (gw.enabled ? 'checked' : '') + '><span class="toggle-track"></span></label>' +
         '</div>' +
       '</div>' +
-      '<div class="gw-card-protocol">协议: ' + (gw.protocol === 'chat_completions' ? 'Chat Completions' : 'Responses') + '</div>' +
+      '<div class="gw-card-protocol">协议 · ' + (gw.protocol === 'chat_completions' ? 'Chat Completions' : 'Responses') + '</div>' +
       '<div class="field">' +
         '<label>显示名称</label>' +
-        '<input type="text" class="f-name" value="' + escapeAttr(gw.name) + '" />' +
+        '<input type="text" class="f-name" value="' + escapeAttr(gw.name) + '">' +
       '</div>' +
       '<div class="field">' +
         '<label>上游地址 (base_url)</label>' +
-        '<input type="text" class="f-baseurl" value="' + escapeAttr(gw.base_url) + '" placeholder="https://…" />' +
+        '<input type="text" class="f-baseurl" value="' + escapeAttr(gw.base_url) + '" placeholder="https://…">' +
         '<span class="field-hint">必须是 HTTPS 地址</span>' +
       '</div>' +
       '<div class="toggle-row ua-toggle-row">' +
         '<div><span class="switch-label">User-Agent 覆盖</span><span class="field-hint">仅作用于此网关</span></div>' +
-        '<label class="toggle">' +
-          '<input type="checkbox" class="f-ua-enabled" ' + (gw.user_agent_override_enabled ? 'checked' : '') + ' />' +
-          '<span class="toggle-track"></span>' +
-        '</label>' +
+        '<label class="toggle"><input type="checkbox" class="f-ua-enabled" ' + (gw.user_agent_override_enabled ? 'checked' : '') + '><span class="toggle-track"></span></label>' +
       '</div>' +
       '<div class="field">' +
         '<label>User-Agent 覆盖值</label>' +
-        '<input type="text" class="f-ua" value="' + escapeAttr(gw.user_agent_override || '') + '" placeholder="grok-gateway-proxy/dev" />' +
+        '<input type="text" class="f-ua" value="' + escapeAttr(gw.user_agent_override || '') + '" placeholder="grok-gateway-proxy/dev">' +
       '</div>' +
       '<div class="field">' +
         '<label>请求头白名单（每行一个）</label>' +
@@ -843,7 +826,8 @@ function renderGatewayCards() {
       '<div class="gw-card-foot">' +
         '<button class="btn-primary small save-gw-btn" style="width:auto;padding:8px 18px;font-size:12px;">' +
           '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M4 8l3 3 5-6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
-          '保存更改</button>' +
+          '保存更改' +
+        '</button>' +
       '</div>';
     container.appendChild(card);
     card.querySelector('.save-gw-btn').addEventListener('click', () => saveGateway(id, card));
@@ -859,7 +843,7 @@ async function saveGateway(id, card) {
     enabled: card.querySelector('.f-enabled').checked,
     user_agent_override_enabled: card.querySelector('.f-ua-enabled').checked,
     user_agent_override: card.querySelector('.f-ua').value.trim(),
-    forward_headers: card.querySelector('.f-headers').value.split('\n').map(s => s.trim()).filter(Boolean),
+    forward_headers: card.querySelector('.f-headers').value.split('\n').map(s => s.trim()).filter(Boolean)
   };
   btn.disabled = true;
   btn.innerHTML = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M8 2v3M8 11v3M2 8h3M11 8h3" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/></svg>保存中…';
@@ -885,7 +869,7 @@ $('#gatewaysReloadBtn').addEventListener('click', async () => {
 });
 
 /* ============================================================
-   Setup snippets view
+   接入代码
    ============================================================ */
 async function loadSetup() {
   const container = $('#setupSnippets');
@@ -903,8 +887,9 @@ async function loadSetup() {
         '<div class="setup-card-head">' +
           '<strong>' + escapeHtml(gw.name || id) + ' <span class="gw-card-prefix" style="font-size:10.5px;">' + escapeHtml(gw.prefix || '') + '</span></strong>' +
           '<button class="btn-ghost small copy-btn" style="width:auto;padding:6px 12px;">' +
-            '<svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><rect x="5" y="5" width="8" height="8" rx="1.5" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M3 11V3.5A1.5 1.5 0 0 1 4.5 2H11" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>' +
-            '复制</button>' +
+            '<svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><rect x="5" y="5" width="8" height="8" rx="1.6" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="M3 11V3.6A1.6 1.6 0 0 1 4.6 2H11" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/></svg>' +
+            '复制' +
+          '</button>' +
         '</div>' +
         '<pre class="setup-pre">' + escapeHtml(snippet) + '</pre>';
       container.appendChild(card);
@@ -916,18 +901,17 @@ async function loadSetup() {
     container.innerHTML = '<div class="empty-state">加载失败：' + escapeHtml(e.message) + '</div>';
   }
 }
-
 $('#setupReloadBtn').addEventListener('click', () => {
   loadSetup();
   showToast('已重新加载接入代码', 'success');
 });
 
 /* ============================================================
-   Command palette (Cmd+K)
+   命令面板 (Cmd+K)
    ============================================================ */
 function buildCmdkItems() {
   const items = [
-    { group: '导航', icon: '<svg viewBox="0 0 16 16" width="13" height="13"><rect x="2" y="2" width="5" height="5" rx="1" fill="currentColor"/><rect x="9" y="2" width="5" height="5" rx="1" fill="currentColor" opacity="0.55"/><rect x="2" y="9" width="5" height="5" rx="1" fill="currentColor" opacity="0.55"/><rect x="9" y="9" width="5" height="5" rx="1" fill="currentColor"/></svg>', label: '前往 总览', hint: '1', run: () => switchView('overview') },
+    { group: '导航', icon: '<svg viewBox="0 0 16 16" width="13" height="13"><rect x="2" y="2" width="5" height="5" rx="1" fill="currentColor"/><rect x="9" y="2" width="5" height="5" rx="1" fill="currentColor" opacity=".55"/><rect x="2" y="9" width="5" height="5" rx="1" fill="currentColor" opacity=".55"/><rect x="9" y="9" width="5" height="5" rx="1" fill="currentColor"/></svg>', label: '前往 总览', hint: '1', run: () => switchView('overview') },
     { group: '导航', icon: '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M3 3.5h10M3 6h10M3 8.5h7M3 11h5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" fill="none"/></svg>', label: '前往 请求日志', hint: '2', run: () => switchView('logs') },
     { group: '导航', icon: '<svg viewBox="0 0 16 16" width="13" height="13"><circle cx="8" cy="8" r="2" fill="currentColor"/><path d="M8 1.5v2.5M8 12v2.5M1.5 8h2.5M12 8h2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" fill="none"/></svg>', label: '前往 网关配置', hint: '3', run: () => switchView('gateways') },
     { group: '导航', icon: '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M5 4l-3 4 3 4M11 4l3 4-3 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>', label: '前往 接入代码', hint: '4', run: () => switchView('setup') },
@@ -940,7 +924,7 @@ function buildCmdkItems() {
         if (state.activeView === 'logs') loadLogs(true);
         loadOverview();
       } catch (e) { showToast('清空失败: ' + e.message, 'error'); }
-    } },
+    } }
   ];
   GW_ORDER.forEach(id => {
     const gw = state.gateways[id];
@@ -957,32 +941,29 @@ function buildCmdkItems() {
             navigator.clipboard.writeText(data[id]).then(() => showToast('已复制 ' + gw.name + ' 接入片段', 'success'));
           }
         } catch (e) { showToast('复制失败: ' + e.message, 'error'); }
-      },
+      }
     });
   });
   return items;
 }
 
 function openCmdk() {
-  const backdrop = $('#cmdkBackdrop');
-  const cmdk = $('#cmdk');
   state.cmdkItems = buildCmdkItems();
   state.cmdkSelected = 0;
   $('#cmdkInput').value = '';
   renderCmdk('');
-  backdrop.classList.add('is-open');
+  $('#cmdkBackdrop').classList.add('is-open');
+  const cmdk = $('#cmdk');
   cmdk.classList.add('is-open');
   cmdk.setAttribute('aria-hidden', 'false');
   setTimeout(() => $('#cmdkInput').focus(), 80);
 }
 function closeCmdk() {
-  const backdrop = $('#cmdkBackdrop');
+  $('#cmdkBackdrop').classList.remove('is-open');
   const cmdk = $('#cmdk');
-  backdrop.classList.remove('is-open');
   cmdk.classList.remove('is-open');
   cmdk.setAttribute('aria-hidden', 'true');
 }
-
 function renderCmdk(query) {
   const list = $('#cmdkList');
   const q = query.trim().toLowerCase();
@@ -1014,7 +995,6 @@ function renderCmdk(query) {
     });
   });
 }
-
 $('#cmdKBtn').addEventListener('click', openCmdk);
 $('#cmdkBackdrop').addEventListener('click', closeCmdk);
 $('#cmdkInput').addEventListener('input', (e) => {
@@ -1034,21 +1014,18 @@ $('#cmdkInput').addEventListener('keydown', (e) => {
 });
 
 /* ============================================================
-   Keyboard shortcuts
+   键盘快捷键
    ============================================================ */
 document.addEventListener('keydown', (e) => {
-  // Cmd/Ctrl+K → open command palette
   if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
     e.preventDefault();
     if ($('#cmdk').classList.contains('is-open')) closeCmdk(); else openCmdk();
     return;
   }
-  // Esc → close drawer / cmdk
   if (e.key === 'Escape') {
     if ($('#cmdk').classList.contains('is-open')) { closeCmdk(); return; }
     if ($('#logDrawer').classList.contains('is-open')) { closeDrawer(); return; }
   }
-  // Number shortcuts → switch view (only if not focused in input)
   const tag = (e.target.tagName || '').toLowerCase();
   const inField = tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable;
   if (inField) return;
@@ -1058,11 +1035,10 @@ document.addEventListener('keydown', (e) => {
   else if (e.key === '3') switchView('gateways');
   else if (e.key === '4') switchView('setup');
   else if (e.key === 'r' || e.key === 'R') refreshAll();
-  else if (e.key === '?') { /* reserved for shortcuts overlay */ }
 });
 
 /* ============================================================
-   Refresh + boot
+   刷新 + 启动
    ============================================================ */
 async function refreshAll() {
   await loadConfig();
@@ -1085,5 +1061,4 @@ async function boot() {
     if (state.activeView === 'overview') loadOverview();
   }, 15000);
 }
-
 boot();
