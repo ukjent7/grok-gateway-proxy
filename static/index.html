@@ -183,30 +183,9 @@
       <header class="view-head">
         <div>
           <h1>网关配置</h1>
-          <p class="muted">编辑上游地址、请求头白名单，以及代理实际发送的 User-Agent</p>
+          <p class="muted">分别编辑每个网关的上游地址、请求头白名单和 User-Agent 覆盖</p>
         </div>
       </header>
-
-      <div class="panel settings-card">
-        <div class="panel-head">
-          <div>
-            <h2>User-Agent 覆盖</h2>
-            <p class="muted small">开启后覆盖所有网关发往上游的 User-Agent；关闭则沿用客户端请求头。</p>
-          </div>
-          <label class="toggle">
-            <input type="checkbox" id="userAgentOverrideEnabled" />
-            <span class="toggle-track"></span>
-          </label>
-        </div>
-        <div class="settings-form">
-          <div class="field">
-            <label for="userAgentOverride">覆盖值</label>
-            <input id="userAgentOverride" type="text" placeholder="grok-gateway-proxy/dev" />
-            <span class="field-hint">示例：grok-gateway-proxy/dev 或你需要伪装的客户端标识</span>
-          </div>
-          <button class="btn-ghost small settings-save-btn" id="saveUserAgentBtn">保存 User-Agent 设置</button>
-        </div>
-      </div>
 
       <div id="gatewayCards" class="gw-config-grid"><!-- JS --></div>
     </section>
