@@ -28,23 +28,29 @@ func TestSenseNovaTransformsToolCallTypesWithoutChangingToolDefinitions(t *testi
 		t.Fatalf("SenseNova tool call type was not converted: %s", upstreamBody)
 	}
 
-	clientBody, err := adapter.TransformResponseBody([]byte(`{"choices":[{"message":{"tool_calls":[{"type":"function_call","function":{"name":"lookup","arguments":"{}"}}]}}]}`))
+	clientBody, err := adapter.TransformResponseBody([]byte(`{"choices":[{"message":{"tool_calls":[{"type":"function_call","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":""}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(clientBody), `"type":"function_call"`) || !strings.Contains(string(clientBody), `"type":"function"`) {
 		t.Fatalf("client tool call type was not converted back: %s", clientBody)
 	}
+	if !strings.Contains(string(clientBody), `"finish_reason":null`) {
+		t.Fatalf("empty finish_reason was not normalized to null: %s", clientBody)
+	}
 }
 
 func TestSenseNovaTransformsStreamingToolCalls(t *testing.T) {
 	adapter := SenseNovaChatAdapter{}
-	reader := adapter.TransformSSE(strings.NewReader("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"type\":\"function_call\"}]}}]}\n\ndata: [DONE]\n\n"))
+	reader := adapter.TransformSSE(strings.NewReader("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"type\":\"function_call\"}]},\"finish_reason\":\"\"}]}\n\ndata: [DONE]\n\n"))
 	body, err := io.ReadAll(reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(body), `"type":"function_call"`) || !strings.Contains(string(body), `"type":"function"`) {
 		t.Fatalf("streaming tool call type was not converted: %s", body)
+	}
+	if !strings.Contains(string(body), `"finish_reason":null`) {
+		t.Fatalf("streaming empty finish_reason was not normalized to null: %s", body)
 	}
 }

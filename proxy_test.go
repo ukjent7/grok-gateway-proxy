@@ -133,7 +133,7 @@ func TestProxyTransformsSenseNovaToolCallsForUpstreamAndClient(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call-1","type":"function_call","function":{"name":"lookup","arguments":"{}"}}]}}]}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call-1","type":"function_call","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":""}]}`))
 	}))
 	defer upstream.Close()
 
@@ -153,7 +153,7 @@ func TestProxyTransformsSenseNovaToolCallsForUpstreamAndClient(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	p.ServeHTTP(recorder, req)
 
-	if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), `"type":"function_call"`) || !strings.Contains(recorder.Body.String(), `"type":"function"`) {
+	if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), `"type":"function_call"`) || !strings.Contains(recorder.Body.String(), `"type":"function"`) || !strings.Contains(recorder.Body.String(), `"finish_reason":null`) {
 		t.Fatalf("unexpected client tool call response: %d %s", recorder.Code, recorder.Body.String())
 	}
 	messages := upstreamBody["messages"].([]any)

@@ -66,7 +66,7 @@ func (SenseNovaChatAdapter) TransformRequestBody(body []byte) ([]byte, error) {
 }
 
 func (SenseNovaChatAdapter) TransformResponseBody(body []byte) ([]byte, error) {
-	return transformToolCallType(body, "function_call", "function")
+	return transformSenseNovaResponseBody(body)
 }
 
 func (SenseNovaChatAdapter) TransformSSE(reader io.Reader) io.Reader {
@@ -111,6 +111,23 @@ func transformToolCallType(body []byte, from, to string) ([]byte, error) {
 	return result, nil
 }
 
+func transformSenseNovaResponseBody(body []byte) ([]byte, error) {
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body, nil
+	}
+	changed := rewriteToolCallTypes(payload, "function_call", "function")
+	changed = rewriteEmptyFinishReasons(payload) || changed
+	if !changed {
+		return body, nil
+	}
+	result, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func rewriteToolCallTypes(value any, from, to string) bool {
 	changed := false
 	switch current := value.(type) {
@@ -135,6 +152,28 @@ func rewriteToolCallTypes(value any, from, to string) bool {
 				continue
 			}
 			changed = rewriteToolCallTypes(child, from, to) || changed
+		}
+	}
+	return changed
+}
+
+func rewriteEmptyFinishReasons(value any) bool {
+	changed := false
+	switch current := value.(type) {
+	case []any:
+		for _, item := range current {
+			changed = rewriteEmptyFinishReasons(item) || changed
+		}
+	case map[string]any:
+		for key, child := range current {
+			if key == "finish_reason" {
+				if reason, ok := child.(string); ok && reason == "" {
+					current[key] = nil
+					changed = true
+				}
+				continue
+			}
+			changed = rewriteEmptyFinishReasons(child) || changed
 		}
 	}
 	return changed
@@ -189,7 +228,7 @@ func transformSenseNovaSSELine(line []byte) []byte {
 	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
 		return line
 	}
-	converted, err := transformToolCallType(payload, "function_call", "function")
+	converted, err := transformSenseNovaResponseBody(payload)
 	if err != nil || bytes.Equal(converted, payload) {
 		return line
 	}
