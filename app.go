@@ -58,13 +58,9 @@ func (a *App) handleAPI(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case path == "/config" && r.Method == http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]any{
-			"listen_addr":                 a.config.ListenAddr,
-			"gateways":                    a.config.Snapshot(),
-			"user_agent_override_enabled": a.config.UserAgentOverrideEnabled,
-			"user_agent_override":         a.config.UserAgentOverride,
+			"listen_addr": a.config.ListenAddr,
+			"gateways":    a.config.Snapshot(),
 		})
-	case path == "/config" && r.Method == http.MethodPut:
-		a.updateSettings(w, r)
 	case path == "/gateways" && r.Method == http.MethodPut:
 		a.updateGateways(w, r)
 	case path == "/metrics" && r.Method == http.MethodGet:
@@ -92,25 +88,6 @@ func (a *App) handleAPI(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusNotFound, fmt.Errorf("unknown management endpoint %s", r.URL.Path))
 	}
-}
-
-func (a *App) updateSettings(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		UserAgentOverrideEnabled bool   `json:"user_agent_override_enabled"`
-		UserAgentOverride        string `json:"user_agent_override"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := a.config.UpdateUserAgentOverride(body.UserAgentOverrideEnabled, body.UserAgentOverride); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"user_agent_override_enabled": a.config.UserAgentOverrideEnabled,
-		"user_agent_override":         a.config.UserAgentOverride,
-	})
 }
 
 func (a *App) updateGateways(w http.ResponseWriter, r *http.Request) {

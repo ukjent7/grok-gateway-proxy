@@ -162,9 +162,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logEntry.UpstreamURL = upstreamURL
-	logEntry.UpstreamBody = append([]byte(nil), requestBody...)
+	upstreamBody, err := transformRequestBody(adapter, requestBody)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		logEntry.Error = err.Error()
+		logEntry.StatusCode = http.StatusBadRequest
+		return
+	}
+	logEntry.UpstreamBody = append([]byte(nil), upstreamBody...)
 
-	upstreamRequest, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(requestBody))
+	upstreamRequest, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(upstreamBody))
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		logEntry.Error = err.Error()
@@ -178,8 +185,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	copyForwardHeaders(upstreamRequest.Header, r.Header, allowlist)
 	upstreamRequest.Header.Set("Content-Type", "application/json")
 	upstreamRequest.Header.Del("Content-Length")
-	if enabled, value := p.config.UserAgentOverrideSnapshot(); enabled {
-		upstreamRequest.Header.Set("User-Agent", value)
+	if gateway.UserAgentOverrideEnabled {
+		upstreamRequest.Header.Set("User-Agent", gateway.UserAgentOverride)
 	}
 	logEntry.UpstreamHeaders = headersJSON(upstreamRequest.Header)
 	logEntry.UpstreamHeadersActual = headersJSONActual(upstreamRequest.Header)
@@ -217,7 +224,31 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	copyResponseHeaders(w.Header(), upstreamResponse.Header)
 	w.WriteHeader(upstreamResponse.StatusCode)
-	responseBody, copyErr := copyAndCapture(w, upstreamResponse.Body, stream || isEventStream(upstreamResponse.Header))
+	eventStream := isEventStream(upstreamResponse.Header)
+	var responseBody []byte
+	var copyErr error
+	if eventStream {
+		var rawResponse bytes.Buffer
+		responseReader := io.Reader(io.TeeReader(upstreamResponse.Body, &rawResponse))
+		if transformer, ok := adapter.(streamTransformer); ok {
+			responseReader = transformer.TransformSSE(responseReader)
+		}
+		responseBody, copyErr = copyAndCapture(w, responseReader, stream || eventStream)
+		logEntry.UpstreamResponseBody = append([]byte(nil), rawResponse.Bytes()...)
+	} else {
+		var rawResponse []byte
+		rawResponse, copyErr = io.ReadAll(upstreamResponse.Body)
+		logEntry.UpstreamResponseBody = append([]byte(nil), rawResponse...)
+		var transformErr error
+		responseBody, transformErr = transformResponseBody(adapter, rawResponse)
+		if transformErr != nil {
+			copyErr = transformErr
+			responseBody = rawResponse
+		}
+		if _, writeErr := w.Write(responseBody); copyErr == nil && writeErr != nil {
+			copyErr = writeErr
+		}
+	}
 	if copyErr != nil {
 		logEntry.Error = copyErr.Error()
 	}
@@ -228,7 +259,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if logEntry.StatusCode >= 400 && logEntry.Error == "" {
 		logEntry.Error = fmt.Sprintf("upstream returned HTTP %d", logEntry.StatusCode)
 	}
-	logEntry.UpstreamResponseBody = append([]byte(nil), responseBody...)
 }
 
 func (p *Proxy) gatewayForPath(path string) (GatewayConfig, string, bool) {

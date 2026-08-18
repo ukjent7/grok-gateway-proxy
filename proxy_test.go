@@ -65,6 +65,115 @@ func TestProxyForwardsSenseNovaChatAndLogs(t *testing.T) {
 	}
 }
 
+func TestProxyCapturesBothSidesAndOverridesUserAgent(t *testing.T) {
+	var gotUserAgent string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUserAgent = r.Header.Get("User-Agent")
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Upstream-Trace", "trace-1")
+		_, _ = w.Write([]byte(`{"id":"upstream-response","choices":[]}`))
+	}))
+	defer upstream.Close()
+
+	store, err := OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := DefaultConfig(t.TempDir() + "/config.json")
+	gateway := cfg.Gateways["st"]
+	gateway.BaseURL = upstream.URL
+	gateway.UserAgentOverrideEnabled = true
+	gateway.UserAgentOverride = "proxy-dev-agent/1"
+	cfg.Gateways["st"] = gateway
+	p := &Proxy{config: cfg, store: store, logger: slog.Default(), client: upstream.Client()}
+
+	requestBody := []byte(`{"model":"capture-model","messages":[{"role":"user","content":"hello"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/st/chat/completions?trace=1", strings.NewReader(string(requestBody)))
+	req.Header.Set("User-Agent", "client-agent/1")
+	recorder := httptest.NewRecorder()
+	p.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK || recorder.Body.String() != string(`{"id":"upstream-response","choices":[]}`) {
+		t.Fatalf("unexpected proxy response: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if gotUserAgent != "proxy-dev-agent/1" {
+		t.Fatalf("user agent was not overridden: %q", gotUserAgent)
+	}
+	logs, err := store.List(context.Background(), LogFilter{Limit: 10})
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("expected one log, got %d, err=%v", len(logs), err)
+	}
+	detail, err := store.Get(context.Background(), logs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.RequestURL != "/st/chat/completions?trace=1" {
+		t.Fatalf("request URL was not captured: %q", detail.RequestURL)
+	}
+	if string(detail.RequestBody) != string(requestBody) || string(detail.UpstreamBody) != string(requestBody) {
+		t.Fatal("client and upstream request bodies were not retained")
+	}
+	if string(detail.UpstreamResponseBody) != recorder.Body.String() || string(detail.ResponseBody) != recorder.Body.String() {
+		t.Fatal("upstream and client response bodies were not retained")
+	}
+	if !strings.Contains(detail.UpstreamHeadersActual, "proxy-dev-agent/1") {
+		t.Fatalf("actual upstream headers did not contain overridden user agent: %s", detail.UpstreamHeadersActual)
+	}
+	if detail.UpstreamResponseStatusCode != http.StatusOK || detail.ClientResponseStatusCode != http.StatusOK {
+		t.Fatalf("response statuses were not captured: upstream=%d client=%d", detail.UpstreamResponseStatusCode, detail.ClientResponseStatusCode)
+	}
+}
+
+func TestProxyTransformsSenseNovaToolCallsForUpstreamAndClient(t *testing.T) {
+	var upstreamBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&upstreamBody); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call-1","type":"function_call","function":{"name":"lookup","arguments":"{}"}}]}}]}`))
+	}))
+	defer upstream.Close()
+
+	store, err := OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := DefaultConfig(t.TempDir() + "/config.json")
+	gateway := cfg.Gateways["st"]
+	gateway.BaseURL = upstream.URL
+	cfg.Gateways["st"] = gateway
+	p := &Proxy{config: cfg, store: store, logger: slog.Default(), client: upstream.Client()}
+
+	requestBody := []byte(`{"model":"sense-model","messages":[{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}]}`)
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/st/chat/completions", strings.NewReader(string(requestBody)))
+	recorder := httptest.NewRecorder()
+	p.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), `"type":"function_call"`) || !strings.Contains(recorder.Body.String(), `"type":"function"`) {
+		t.Fatalf("unexpected client tool call response: %d %s", recorder.Code, recorder.Body.String())
+	}
+	messages := upstreamBody["messages"].([]any)
+	calls := messages[0].(map[string]any)["tool_calls"].([]any)
+	if calls[0].(map[string]any)["type"] != "function_call" {
+		t.Fatalf("upstream did not receive SenseNova tool call type: %+v", upstreamBody)
+	}
+	logs, err := store.List(context.Background(), LogFilter{Limit: 10})
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("expected one log, got %d, err=%v", len(logs), err)
+	}
+	detail, err := store.Get(context.Background(), logs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(detail.RequestBody), `"type":"function"`) || !strings.Contains(string(detail.UpstreamBody), `"type":"function_call"`) {
+		t.Fatalf("request comparison did not retain both protocol forms: request=%s upstream=%s", detail.RequestBody, detail.UpstreamBody)
+	}
+}
+
 func TestProxyRejectsWrongProtocol(t *testing.T) {
 	store, err := OpenStore(t.TempDir() + "/proxy.db")
 	if err != nil {

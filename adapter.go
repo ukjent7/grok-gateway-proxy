@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -53,6 +56,149 @@ func (SenseNovaChatAdapter) ValidateRequest(body []byte) error {
 }
 func (SenseNovaChatAdapter) NormalizeError(status int, body []byte) []byte {
 	return normalizeUpstreamError(status, body)
+}
+
+// SenseNova's tool-call history decoder uses function_call for the tool call
+// variant, while the client-facing Chat Completions format uses function.
+// Keep the conversion scoped to tool_calls so tools[].type remains function.
+func (SenseNovaChatAdapter) TransformRequestBody(body []byte) ([]byte, error) {
+	return transformToolCallType(body, "function", "function_call")
+}
+
+func (SenseNovaChatAdapter) TransformResponseBody(body []byte) ([]byte, error) {
+	return transformToolCallType(body, "function_call", "function")
+}
+
+func (SenseNovaChatAdapter) TransformSSE(reader io.Reader) io.Reader {
+	return &senseNovaSSEReader{reader: bufio.NewReaderSize(reader, 64*1024)}
+}
+
+type payloadTransformer interface {
+	TransformRequestBody([]byte) ([]byte, error)
+	TransformResponseBody([]byte) ([]byte, error)
+}
+
+type streamTransformer interface {
+	TransformSSE(io.Reader) io.Reader
+}
+
+func transformRequestBody(adapter GatewayAdapter, body []byte) ([]byte, error) {
+	if transformer, ok := adapter.(payloadTransformer); ok {
+		return transformer.TransformRequestBody(body)
+	}
+	return body, nil
+}
+
+func transformResponseBody(adapter GatewayAdapter, body []byte) ([]byte, error) {
+	if transformer, ok := adapter.(payloadTransformer); ok {
+		return transformer.TransformResponseBody(body)
+	}
+	return body, nil
+}
+
+func transformToolCallType(body []byte, from, to string) ([]byte, error) {
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body, nil
+	}
+	if !rewriteToolCallTypes(payload, from, to) {
+		return body, nil
+	}
+	result, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func rewriteToolCallTypes(value any, from, to string) bool {
+	changed := false
+	switch current := value.(type) {
+	case []any:
+		for _, item := range current {
+			changed = rewriteToolCallTypes(item, from, to) || changed
+		}
+	case map[string]any:
+		for key, child := range current {
+			if key == "tool_calls" {
+				if calls, ok := child.([]any); ok {
+					for _, call := range calls {
+						if callObject, ok := call.(map[string]any); ok {
+							if callType, ok := callObject["type"].(string); ok && callType == from {
+								callObject["type"] = to
+								changed = true
+							}
+						}
+						changed = rewriteToolCallTypes(call, from, to) || changed
+					}
+				}
+				continue
+			}
+			changed = rewriteToolCallTypes(child, from, to) || changed
+		}
+	}
+	return changed
+}
+
+type senseNovaSSEReader struct {
+	reader  *bufio.Reader
+	pending bytes.Buffer
+	done    bool
+	err     error
+}
+
+func (r *senseNovaSSEReader) Read(p []byte) (int, error) {
+	if r.pending.Len() > 0 {
+		return r.pending.Read(p)
+	}
+	if r.done {
+		return 0, r.err
+	}
+	line, err := r.reader.ReadBytes('\n')
+	if len(line) > 0 {
+		r.pending.Write(transformSenseNovaSSELine(line))
+	}
+	if err != nil {
+		r.done = true
+		r.err = err
+	}
+	if r.pending.Len() > 0 {
+		return r.pending.Read(p)
+	}
+	return 0, err
+}
+
+func transformSenseNovaSSELine(line []byte) []byte {
+	lineEnd := []byte(nil)
+	content := line
+	if bytes.HasSuffix(content, []byte("\r\n")) {
+		lineEnd = []byte("\r\n")
+		content = content[:len(content)-2]
+	} else if bytes.HasSuffix(content, []byte("\n")) {
+		lineEnd = []byte("\n")
+		content = content[:len(content)-1]
+	} else if bytes.HasSuffix(content, []byte("\r")) {
+		lineEnd = []byte("\r")
+		content = content[:len(content)-1]
+	}
+	dataIndex := bytes.Index(content, []byte("data:"))
+	if dataIndex < 0 || len(bytes.TrimSpace(content[:dataIndex])) != 0 {
+		return line
+	}
+	payload := bytes.TrimSpace(content[dataIndex+len("data:"):])
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+		return line
+	}
+	converted, err := transformToolCallType(payload, "function_call", "function")
+	if err != nil || bytes.Equal(converted, payload) {
+		return line
+	}
+	result := make([]byte, 0, len(line)+8)
+	result = append(result, content[:dataIndex]...)
+	result = append(result, []byte("data: ")...)
+	result = append(result, converted...)
+	result = append(result, lineEnd...)
+	return result
 }
 
 type VercelResponsesAdapter struct{}

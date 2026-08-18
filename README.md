@@ -12,6 +12,8 @@ The proxy does not provide a models endpoint and does not fetch models from an u
 
 Each adapter preserves its native protocol. `/oc` and `/ve` accept only `POST /responses`; `/st` accepts only `POST /chat/completions`. There is no generic Responses/Chat Completions conversion layer.
 
+The SenseNova adapter includes a narrow compatibility shim for tool-call history: it sends `messages[].tool_calls[].type` as `function_call` upstream and converts it back to `function` for the client, including SSE responses. `tools[].type` is left unchanged. Both forms remain visible in the request audit record.
+
 ## Run
 
 ```sh
@@ -28,9 +30,18 @@ go build -o grok-gateway-proxy .
 
 Useful endpoints are `GET /healthz`, `GET /api/config`, `GET /api/metrics`, `GET /api/logs`, `GET /api/logs/{id}`, and `DELETE /api/logs`. Use `-listen` to override the saved listen address and `-data-dir` to choose where `config.json` and `proxy.db` are stored.
 
-The application stores `config.json` and `proxy.db` in the platform data directory. API keys remain in Grok Build configuration; the proxy forwards allowlisted headers and redacts credentials in logs.
+The application stores `config.json` and `proxy.db` in the `data` folder under the current working directory by default. Use `-data-dir` to override this location. API keys remain in Grok Build configuration; the proxy forwards allowlisted headers and redacts credentials in the normal log fields.
 
 The dashboard can edit the three HTTPS upstream URLs and per-gateway Header allowlists, filter logs/statistics by gateway, model, and time range, show weighted cache hit rate and coverage, inspect raw JSON/SSE bodies, and copy Grok Build configuration snippets.
+
+The request detail drawer also provides GitHub-style, change-focused side-by-side comparisons with added/modified/deleted counts and a reason for each change:
+
+- the original client request versus the request actually sent to the upstream;
+- the upstream API response versus the response actually written back to the client.
+
+For development troubleshooting, SQLite keeps the request body, upstream request body, upstream raw response, final client response, statuses, URLs, sanitized headers, and actual header snapshots as separate fields. Existing databases are migrated automatically on startup.
+
+The **网关配置** page includes an independent User-Agent override switch and value for each gateway. When enabled, that gateway's configured value is applied to its upstream requests; when disabled, the client User-Agent is forwarded according to that gateway's Header allowlist.
 
 ## Test
 

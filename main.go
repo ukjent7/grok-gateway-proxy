@@ -80,14 +80,5 @@ func main() {
 }
 
 func defaultDataDir() string {
-	if appData := os.Getenv("APPDATA"); appData != "" {
-		return filepath.Join(appData, "grok-gateway-proxy")
-	}
-	if dataHome := os.Getenv("XDG_DATA_HOME"); dataHome != "" {
-		return filepath.Join(dataHome, "grok-gateway-proxy")
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		return filepath.Join(home, ".local", "share", "grok-gateway-proxy")
-	}
-	return ".grok-gateway-proxy"
+	return filepath.Join(".", "data")
 }

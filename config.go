@@ -19,53 +19,55 @@ const (
 )
 
 type GatewayConfig struct {
-	ID             string   `json:"id"`
-	Prefix         string   `json:"prefix"`
-	Name           string   `json:"name"`
-	BaseURL        string   `json:"base_url"`
-	Protocol       Protocol `json:"protocol"`
-	Enabled        bool     `json:"enabled"`
-	ForwardHeaders []string `json:"forward_headers,omitempty"`
+	ID                       string   `json:"id"`
+	Prefix                   string   `json:"prefix"`
+	Name                     string   `json:"name"`
+	BaseURL                  string   `json:"base_url"`
+	Protocol                 Protocol `json:"protocol"`
+	Enabled                  bool     `json:"enabled"`
+	ForwardHeaders           []string `json:"forward_headers,omitempty"`
+	UserAgentOverrideEnabled bool     `json:"user_agent_override_enabled"`
+	UserAgentOverride        string   `json:"user_agent_override,omitempty"`
 }
 
 type Config struct {
-	ListenAddr               string                   `json:"listen_addr"`
-	ConfigPath               string                   `json:"-"`
-	Gateways                 map[string]GatewayConfig `json:"gateways"`
-	UserAgentOverrideEnabled bool                     `json:"user_agent_override_enabled"`
-	UserAgentOverride        string                   `json:"user_agent_override"`
-	mu                       sync.RWMutex
+	ListenAddr string                   `json:"listen_addr"`
+	ConfigPath string                   `json:"-"`
+	Gateways   map[string]GatewayConfig `json:"gateways"`
+	mu         sync.RWMutex
 }
 
 func DefaultConfig(path string) *Config {
 	return &Config{
 		ListenAddr: "127.0.0.1:8787",
 		ConfigPath: path,
-		UserAgentOverride: "grok-gateway-proxy/dev",
 		Gateways: map[string]GatewayConfig{
 			"oc": {
-				ID:       "oc",
-				Prefix:   "/oc",
-				Name:     "OpenCode Zen",
-				BaseURL:  "https://opencode.ai/zen/go/v1",
-				Protocol: ProtocolResponses,
-				Enabled:  true,
+				ID:                "oc",
+				Prefix:            "/oc",
+				Name:              "OpenCode Zen",
+				BaseURL:           "https://opencode.ai/zen/go/v1",
+				Protocol:          ProtocolResponses,
+				Enabled:           true,
+				UserAgentOverride: "grok-gateway-proxy/dev",
 			},
 			"st": {
-				ID:       "st",
-				Prefix:   "/st",
-				Name:     "SenseNova",
-				BaseURL:  "https://token.sensenova.cn/v1",
-				Protocol: ProtocolChat,
-				Enabled:  true,
+				ID:                "st",
+				Prefix:            "/st",
+				Name:              "SenseNova",
+				BaseURL:           "https://token.sensenova.cn/v1",
+				Protocol:          ProtocolChat,
+				Enabled:           true,
+				UserAgentOverride: "grok-gateway-proxy/dev",
 			},
 			"ve": {
-				ID:       "ve",
-				Prefix:   "/ve",
-				Name:     "Vercel AI Gateway",
-				BaseURL:  "https://ai-gateway.vercel.sh/v1",
-				Protocol: ProtocolResponses,
-				Enabled:  true,
+				ID:                "ve",
+				Prefix:            "/ve",
+				Name:              "Vercel AI Gateway",
+				BaseURL:           "https://ai-gateway.vercel.sh/v1",
+				Protocol:          ProtocolResponses,
+				Enabled:           true,
+				UserAgentOverride: "grok-gateway-proxy/dev",
 			},
 		},
 	}
@@ -81,20 +83,17 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 	var disk struct {
-		ListenAddr               string                   `json:"listen_addr"`
-		Gateways                 map[string]GatewayConfig `json:"gateways"`
-		UserAgentOverrideEnabled bool                     `json:"user_agent_override_enabled"`
-		UserAgentOverride        string                   `json:"user_agent_override"`
+		ListenAddr string                   `json:"listen_addr"`
+		Gateways   map[string]GatewayConfig `json:"gateways"`
+		// These fields are read only to migrate the previous global setting.
+		LegacyUserAgentOverrideEnabled bool   `json:"user_agent_override_enabled"`
+		LegacyUserAgentOverride        string `json:"user_agent_override"`
 	}
 	if err := json.Unmarshal(b, &disk); err != nil {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
 	if disk.ListenAddr != "" {
 		cfg.ListenAddr = disk.ListenAddr
-	}
-	cfg.UserAgentOverrideEnabled = disk.UserAgentOverrideEnabled
-	if disk.UserAgentOverride != "" {
-		cfg.UserAgentOverride = disk.UserAgentOverride
 	}
 	for id, gateway := range disk.Gateways {
 		if defaultGateway, ok := cfg.Gateways[id]; ok {
@@ -106,7 +105,21 @@ func LoadConfig(path string) (*Config, error) {
 			if gateway.BaseURL == "" {
 				gateway.BaseURL = defaultGateway.BaseURL
 			}
+			if gateway.UserAgentOverride == "" {
+				gateway.UserAgentOverride = defaultGateway.UserAgentOverride
+			}
 			gateway.ID = id
+			cfg.Gateways[id] = gateway
+		}
+	}
+	if disk.LegacyUserAgentOverrideEnabled {
+		value := strings.TrimSpace(disk.LegacyUserAgentOverride)
+		if value == "" {
+			value = "grok-gateway-proxy/dev"
+		}
+		for id, gateway := range cfg.Gateways {
+			gateway.UserAgentOverrideEnabled = true
+			gateway.UserAgentOverride = value
 			cfg.Gateways[id] = gateway
 		}
 	}
@@ -123,11 +136,9 @@ func (c *Config) Save() error {
 		return err
 	}
 	b, err := json.MarshalIndent(struct {
-		ListenAddr               string                   `json:"listen_addr"`
-		Gateways                 map[string]GatewayConfig `json:"gateways"`
-		UserAgentOverrideEnabled bool                     `json:"user_agent_override_enabled"`
-		UserAgentOverride        string                   `json:"user_agent_override"`
-	}{c.ListenAddr, c.Gateways, c.UserAgentOverrideEnabled, c.UserAgentOverride}, "", "  ")
+		ListenAddr string                   `json:"listen_addr"`
+		Gateways   map[string]GatewayConfig `json:"gateways"`
+	}{c.ListenAddr, c.Gateways}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -145,9 +156,6 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.ListenAddr) == "" {
 		return errors.New("listen_addr is required")
 	}
-	if c.UserAgentOverrideEnabled && strings.TrimSpace(c.UserAgentOverride) == "" {
-		return errors.New("user_agent_override is required when the override is enabled")
-	}
 	for id, gateway := range c.Gateways {
 		expected, ok := DefaultConfig("").Gateways[id]
 		if !ok {
@@ -162,43 +170,15 @@ func (c *Config) Validate() error {
 		if gateway.Protocol != expected.Protocol {
 			return fmt.Errorf("gateway %q must use protocol %q", id, expected.Protocol)
 		}
+		if gateway.UserAgentOverrideEnabled && strings.TrimSpace(gateway.UserAgentOverride) == "" {
+			return fmt.Errorf("gateway %q user_agent_override is required when the override is enabled", id)
+		}
 		u, err := url.Parse(gateway.BaseURL)
 		if err != nil || u.Scheme != "https" || u.Host == "" {
 			return fmt.Errorf("gateway %q base_url must be an HTTPS URL", id)
 		}
 	}
 	return nil
-}
-
-func (c *Config) UpdateUserAgentOverride(enabled bool, value string) error {
-	value = strings.TrimSpace(value)
-	if enabled && value == "" {
-		return errors.New("user_agent_override is required when the override is enabled")
-	}
-	c.mu.Lock()
-	oldEnabled, oldValue := c.UserAgentOverrideEnabled, c.UserAgentOverride
-	c.UserAgentOverrideEnabled, c.UserAgentOverride = enabled, value
-	validationErr := c.Validate()
-	c.mu.Unlock()
-	if validationErr != nil {
-		c.mu.Lock()
-		c.UserAgentOverrideEnabled, c.UserAgentOverride = oldEnabled, oldValue
-		c.mu.Unlock()
-		return validationErr
-	}
-	if err := c.Save(); err != nil {
-		c.mu.Lock()
-		c.UserAgentOverrideEnabled, c.UserAgentOverride = oldEnabled, oldValue
-		c.mu.Unlock()
-		return err
-	}
-	return nil
-}
-
-func (c *Config) UserAgentOverrideSnapshot() (bool, string) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.UserAgentOverrideEnabled, c.UserAgentOverride
 }
 
 func (c *Config) Snapshot() map[string]GatewayConfig {
