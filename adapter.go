@@ -112,20 +112,83 @@ func transformToolCallType(body []byte, from, to string) ([]byte, error) {
 }
 
 func transformSenseNovaResponseBody(body []byte) ([]byte, error) {
-	var payload any
-	if err := json.Unmarshal(body, &payload); err != nil {
+	if !json.Valid(body) {
 		return body, nil
 	}
-	changed := rewriteToolCallTypes(payload, "function_call", "function")
-	changed = rewriteEmptyFinishReasons(payload) || changed
+	result, changed := replaceJSONPropertyStringValue(body, "type", "function_call", `"function"`)
+	var finishChanged bool
+	result, finishChanged = replaceJSONPropertyStringValue(result, "finish_reason", "", "null")
+	changed = changed || finishChanged
 	if !changed {
 		return body, nil
 	}
-	result, err := json.Marshal(payload)
-	if err != nil {
-		return nil, err
-	}
 	return result, nil
+}
+
+// replaceJSONPropertyStringValue changes only a JSON property value. It keeps
+// the original key order, whitespace, and all unrelated bytes intact.
+func replaceJSONPropertyStringValue(body []byte, key, from, to string) ([]byte, bool) {
+	keyToken := []byte(`"` + key + `"`)
+	fromToken := []byte(`"` + from + `"`)
+	toToken := []byte(to)
+	changed := false
+	for index := 0; index < len(body); {
+		if body[index] != '"' {
+			index++
+			continue
+		}
+		end, ok := scanJSONString(body, index)
+		if !ok {
+			return body, changed
+		}
+		if bytes.Equal(body[index:end], keyToken) {
+			valueStart := skipJSONWhitespace(body, end)
+			if valueStart < len(body) && body[valueStart] == ':' {
+				valueStart = skipJSONWhitespace(body, valueStart+1)
+				if valueEnd, valueOK := scanJSONString(body, valueStart); valueOK && bytes.Equal(body[valueStart:valueEnd], fromToken) {
+					result := make([]byte, 0, len(body)-len(fromToken)+len(toToken))
+					result = append(result, body[:valueStart]...)
+					result = append(result, toToken...)
+					result = append(result, body[valueEnd:]...)
+					body = result
+					index = valueStart + len(toToken)
+					changed = true
+					continue
+				}
+			}
+		}
+		index = end
+	}
+	return body, changed
+}
+
+func scanJSONString(body []byte, start int) (int, bool) {
+	if start >= len(body) || body[start] != '"' {
+		return 0, false
+	}
+	for index := start + 1; index < len(body); index++ {
+		switch body[index] {
+		case '\\':
+			index++
+		case '"':
+			return index + 1, true
+		}
+	}
+	return 0, false
+}
+
+func skipJSONWhitespace(body []byte, start int) int {
+	for start < len(body) {
+		if !isJSONWhitespace(body[start]) {
+			return start
+		}
+		start++
+	}
+	return start
+}
+
+func isJSONWhitespace(value byte) bool {
+	return value == ' ' || value == '\t' || value == '\r' || value == '\n'
 }
 
 func rewriteToolCallTypes(value any, from, to string) bool {
@@ -152,28 +215,6 @@ func rewriteToolCallTypes(value any, from, to string) bool {
 				continue
 			}
 			changed = rewriteToolCallTypes(child, from, to) || changed
-		}
-	}
-	return changed
-}
-
-func rewriteEmptyFinishReasons(value any) bool {
-	changed := false
-	switch current := value.(type) {
-	case []any:
-		for _, item := range current {
-			changed = rewriteEmptyFinishReasons(item) || changed
-		}
-	case map[string]any:
-		for key, child := range current {
-			if key == "finish_reason" {
-				if reason, ok := child.(string); ok && reason == "" {
-					current[key] = nil
-					changed = true
-				}
-				continue
-			}
-			changed = rewriteEmptyFinishReasons(child) || changed
 		}
 	}
 	return changed
@@ -224,7 +265,15 @@ func transformSenseNovaSSELine(line []byte) []byte {
 	if dataIndex < 0 || len(bytes.TrimSpace(content[:dataIndex])) != 0 {
 		return line
 	}
-	payload := bytes.TrimSpace(content[dataIndex+len("data:"):])
+	payloadStart := dataIndex + len("data:")
+	for payloadStart < len(content) && isJSONWhitespace(content[payloadStart]) {
+		payloadStart++
+	}
+	payloadEnd := len(content)
+	for payloadEnd > payloadStart && isJSONWhitespace(content[payloadEnd-1]) {
+		payloadEnd--
+	}
+	payload := content[payloadStart:payloadEnd]
 	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
 		return line
 	}
@@ -232,10 +281,10 @@ func transformSenseNovaSSELine(line []byte) []byte {
 	if err != nil || bytes.Equal(converted, payload) {
 		return line
 	}
-	result := make([]byte, 0, len(line)+8)
-	result = append(result, content[:dataIndex]...)
-	result = append(result, []byte("data: ")...)
+	result := make([]byte, 0, len(line))
+	result = append(result, content[:payloadStart]...)
 	result = append(result, converted...)
+	result = append(result, content[payloadEnd:]...)
 	result = append(result, lineEnd...)
 	return result
 }

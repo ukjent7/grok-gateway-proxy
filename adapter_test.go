@@ -42,10 +42,16 @@ func TestSenseNovaTransformsToolCallTypesWithoutChangingToolDefinitions(t *testi
 
 func TestSenseNovaTransformsStreamingToolCalls(t *testing.T) {
 	adapter := SenseNovaChatAdapter{}
-	reader := adapter.TransformSSE(strings.NewReader("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"type\":\"function_call\"}]},\"finish_reason\":\"\"}]}\n\ndata: [DONE]\n\n"))
+	input := "data: {\"id\":\"chunk-1\",\"created\":1,\"model\":\"demo\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"type\":\"function_call\"}]},\"finish_reason\":\"\"}],\"request_id\":\"chunk-1\"}\n\ndata: [DONE]\n\n"
+	expected := strings.ReplaceAll(input, `"type":"function_call"`, `"type":"function"`)
+	expected = strings.ReplaceAll(expected, `"finish_reason":""`, `"finish_reason":null`)
+	reader := adapter.TransformSSE(strings.NewReader(input))
 	body, err := io.ReadAll(reader)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if string(body) != expected {
+		t.Fatalf("streaming response was reserialized or changed unexpectedly:\nwant: %s\ngot:  %s", expected, body)
 	}
 	if strings.Contains(string(body), `"type":"function_call"`) || !strings.Contains(string(body), `"type":"function"`) {
 		t.Fatalf("streaming tool call type was not converted: %s", body)
