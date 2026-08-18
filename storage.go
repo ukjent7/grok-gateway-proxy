@@ -141,20 +141,30 @@ func (s *Store) addColumnIfMissing(name, definition string) error {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+var requestLogInsertColumns = []string{
+	"id", "started_at", "gateway_id", "gateway_name", "prefix", "ingress_protocol",
+	"upstream_protocol", "model", "request_path", "request_url", "upstream_url", "method",
+	"status_code", "client_response_status_code", "upstream_response_status_code",
+	"success", "stream", "duration_ms", "request_headers", "request_headers_actual",
+	"request_body", "upstream_headers", "upstream_headers_actual", "upstream_body",
+	"upstream_response_headers", "upstream_response_headers_actual", "upstream_response_body",
+	"response_headers", "response_headers_actual", "response_body", "error",
+	"input_tokens", "cache_read_tokens", "cache_write_tokens", "prompt_tokens",
+	"output_tokens", "reasoning_tokens", "cache_supported", "usage_present", "cache_source",
+}
+
+var requestLogInsertSQL = buildRequestLogInsertSQL()
+
+func buildRequestLogInsertSQL() string {
+	placeholders := make([]string, len(requestLogInsertColumns))
+	for i := range placeholders {
+		placeholders[i] = "?"
+	}
+	return "INSERT INTO request_logs (" + strings.Join(requestLogInsertColumns, ", ") + ") VALUES (" + strings.Join(placeholders, ", ") + ")"
+}
+
 func (s *Store) Insert(ctx context.Context, log RequestLog) error {
-	_, err := s.db.ExecContext(ctx, `
-INSERT INTO request_logs (
-    id, started_at, gateway_id, gateway_name, prefix, ingress_protocol,
-    upstream_protocol, model, request_path, request_url, upstream_url, method,
-    status_code, client_response_status_code, upstream_response_status_code,
-    success, stream, duration_ms, request_headers, request_headers_actual,
-    request_body, upstream_headers, upstream_headers_actual, upstream_body,
-    upstream_response_headers, upstream_response_headers_actual, upstream_response_body,
-    response_headers, response_headers_actual, response_body, error,
-    input_tokens, cache_read_tokens, cache_write_tokens, prompt_tokens,
-    output_tokens, reasoning_tokens, cache_supported, usage_present, cache_source
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-`, log.ID, log.StartedAt.UTC().Format(time.RFC3339Nano), log.GatewayID,
+	args := []any{log.ID, log.StartedAt.UTC().Format(time.RFC3339Nano), log.GatewayID,
 		log.GatewayName, log.Prefix, log.IngressProtocol, log.UpstreamProtocol,
 		log.Model, log.RequestPath, log.RequestURL, log.UpstreamURL, log.Method, log.StatusCode,
 		log.ClientResponseStatusCode, log.UpstreamResponseStatusCode, boolInt(log.Success),
@@ -165,7 +175,11 @@ INSERT INTO request_logs (
 		emptyBlob(log.ResponseBody), log.Error, log.Usage.InputTokens, log.Usage.CacheReadTokens,
 		log.Usage.CacheWriteTokens, log.Usage.PromptTokens, log.Usage.OutputTokens,
 		log.Usage.ReasoningTokens, boolInt(log.Usage.CacheSupported),
-		boolInt(log.Usage.UsagePresent), log.Usage.CacheSource)
+		boolInt(log.Usage.UsagePresent), log.Usage.CacheSource}
+	if len(args) != len(requestLogInsertColumns) {
+		return fmt.Errorf("request log insert has %d values for %d columns", len(args), len(requestLogInsertColumns))
+	}
+	_, err := s.db.ExecContext(ctx, requestLogInsertSQL, args...)
 	return err
 }
 
