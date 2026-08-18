@@ -307,12 +307,29 @@ func (VercelResponsesAdapter) NormalizeError(status int, body []byte) []byte {
 	return normalizeUpstreamError(status, body)
 }
 
-// Vercel's AI Gateway keeps long-running SSE responses alive with periodic
-// ping events (data: {"type":"ping"}). Clients with a strict Responses event
-// enum (e.g. Grok Build) fail to deserialize those, so drop them before the
-// stream reaches the client. Every other event is passed through untouched.
+// Vercel's AI Gateway adapts third-party providers to the Responses API, and
+// two of its behaviors break strict clients (e.g. Grok Build's async-openai
+// based parser): it injects keepalive `ping` events (data: {"type":"ping"})
+// and, for reasoning models, emits the legacy event names
+// `response.reasoning.delta` / `response.reasoning.done` instead of the
+// `response.reasoning_text.delta` / `response.reasoning_text.done` variants
+// the client's enum knows. Drop the pings and rename the legacy reasoning
+// events (their payloads are field-for-field identical); everything else is
+// passed through untouched.
 func (VercelResponsesAdapter) TransformSSE(reader io.Reader) io.Reader {
 	return &vercelSSEReader{reader: bufio.NewReaderSize(reader, 64*1024)}
+}
+
+// rewriteVercelReasoningEvent renames the legacy reasoning stream event names
+// to the newer `reasoning_text` variants. Only the exact type tag / event name
+// is rewritten, so delta or text content that merely quotes the old name is
+// never corrupted.
+func rewriteVercelReasoningEvent(line []byte) []byte {
+	line = bytes.ReplaceAll(line, []byte(`"type":"response.reasoning.delta"`), []byte(`"type":"response.reasoning_text.delta"`))
+	line = bytes.ReplaceAll(line, []byte(`"type":"response.reasoning.done"`), []byte(`"type":"response.reasoning_text.done"`))
+	line = bytes.ReplaceAll(line, []byte("event: response.reasoning.delta"), []byte("event: response.reasoning_text.delta"))
+	line = bytes.ReplaceAll(line, []byte("event: response.reasoning.done"), []byte("event: response.reasoning_text.done"))
+	return line
 }
 
 type vercelSSEReader struct {
@@ -349,7 +366,7 @@ func (r *vercelSSEReader) Read(p []byte) (int, error) {
 		switch {
 		case bytes.HasPrefix(trimmed, []byte("event:")):
 			r.flushEventLine()
-			r.eventLine = append(r.eventLine[:0], line...)
+			r.eventLine = append(r.eventLine[:0], rewriteVercelReasoningEvent(line)...)
 		case bytes.HasPrefix(trimmed, []byte("data:")):
 			payload := bytes.TrimSpace(trimmed[len("data:"):])
 			if isVercelPing(payload) {
@@ -358,7 +375,7 @@ func (r *vercelSSEReader) Read(p []byte) (int, error) {
 				continue
 			}
 			r.flushEventLine()
-			r.pending.Write(line)
+			r.pending.Write(rewriteVercelReasoningEvent(line))
 		default:
 			// Drop the blank line that terminates a dropped ping event so the
 			// stream stays byte-identical apart from the removed event.

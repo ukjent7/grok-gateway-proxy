@@ -14,6 +14,8 @@ Each adapter preserves its native protocol. `/oc` and `/ve` accept only `POST /r
 
 The SenseNova adapter includes a narrow compatibility shim for tool-call history: it sends `messages[].tool_calls[].type` as `function_call` upstream and converts it back to `function` for the client, including SSE responses. `tools[].type` is left unchanged. Both forms remain visible in the request audit record.
 
+The Vercel adapter normalizes two Responses SSE quirks of Vercel's AI Gateway that break strict clients (e.g. Grok Build's async-openai based parser): it drops the `ping` keepalive events the gateway injects, and it renames the legacy `response.reasoning.delta` / `response.reasoning.done` events to the `response.reasoning_text.delta` / `response.reasoning_text.done` variants the client's enum knows (the payloads are field-for-field identical). Everything else is forwarded byte-for-byte.
+
 ## Run
 
 ```sh

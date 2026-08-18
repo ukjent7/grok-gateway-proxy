@@ -60,10 +60,41 @@ func TestVercelFiltersPingEventsFromResponsesStream(t *testing.T) {
 	}
 }
 
+func TestVercelRenamesLegacyReasoningEvents(t *testing.T) {
+	adapter := VercelResponsesAdapter{}
+	input := "event: response.reasoning.delta\ndata: {\"type\":\"response.reasoning.delta\",\"sequence_number\":3,\"item_id\":\"rs_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"thinking\"}\n\n" +
+		"event: response.reasoning.done\ndata: {\"type\":\"response.reasoning.done\",\"sequence_number\":26,\"item_id\":\"rs_1\",\"output_index\":0,\"content_index\":0,\"text\":\"thinking\"}\n\n" +
+		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":30,\"delta\":\"hello\"}\n\n"
+	want := strings.ReplaceAll(input, "response.reasoning.delta", "response.reasoning_text.delta")
+	want = strings.ReplaceAll(want, "response.reasoning.done", "response.reasoning_text.done")
+	reader := adapter.TransformSSE(strings.NewReader(input))
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != want {
+		t.Fatalf("legacy reasoning events were not renamed:\nwant: %q\ngot:  %q", want, body)
+	}
+}
+
+func TestVercelRenameDoesNotCorruptQuotedContent(t *testing.T) {
+	adapter := VercelResponsesAdapter{}
+	// The old event name quoted inside delta text must survive untouched.
+	input := "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"the event is response.reasoning.delta\"}\n\n"
+	reader := adapter.TransformSSE(strings.NewReader(input))
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != input {
+		t.Fatalf("quoted content was corrupted:\nwant: %q\ngot:  %q", input, body)
+	}
+}
+
 func TestVercelPassesResponsesStreamThroughUnchanged(t *testing.T) {
 	adapter := VercelResponsesAdapter{}
 	input := "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r1\",\"status\":\"in_progress\"}}\n\n" +
-		"event: response.reasoning.delta\ndata: {\"type\":\"response.reasoning.delta\",\"delta\":\"think\"}\n\n" +
+		"event: response.reasoning_text.delta\ndata: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"think\"}\n\n" +
 		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n" +
 		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\"}}\n\n"
 	reader := adapter.TransformSSE(strings.NewReader(input))
