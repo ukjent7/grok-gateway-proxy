@@ -42,11 +42,15 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.handleAPI(w, r)
 		return
 	}
-	if strings.HasPrefix(r.URL.Path, "/oc") || strings.HasPrefix(r.URL.Path, "/st") || strings.HasPrefix(r.URL.Path, "/ve") {
+	if hasPathPrefix(r.URL.Path, "/oc") || hasPathPrefix(r.URL.Path, "/st") || hasPathPrefix(r.URL.Path, "/ve") {
 		a.proxy.ServeHTTP(w, r)
 		return
 	}
 	a.handleUI(w, r)
+}
+
+func hasPathPrefix(path, prefix string) bool {
+	return path == prefix || strings.HasPrefix(path, prefix+"/")
 }
 
 func (a *App) handleAPI(w http.ResponseWriter, r *http.Request) {
