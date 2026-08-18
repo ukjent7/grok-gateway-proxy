@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -53,13 +54,34 @@ func hasPathPrefix(path, prefix string) bool {
 	return path == prefix || strings.HasPrefix(path, prefix+"/")
 }
 
+// requireAPIToken guards the management API with an optional Bearer token.
+// When no token is configured every local request passes; when one is set,
+// the caller must present it via the Authorization header.
+func (a *App) requireAPIToken(w http.ResponseWriter, r *http.Request) bool {
+	token := a.config.APIToken
+	if token == "" {
+		return true
+	}
+	provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if provided == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="grok-gateway-proxy"`)
+		writeError(w, http.StatusUnauthorized, fmt.Errorf("unauthorized: invalid or missing API token"))
+		return false
+	}
+	return true
+}
+
 func (a *App) handleAPI(w http.ResponseWriter, r *http.Request) {
+	if !a.requireAPIToken(w, r) {
+		return
+	}
 	path := strings.TrimPrefix(r.URL.Path, "/api")
 	switch {
 	case path == "/config" && r.Method == http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]any{
-			"listen_addr": a.config.ListenAddr,
-			"gateways":    a.config.Snapshot(),
+			"listen_addr":  a.config.ListenAddr,
+			"auth_enabled": a.config.APIToken != "",
+			"gateways":     a.config.Snapshot(),
 		})
 	case path == "/gateways" && r.Method == http.MethodPut:
 		a.updateGateways(w, r)

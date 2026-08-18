@@ -5,11 +5,18 @@ import (
 	"strings"
 )
 
+// ExtractUsage reads usage metrics from either a single JSON response body or
+// an SSE stream. For streams, usage may be carried by several events (e.g. the
+// Responses API emits `response.created` with an all-zero usage object before
+// the terminal event), so the last usage-bearing event wins: intermediate
+// events are zeroed placeholders, while the terminal event holds the
+// cumulative totals the client would bill on.
 func ExtractUsage(body []byte, protocol Protocol) UsageMetrics {
 	var root map[string]any
 	if json.Unmarshal(body, &root) == nil {
 		return extractUsageFromRoot(root, protocol)
 	}
+	var last UsageMetrics
 	for _, line := range strings.Split(string(body), "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "data:") {
@@ -20,13 +27,12 @@ func ExtractUsage(body []byte, protocol Protocol) UsageMetrics {
 			continue
 		}
 		if json.Unmarshal([]byte(data), &root) == nil {
-			metrics := extractUsageFromRoot(root, protocol)
-			if metrics.UsagePresent {
-				return metrics
+			if metrics := extractUsageFromRoot(root, protocol); metrics.UsagePresent {
+				last = metrics
 			}
 		}
 	}
-	return UsageMetrics{}
+	return last
 }
 
 func extractUsageFromRoot(root map[string]any, protocol Protocol) UsageMetrics {

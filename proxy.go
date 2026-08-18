@@ -16,10 +16,21 @@ import (
 )
 
 type Proxy struct {
-	config *Config
-	store  *Store
-	logger *slog.Logger
-	client *http.Client
+	config           *Config
+	store            *Store
+	logger           *slog.Logger
+	client           *http.Client
+	responseBodySize int64
+}
+
+// responseBodySize returns the audit-capture cap for response bodies. It is a
+// field so tests can exercise truncation with a small bound; production uses
+// maxResponseBodySize.
+func (p *Proxy) responseBodyLimit() int64 {
+	if p.responseBodySize > 0 {
+		return p.responseBodySize
+	}
+	return maxResponseBodySize
 }
 
 type responseCapture struct {
@@ -27,6 +38,8 @@ type responseCapture struct {
 	statusCode int
 	headers    http.Header
 	body       bytes.Buffer
+	bodyLimit  int64
+	truncated  bool
 }
 
 func (w *responseCapture) WriteHeader(statusCode int) {
@@ -44,9 +57,26 @@ func (w *responseCapture) Write(data []byte) (int, error) {
 	}
 	n, err := w.ResponseWriter.Write(data)
 	if n > 0 {
-		_, _ = w.body.Write(data[:n])
+		w.captureBody(data[:n])
 	}
 	return n, err
+}
+
+func (w *responseCapture) captureBody(data []byte) {
+	if w.truncated {
+		return
+	}
+	remaining := w.bodyLimit - int64(w.body.Len())
+	if remaining <= 0 {
+		w.truncated = true
+		return
+	}
+	if int64(len(data)) > remaining {
+		_, _ = w.body.Write(data[:remaining])
+		w.truncated = true
+		return
+	}
+	_, _ = w.body.Write(data)
 }
 
 func (w *responseCapture) Flush() {
@@ -66,11 +96,52 @@ func cloneHeaders(src http.Header) http.Header {
 	return dst
 }
 
-const maxRequestBodySize int64 = 64 << 20
+const (
+	// maxRequestBodySize bounds the audit-captured request body. Requests
+	// larger than this are rejected with 413 before any upstream call.
+	maxRequestBodySize int64 = 64 << 20
+	// maxResponseBodySize bounds the audit-captured response body. Responses
+	// larger than this are still forwarded to the client in full, but only the
+	// first maxResponseBodySize bytes are buffered for the log, and the log is
+	// flagged with response_truncated. This keeps a pathological upstream
+	// stream from ballooning proxy memory or the SQLite database.
+	maxResponseBodySize int64 = 64 << 20
+)
+
+// cappedBuffer is an io.Writer that stops accepting bytes once limit is
+// reached, so a TeeReader can snapshot the upstream stream without unbounded
+// buffering. Writes beyond the limit are reported as written (the byte count
+// is returned as-is) so the TeeReader keeps passing the full stream through.
+type cappedBuffer struct {
+	buf       bytes.Buffer
+	limit     int64
+	truncated bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if c.truncated {
+		return len(p), nil
+	}
+	remaining := c.limit - int64(c.buf.Len())
+	if remaining <= 0 {
+		c.truncated = true
+		return len(p), nil
+	}
+	if int64(len(p)) > remaining {
+		_, _ = c.buf.Write(p[:remaining])
+		c.truncated = true
+	} else {
+		_, _ = c.buf.Write(p)
+	}
+	return len(p), nil
+}
+
+func (c *cappedBuffer) Bytes() []byte { return c.buf.Bytes() }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
-	capturedResponse := &responseCapture{ResponseWriter: w}
+	bodyLimit := p.responseBodyLimit()
+	capturedResponse := &responseCapture{ResponseWriter: w, bodyLimit: bodyLimit}
 	w = capturedResponse
 	logEntry := RequestLog{
 		ID:                   newRequestID(),
@@ -92,6 +163,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		logEntry.ResponseHeaders = headersJSON(capturedResponse.headers)
 		logEntry.ResponseHeadersActual = headersJSONActual(capturedResponse.headers)
 		logEntry.ResponseBody = append([]byte(nil), capturedResponse.body.Bytes()...)
+		logEntry.ResponseTruncated = logEntry.ResponseTruncated || capturedResponse.truncated
 		p.finishLog(r.Context(), &logEntry, started)
 	}()
 
@@ -204,7 +276,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	logEntry.UpstreamResponseHeaders = headersJSON(upstreamResponse.Header)
 	logEntry.UpstreamResponseHeadersActual = headersJSONActual(upstreamResponse.Header)
 	if upstreamResponse.StatusCode >= http.StatusBadRequest {
-		rawError, readErr := io.ReadAll(upstreamResponse.Body)
+		rawError, readErr := io.ReadAll(io.LimitReader(upstreamResponse.Body, bodyLimit+1))
+		if int64(len(rawError)) > bodyLimit {
+			rawError = rawError[:bodyLimit]
+			logEntry.ResponseTruncated = true
+		}
 		logEntry.UpstreamResponseBody = append([]byte(nil), rawError...)
 		if readErr != nil {
 			logEntry.Error = readErr.Error()
@@ -228,17 +304,25 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var responseBody []byte
 	var copyErr error
 	if eventStream {
-		var rawResponse bytes.Buffer
+		var rawResponse cappedBuffer
+		rawResponse.limit = bodyLimit
 		responseReader := io.Reader(io.TeeReader(upstreamResponse.Body, &rawResponse))
 		if transformer, ok := adapter.(streamTransformer); ok {
 			responseReader = transformer.TransformSSE(responseReader)
 		}
-		responseBody, copyErr = copyAndCapture(w, responseReader, stream || eventStream)
+		responseBody, copyErr = copyAndCapture(w, responseReader, stream || eventStream, bodyLimit)
 		logEntry.UpstreamResponseBody = append([]byte(nil), rawResponse.Bytes()...)
+		logEntry.ResponseTruncated = rawResponse.truncated
 	} else {
-		var rawResponse []byte
-		rawResponse, copyErr = io.ReadAll(upstreamResponse.Body)
-		logEntry.UpstreamResponseBody = append([]byte(nil), rawResponse...)
+		// Read the full body so the client always receives the complete
+		// response; only the audit capture is capped. TeeReader snapshots the
+		// first bodyLimit bytes into rawCapture while io.ReadAll consumes the
+		// whole stream for transformation and forwarding.
+		var rawCapture cappedBuffer
+		rawCapture.limit = bodyLimit
+		rawResponse, copyErr := io.ReadAll(io.TeeReader(upstreamResponse.Body, &rawCapture))
+		logEntry.UpstreamResponseBody = append([]byte(nil), rawCapture.Bytes()...)
+		logEntry.ResponseTruncated = rawCapture.truncated
 		var transformErr error
 		responseBody, transformErr = transformResponseBody(adapter, rawResponse)
 		if transformErr != nil {
@@ -321,8 +405,8 @@ func copyResponseHeaders(dst, src http.Header) {
 	}
 }
 
-func copyAndCapture(w http.ResponseWriter, reader io.Reader, streaming bool) ([]byte, error) {
-	var capture bytes.Buffer
+func copyAndCapture(w http.ResponseWriter, reader io.Reader, streaming bool, limit int64) ([]byte, error) {
+	capture := cappedBuffer{limit: limit}
 	buf := make([]byte, 32*1024)
 	flusher, canFlush := w.(http.Flusher)
 	for {

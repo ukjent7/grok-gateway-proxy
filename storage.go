@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
     response_headers TEXT NOT NULL,
     response_headers_actual TEXT NOT NULL DEFAULT '',
     response_body BLOB NOT NULL,
+    response_truncated INTEGER NOT NULL DEFAULT 0,
     error TEXT NOT NULL DEFAULT '',
     input_tokens INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
@@ -98,6 +99,7 @@ CREATE INDEX IF NOT EXISTS idx_request_logs_model ON request_logs(model);
 		{name: "upstream_response_headers_actual", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "upstream_response_body", definition: "BLOB NOT NULL DEFAULT X''"},
 		{name: "response_headers_actual", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "response_truncated", definition: "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := s.addColumnIfMissing(column.name, column.definition); err != nil {
 			return err
@@ -148,7 +150,7 @@ var requestLogInsertColumns = []string{
 	"success", "stream", "duration_ms", "request_headers", "request_headers_actual",
 	"request_body", "upstream_headers", "upstream_headers_actual", "upstream_body",
 	"upstream_response_headers", "upstream_response_headers_actual", "upstream_response_body",
-	"response_headers", "response_headers_actual", "response_body", "error",
+	"response_headers", "response_headers_actual", "response_body", "response_truncated", "error",
 	"input_tokens", "cache_read_tokens", "cache_write_tokens", "prompt_tokens",
 	"output_tokens", "reasoning_tokens", "cache_supported", "usage_present", "cache_source",
 }
@@ -172,7 +174,7 @@ func (s *Store) Insert(ctx context.Context, log RequestLog) error {
 		emptyBlob(log.RequestBody), log.UpstreamHeaders, log.UpstreamHeadersActual,
 		emptyBlob(log.UpstreamBody), log.UpstreamResponseHeaders, log.UpstreamResponseHeadersActual,
 		emptyBlob(log.UpstreamResponseBody), log.ResponseHeaders, log.ResponseHeadersActual,
-		emptyBlob(log.ResponseBody), log.Error, log.Usage.InputTokens, log.Usage.CacheReadTokens,
+		emptyBlob(log.ResponseBody), boolInt(log.ResponseTruncated), log.Error, log.Usage.InputTokens, log.Usage.CacheReadTokens,
 		log.Usage.CacheWriteTokens, log.Usage.PromptTokens, log.Usage.OutputTokens,
 		log.Usage.ReasoningTokens, boolInt(log.Usage.CacheSupported),
 		boolInt(log.Usage.UsagePresent), log.Usage.CacheSource}
@@ -222,7 +224,7 @@ upstream_protocol, model, request_path, request_url, upstream_url, method, statu
 client_response_status_code, upstream_response_status_code, success, stream, duration_ms,
 request_headers, request_headers_actual, request_body, upstream_headers, upstream_headers_actual,
 upstream_body, upstream_response_headers, upstream_response_headers_actual, upstream_response_body,
-response_headers, response_headers_actual, response_body, error, input_tokens,
+response_headers, response_headers_actual, response_body, response_truncated, error, input_tokens,
 cache_read_tokens, cache_write_tokens, prompt_tokens, output_tokens,
 reasoning_tokens, cache_supported, usage_present, cache_source
 FROM request_logs WHERE id = ?`, id)
@@ -350,7 +352,7 @@ func scanSummary(row scanner) (RequestLog, error) {
 func scanFull(row scanner) (RequestLog, error) {
 	var log RequestLog
 	var started string
-	var success, stream, cacheSupported, usagePresent int
+	var success, stream, cacheSupported, usagePresent, responseTruncated int
 	var ingress, upstream string
 	if err := row.Scan(&log.ID, &started, &log.GatewayID, &log.GatewayName,
 		&log.Prefix, &ingress, &upstream, &log.Model, &log.RequestPath,
@@ -360,7 +362,7 @@ func scanFull(row scanner) (RequestLog, error) {
 		&log.UpstreamHeaders, &log.UpstreamHeadersActual, &log.UpstreamBody,
 		&log.UpstreamResponseHeaders, &log.UpstreamResponseHeadersActual,
 		&log.UpstreamResponseBody, &log.ResponseHeaders, &log.ResponseHeadersActual,
-		&log.ResponseBody, &log.Error, &log.Usage.InputTokens,
+		&log.ResponseBody, &responseTruncated, &log.Error, &log.Usage.InputTokens,
 		&log.Usage.CacheReadTokens, &log.Usage.CacheWriteTokens,
 		&log.Usage.PromptTokens, &log.Usage.OutputTokens,
 		&log.Usage.ReasoningTokens, &cacheSupported, &usagePresent,
@@ -377,6 +379,7 @@ func scanFull(row scanner) (RequestLog, error) {
 	log.Stream = stream != 0
 	log.Usage.CacheSupported = cacheSupported != 0
 	log.Usage.UsagePresent = usagePresent != 0
+	log.ResponseTruncated = responseTruncated != 0
 	return log, nil
 }
 

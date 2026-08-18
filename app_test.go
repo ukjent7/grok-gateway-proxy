@@ -50,6 +50,53 @@ func TestDefaultDataDirIsLocalDataFolder(t *testing.T) {
 	}
 }
 
+func TestAPITokenGatesManagementAPIWhenConfigured(t *testing.T) {
+	cfg := DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
+	cfg.APIToken = "secret-token"
+	app := &App{config: cfg, logger: slog.Default()}
+
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/api/config", nil)
+	recorder := httptest.NewRecorder()
+	app.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without token, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/api/config", nil)
+	req.Header.Set("Authorization", "Bearer wrong-token")
+	recorder = httptest.NewRecorder()
+	app.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with wrong token, got %d", recorder.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/api/config", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	recorder = httptest.NewRecorder()
+	app.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200 with correct token, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["auth_enabled"] != true {
+		t.Fatalf("expected auth_enabled true, got: %+v", body)
+	}
+}
+
+func TestAPITokenUnsetAllowsManagementAPI(t *testing.T) {
+	cfg := DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
+	app := &App{config: cfg, logger: slog.Default()}
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/api/config", nil)
+	recorder := httptest.NewRecorder()
+	app.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200 without token configured, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestGatewayConfigAPIUpdatesUserAgentOverride(t *testing.T) {
 	cfg := DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
 	app := &App{config: cfg, logger: slog.Default()}

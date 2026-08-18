@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 )
 
@@ -115,7 +116,11 @@ func transformSenseNovaResponseBody(body []byte) ([]byte, error) {
 	if !json.Valid(body) {
 		return body, nil
 	}
-	result, changed := replaceJSONPropertyStringValue(body, "type", "function_call", `"function"`)
+	// Only rewrite the tool-call type value inside tool_calls arrays, matching
+	// the request-side conversion; tools[].type and any other "type" property
+	// stay untouched. finish_reason "" is normalized to null because strict
+	// clients reject the empty string on the terminal choice.
+	result, changed := replaceJSONPropertyStringValueInToolCalls(body, "function_call", `"function"`)
 	var finishChanged bool
 	result, finishChanged = replaceJSONPropertyStringValue(result, "finish_reason", "", "null")
 	changed = changed || finishChanged
@@ -123,6 +128,79 @@ func transformSenseNovaResponseBody(body []byte) ([]byte, error) {
 		return body, nil
 	}
 	return result, nil
+}
+
+// replaceJSONPropertyStringValueInToolCalls changes a "type" property string
+// value only when the property belongs to an entry of a "tool_calls" array.
+// Everything else — key order, whitespace, and any other "type" field such as
+// tools[].type — is left byte-for-byte intact.
+func replaceJSONPropertyStringValueInToolCalls(body []byte, from, to string) ([]byte, bool) {
+	typeToken := []byte(`"type"`)
+	toolCallsKeyToken := []byte(`"tool_calls"`)
+	fromToken := []byte(`"` + from + `"`)
+	toToken := []byte(to)
+	changed := false
+	// bracketDepth tracks the nesting of {} and [] containers.
+	bracketDepth := 0
+	// toolCallDepths holds the bracketDepth at which each currently open
+	// tool_calls array started; empty while not inside any.
+	var toolCallDepths []int
+	// lastKey is the most recently seen object key at the current depth.
+	lastKeyDepth := -1
+	lastKey := []byte(nil)
+	inToolCalls := func() bool {
+		return len(toolCallDepths) > 0 && bracketDepth > toolCallDepths[len(toolCallDepths)-1]
+	}
+
+	for index := 0; index < len(body); {
+		switch body[index] {
+		case '{', '[':
+			lastKeyDepth = -1
+			lastKey = nil
+			bracketDepth++
+			index++
+		case '}', ']':
+			bracketDepth--
+			for len(toolCallDepths) > 0 && bracketDepth <= toolCallDepths[len(toolCallDepths)-1] {
+				toolCallDepths = toolCallDepths[:len(toolCallDepths)-1]
+			}
+			index++
+		case '"':
+			end, ok := scanJSONString(body, index)
+			if !ok {
+				return body, changed
+			}
+			valueStart := skipJSONWhitespace(body, end)
+			isKey := valueStart < len(body) && body[valueStart] == ':'
+			if isKey {
+				lastKeyDepth = bracketDepth
+				lastKey = body[index:end]
+				if bytes.Equal(body[index:end], toolCallsKeyToken) {
+					afterColon := skipJSONWhitespace(body, valueStart+1)
+					if afterColon < len(body) && body[afterColon] == '[' {
+						toolCallDepths = append(toolCallDepths, bracketDepth)
+					}
+				}
+				index = end
+				continue
+			}
+			if inToolCalls() && lastKeyDepth == bracketDepth && bytes.Equal(lastKey, typeToken) &&
+				bytes.Equal(body[index:end], fromToken) {
+				result := make([]byte, 0, len(body)-len(fromToken)+len(toToken))
+				result = append(result, body[:index]...)
+				result = append(result, toToken...)
+				result = append(result, body[end:]...)
+				body = result
+				changed = true
+				index = index + len(toToken)
+				continue
+			}
+			index = end
+		default:
+			index++
+		}
+	}
+	return body, changed
 }
 
 // replaceJSONPropertyStringValue changes only a JSON property value. It keeps
@@ -436,7 +514,7 @@ func normalizeUpstreamError(status int, body []byte) []byte {
 	errorBody := map[string]any{
 		"type":    "upstream_error",
 		"message": message,
-		"code":    status,
+		"code":    strconv.Itoa(status),
 	}
 	if len(body) > 0 {
 		if json.Valid(body) {

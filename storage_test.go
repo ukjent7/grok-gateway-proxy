@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"math"
 	"path/filepath"
@@ -107,6 +108,90 @@ func TestStoreInsertPersistsAllAuditFields(t *testing.T) {
 		if !bytes.Equal(check.got, check.want) {
 			t.Fatalf("%s was not persisted: got=%q want=%q", check.name, check.got, check.want)
 		}
+	}
+}
+
+// A database created by an older proxy build (missing the later-added columns)
+// must be migrated on open without losing existing rows.
+func TestOpenStoreMigratesLegacySchema(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "proxy.db")
+	legacy, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`
+CREATE TABLE request_logs (
+    id TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    gateway_id TEXT NOT NULL,
+    gateway_name TEXT NOT NULL,
+    prefix TEXT NOT NULL,
+    ingress_protocol TEXT NOT NULL,
+    upstream_protocol TEXT NOT NULL,
+    model TEXT NOT NULL,
+    request_path TEXT NOT NULL,
+    upstream_url TEXT NOT NULL,
+    method TEXT NOT NULL,
+    status_code INTEGER NOT NULL DEFAULT 0,
+    success INTEGER NOT NULL DEFAULT 0,
+    stream INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    request_headers TEXT NOT NULL,
+    request_body BLOB NOT NULL,
+    upstream_headers TEXT NOT NULL,
+    upstream_body BLOB NOT NULL,
+    response_headers TEXT NOT NULL,
+    response_body BLOB NOT NULL,
+    error TEXT NOT NULL DEFAULT '',
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_supported INTEGER NOT NULL DEFAULT 0,
+    usage_present INTEGER NOT NULL DEFAULT 0,
+    cache_source TEXT NOT NULL DEFAULT ''
+);
+INSERT INTO request_logs (id, started_at, gateway_id, gateway_name, prefix, ingress_protocol, upstream_protocol, model, request_path, upstream_url, method, status_code, success, stream, duration_ms, request_headers, request_body, upstream_headers, upstream_body, response_headers, response_body, error, input_tokens, cache_read_tokens, cache_write_tokens, prompt_tokens, output_tokens, reasoning_tokens, cache_supported, usage_present, cache_source)
+VALUES ('legacy-1', '2026-01-01T00:00:00Z', 've', 'Vercel AI Gateway', '/ve', 'responses', 'responses', 'demo', '/responses', 'https://example.test/v1/responses', 'POST', 200, 1, 1, 10, '{}', X'7b7d', '{}', X'7b7d', '{}', X'7b7d', '', 0, 0, 0, 0, 0, 0, 0, 0, '');
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy.Close()
+
+	store, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	got, err := store.Get(context.Background(), "legacy-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GatewayID != "ve" || got.StatusCode != 200 {
+		t.Fatalf("legacy row was not preserved: %+v", got)
+	}
+	if got.ResponseTruncated {
+		t.Fatal("legacy row must default to response_truncated=false")
+	}
+
+	// The new column must be usable for inserts after migration.
+	if err := store.Insert(context.Background(), RequestLog{
+		ID: "post-migration", StartedAt: time.Now().UTC(), GatewayID: "ve", GatewayName: "Vercel AI Gateway",
+		Prefix: "/ve", IngressProtocol: ProtocolResponses, UpstreamProtocol: ProtocolResponses,
+		ResponseTruncated: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	inserted, err := store.Get(context.Background(), "post-migration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted.ResponseTruncated {
+		t.Fatal("response_truncated flag was not persisted after migration")
 	}
 }
 

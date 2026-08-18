@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -270,5 +272,144 @@ func TestJoinUpstreamURL(t *testing.T) {
 	got, err := joinUpstreamURL("https://example.test/v1", "/responses", "x=1")
 	if err != nil || got != "https://example.test/v1/responses?x=1" {
 		t.Fatalf("unexpected URL: %s, err=%v", got, err)
+	}
+}
+
+// A response larger than the capture cap must still be forwarded to the
+// client in full, while the log keeps only the first cap bytes and flags the
+// log with response_truncated.
+func TestProxyCapsResponseBodyCapture(t *testing.T) {
+	const capSize = 1024
+	bigBody := bytes.Repeat([]byte("x"), 4*capSize)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(bigBody)
+	}))
+	defer upstream.Close()
+
+	store, err := OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := DefaultConfig(t.TempDir() + "/config.json")
+	gateway := cfg.Gateways["st"]
+	gateway.BaseURL = upstream.URL
+	cfg.Gateways["st"] = gateway
+	p := &Proxy{config: cfg, store: store, logger: slog.Default(), client: upstream.Client(), responseBodySize: capSize}
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/st/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	recorder := httptest.NewRecorder()
+	p.ServeHTTP(recorder, req)
+
+	// The client still receives the full body.
+	if recorder.Code != http.StatusOK || recorder.Body.Len() != len(bigBody) {
+		t.Fatalf("client did not receive full body: status=%d len=%d", recorder.Code, recorder.Body.Len())
+	}
+
+	logs, err := store.List(context.Background(), LogFilter{Limit: 10})
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("expected one log, got %d, err=%v", len(logs), err)
+	}
+	detail, err := store.Get(context.Background(), logs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detail.ResponseBody) != capSize || len(detail.UpstreamResponseBody) != capSize {
+		t.Fatalf("expected capped bodies of %d bytes, got response=%d upstream=%d", capSize, len(detail.ResponseBody), len(detail.UpstreamResponseBody))
+	}
+	if !detail.ResponseTruncated {
+		t.Fatal("expected response_truncated flag on the log")
+	}
+}
+
+// An SSE stream larger than the capture cap is forwarded in full to the
+// client; only the logged raw/transformed captures are capped and flagged.
+func TestProxyCapsSSEResponseBodyCapture(t *testing.T) {
+	const capSize = 1024
+	var stream bytes.Buffer
+	for i := 0; i < 40; i++ {
+		stream.WriteString("data: {\"type\":\"response.output_text.delta\",\"sequence_number\":" + strconv.Itoa(i) + ",\"delta\":\"" + strings.Repeat("x", 80) + "\"}\n\n")
+	}
+	stream.WriteString("data: [DONE]\n\n")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write(stream.Bytes())
+	}))
+	defer upstream.Close()
+
+	store, err := OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := DefaultConfig(t.TempDir() + "/config.json")
+	gateway := cfg.Gateways["ve"]
+	gateway.BaseURL = upstream.URL
+	cfg.Gateways["ve"] = gateway
+	p := &Proxy{config: cfg, store: store, logger: slog.Default(), client: upstream.Client(), responseBodySize: capSize}
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/ve/responses", strings.NewReader(`{"model":"m","stream":true,"input":"hi"}`))
+	recorder := httptest.NewRecorder()
+	p.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK || recorder.Body.Len() != stream.Len() {
+		t.Fatalf("client did not receive full stream: status=%d len=%d want=%d", recorder.Code, recorder.Body.Len(), stream.Len())
+	}
+
+	logs, err := store.List(context.Background(), LogFilter{Limit: 10})
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("expected one log, got %d, err=%v", len(logs), err)
+	}
+	detail, err := store.Get(context.Background(), logs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detail.ResponseBody) != capSize || len(detail.UpstreamResponseBody) != capSize {
+		t.Fatalf("expected capped captures of %d bytes, got response=%d upstream=%d", capSize, len(detail.ResponseBody), len(detail.UpstreamResponseBody))
+	}
+	if !detail.ResponseTruncated {
+		t.Fatal("expected response_truncated flag on the log")
+	}
+}
+
+// A response within the cap is stored in full and not flagged.
+func TestProxyResponseWithinCapIsNotFlagged(t *testing.T) {
+	const capSize = 4096
+	body := []byte(`{"id":"ok","choices":[]}`)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer upstream.Close()
+
+	store, err := OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := DefaultConfig(t.TempDir() + "/config.json")
+	gateway := cfg.Gateways["st"]
+	gateway.BaseURL = upstream.URL
+	cfg.Gateways["st"] = gateway
+	p := &Proxy{config: cfg, store: store, logger: slog.Default(), client: upstream.Client(), responseBodySize: capSize}
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/st/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	recorder := httptest.NewRecorder()
+	p.ServeHTTP(recorder, req)
+
+	logs, err := store.List(context.Background(), LogFilter{Limit: 10})
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("expected one log, got %d, err=%v", len(logs), err)
+	}
+	detail, err := store.Get(context.Background(), logs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.ResponseTruncated {
+		t.Fatal("response within cap must not be flagged truncated")
+	}
+	if string(detail.ResponseBody) != string(body) {
+		t.Fatalf("response body mismatch: %q", detail.ResponseBody)
 	}
 }

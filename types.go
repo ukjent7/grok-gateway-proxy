@@ -26,38 +26,39 @@ func (u UsageMetrics) HitRate() *float64 {
 }
 
 type RequestLog struct {
-	ID               string       `json:"id"`
-	StartedAt        time.Time    `json:"started_at"`
-	GatewayID        string       `json:"gateway_id"`
-	GatewayName      string       `json:"gateway_name"`
-	Prefix           string       `json:"prefix"`
-	IngressProtocol  Protocol     `json:"ingress_protocol"`
-	UpstreamProtocol Protocol     `json:"upstream_protocol"`
-	Model            string       `json:"model"`
-	RequestPath      string       `json:"request_path"`
-	RequestURL       string       `json:"request_url"`
-	UpstreamURL      string       `json:"upstream_url"`
-	Method           string       `json:"method"`
-	StatusCode       int          `json:"status_code"`
-	ClientResponseStatusCode int  `json:"client_response_status_code"`
-	UpstreamResponseStatusCode int `json:"upstream_response_status_code"`
-	Success          bool         `json:"success"`
-	Stream           bool         `json:"stream"`
-	DurationMS       int64        `json:"duration_ms"`
-	RequestHeaders   string       `json:"request_headers"`
-	RequestHeadersActual string    `json:"request_headers_actual,omitempty"`
-	RequestBody      []byte       `json:"request_body"`
-	UpstreamHeaders  string       `json:"upstream_headers"`
-	UpstreamHeadersActual string  `json:"upstream_headers_actual,omitempty"`
-	UpstreamBody     []byte       `json:"upstream_body"`
-	UpstreamResponseHeaders string `json:"upstream_response_headers"`
-	UpstreamResponseHeadersActual string `json:"upstream_response_headers_actual,omitempty"`
-	UpstreamResponseBody []byte   `json:"upstream_response_body"`
-	ResponseHeaders  string       `json:"response_headers"`
-	ResponseHeadersActual string  `json:"response_headers_actual,omitempty"`
-	ResponseBody     []byte       `json:"response_body"`
-	Error            string       `json:"error,omitempty"`
-	Usage            UsageMetrics `json:"usage"`
+	ID                            string       `json:"id"`
+	StartedAt                     time.Time    `json:"started_at"`
+	GatewayID                     string       `json:"gateway_id"`
+	GatewayName                   string       `json:"gateway_name"`
+	Prefix                        string       `json:"prefix"`
+	IngressProtocol               Protocol     `json:"ingress_protocol"`
+	UpstreamProtocol              Protocol     `json:"upstream_protocol"`
+	Model                         string       `json:"model"`
+	RequestPath                   string       `json:"request_path"`
+	RequestURL                    string       `json:"request_url"`
+	UpstreamURL                   string       `json:"upstream_url"`
+	Method                        string       `json:"method"`
+	StatusCode                    int          `json:"status_code"`
+	ClientResponseStatusCode      int          `json:"client_response_status_code"`
+	UpstreamResponseStatusCode    int          `json:"upstream_response_status_code"`
+	Success                       bool         `json:"success"`
+	Stream                        bool         `json:"stream"`
+	DurationMS                    int64        `json:"duration_ms"`
+	RequestHeaders                string       `json:"request_headers"`
+	RequestHeadersActual          string       `json:"request_headers_actual,omitempty"`
+	RequestBody                   []byte       `json:"request_body"`
+	UpstreamHeaders               string       `json:"upstream_headers"`
+	UpstreamHeadersActual         string       `json:"upstream_headers_actual,omitempty"`
+	UpstreamBody                  []byte       `json:"upstream_body"`
+	UpstreamResponseHeaders       string       `json:"upstream_response_headers"`
+	UpstreamResponseHeadersActual string       `json:"upstream_response_headers_actual,omitempty"`
+	UpstreamResponseBody          []byte       `json:"upstream_response_body"`
+	ResponseHeaders               string       `json:"response_headers"`
+	ResponseHeadersActual         string       `json:"response_headers_actual,omitempty"`
+	ResponseBody                  []byte       `json:"response_body"`
+	ResponseTruncated             bool         `json:"response_truncated,omitempty"`
+	Error                         string       `json:"error,omitempty"`
+	Usage                         UsageMetrics `json:"usage"`
 }
 
 type Metrics struct {
@@ -86,17 +87,17 @@ type Metrics struct {
 func (l RequestLog) MarshalJSON() ([]byte, error) {
 	type alias RequestLog
 	return json.Marshal(&struct {
-		RequestBody  string `json:"request_body"`
-		UpstreamBody string `json:"upstream_body"`
+		RequestBody          string `json:"request_body"`
+		UpstreamBody         string `json:"upstream_body"`
 		UpstreamResponseBody string `json:"upstream_response_body"`
-		ResponseBody string `json:"response_body"`
+		ResponseBody         string `json:"response_body"`
 		*alias
 	}{
-		RequestBody:  string(l.RequestBody),
-		UpstreamBody: string(l.UpstreamBody),
+		RequestBody:          string(l.RequestBody),
+		UpstreamBody:         string(l.UpstreamBody),
 		UpstreamResponseBody: string(l.UpstreamResponseBody),
-		ResponseBody: string(l.ResponseBody),
-		alias:        (*alias)(&l),
+		ResponseBody:         string(l.ResponseBody),
+		alias:                (*alias)(&l),
 	})
 }
 

@@ -40,6 +40,27 @@ func TestSenseNovaTransformsToolCallTypesWithoutChangingToolDefinitions(t *testi
 	}
 }
 
+// The response-side conversion must only rewrite tool-call entries inside
+// tool_calls arrays; any other "type" property (e.g. echoed tool definitions)
+// is left byte-for-byte intact.
+func TestSenseNovaResponseTransformScopedToToolCalls(t *testing.T) {
+	adapter := SenseNovaChatAdapter{}
+	body := []byte(`{"tools":[{"type":"function_call","function":{"name":"defn"}}],"choices":[{"message":{"tool_calls":[{"id":"call-1","type":"function_call","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":""}]}`)
+	clientBody, err := adapter.TransformResponseBody(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(clientBody), `"tools":[{"type":"function_call"`) {
+		t.Fatalf("non-tool_calls type was rewritten: %s", clientBody)
+	}
+	if !strings.Contains(string(clientBody), `"tool_calls":[{"id":"call-1","type":"function"`) {
+		t.Fatalf("tool_calls type was not converted: %s", clientBody)
+	}
+	if !strings.Contains(string(clientBody), `"finish_reason":null`) {
+		t.Fatalf("empty finish_reason was not normalized to null: %s", clientBody)
+	}
+}
+
 func TestVercelFiltersPingEventsFromResponsesStream(t *testing.T) {
 	adapter := VercelResponsesAdapter{}
 	input := "event: ping\ndata: {\"type\":\"ping\"}\n\n" +

@@ -32,6 +32,7 @@ type GatewayConfig struct {
 
 type Config struct {
 	ListenAddr string                   `json:"listen_addr"`
+	APIToken   string                   `json:"api_token,omitempty"`
 	ConfigPath string                   `json:"-"`
 	Gateways   map[string]GatewayConfig `json:"gateways"`
 	mu         sync.RWMutex
@@ -84,6 +85,7 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	var disk struct {
 		ListenAddr string                   `json:"listen_addr"`
+		APIToken   string                   `json:"api_token"`
 		Gateways   map[string]GatewayConfig `json:"gateways"`
 		// These fields are read only to migrate the previous global setting.
 		LegacyUserAgentOverrideEnabled bool   `json:"user_agent_override_enabled"`
@@ -95,6 +97,7 @@ func LoadConfig(path string) (*Config, error) {
 	if disk.ListenAddr != "" {
 		cfg.ListenAddr = disk.ListenAddr
 	}
+	cfg.APIToken = disk.APIToken
 	for id, gateway := range disk.Gateways {
 		if defaultGateway, ok := cfg.Gateways[id]; ok {
 			gateway.Prefix = defaultGateway.Prefix
@@ -137,8 +140,9 @@ func (c *Config) Save() error {
 	}
 	b, err := json.MarshalIndent(struct {
 		ListenAddr string                   `json:"listen_addr"`
+		APIToken   string                   `json:"api_token,omitempty"`
 		Gateways   map[string]GatewayConfig `json:"gateways"`
-	}{c.ListenAddr, c.Gateways}, "", "  ")
+	}{c.ListenAddr, c.APIToken, c.Gateways}, "", "  ")
 	if err != nil {
 		return err
 	}
