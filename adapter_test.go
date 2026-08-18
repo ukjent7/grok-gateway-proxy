@@ -205,3 +205,24 @@ func TestSenseNovaTransformsStreamingToolCalls(t *testing.T) {
 		t.Fatalf("streaming empty finish_reason was not normalized to null: %s", body)
 	}
 }
+
+func TestSenseNovaStreamingToolCallContinuationKeepsIdentity(t *testing.T) {
+	adapter := SenseNovaChatAdapter{}
+	input := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\"}}]},\"finish_reason\":\"\"}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\",\"type\":\"function\",\"function\":{\"name\":\"\",\"arguments\":\"x\"}}]},\"finish_reason\":\"\"}]}\n\n"
+	reader := adapter.TransformSSE(strings.NewReader(input))
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := string(body)
+	if !strings.Contains(result, `"id":"call-1"`) || !strings.Contains(result, `"name":"lookup"`) {
+		t.Fatalf("initial tool-call identity was lost: %s", result)
+	}
+	if strings.Contains(result, `"id":""`) || strings.Contains(result, `"name":""`) {
+		t.Fatalf("empty continuation identity fields were forwarded: %s", result)
+	}
+	if !strings.Contains(result, `"arguments":"x"`) {
+		t.Fatalf("tool-call argument continuation was changed: %s", result)
+	}
+}

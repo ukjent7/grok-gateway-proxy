@@ -470,6 +470,10 @@ func transformSenseNovaSSELine(line []byte) []byte {
 		return line
 	}
 	converted, err := transformSenseNovaResponseBody(payload)
+	if err != nil {
+		return line
+	}
+	converted, err = stripEmptySenseNovaToolCallDeltaFields(converted)
 	if err != nil || bytes.Equal(converted, payload) {
 		return line
 	}
@@ -479,6 +483,59 @@ func transformSenseNovaSSELine(line []byte) []byte {
 	result = append(result, content[payloadEnd:]...)
 	result = append(result, lineEnd...)
 	return result
+}
+
+// SenseNova repeats empty id/name fields on tool-call continuation chunks.
+// Some OpenAI-compatible clients merge those chunks by assignment, so the
+// repeated empty fields overwrite the identity from the first chunk and the
+// next request contains an invalid empty tool call. Omit only empty identity
+// fields inside streamed tool_calls; arguments remain incremental fragments.
+func stripEmptySenseNovaToolCallDeltaFields(body []byte) ([]byte, error) {
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body, nil
+	}
+	if !stripEmptySenseNovaToolCallDeltaFieldsInValue(payload) {
+		return body, nil
+	}
+	result, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func stripEmptySenseNovaToolCallDeltaFieldsInValue(value any) bool {
+	changed := false
+	switch current := value.(type) {
+	case []any:
+		for _, item := range current {
+			changed = stripEmptySenseNovaToolCallDeltaFieldsInValue(item) || changed
+		}
+	case map[string]any:
+		if calls, ok := current["tool_calls"].([]any); ok {
+			for _, item := range calls {
+				call, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+				if id, ok := call["id"].(string); ok && id == "" {
+					delete(call, "id")
+					changed = true
+				}
+				if function, ok := call["function"].(map[string]any); ok {
+					if name, ok := function["name"].(string); ok && name == "" {
+						delete(function, "name")
+						changed = true
+					}
+				}
+			}
+		}
+		for _, child := range current {
+			changed = stripEmptySenseNovaToolCallDeltaFieldsInValue(child) || changed
+		}
+	}
+	return changed
 }
 
 type VercelResponsesAdapter struct{}
