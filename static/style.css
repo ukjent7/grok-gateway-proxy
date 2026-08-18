@@ -346,6 +346,11 @@ kbd{
   transform:translateY(-1px);
 }
 .btn-ghost.small{ padding:5px 10px; font-size:11.5px; }
+.btn-ghost.is-set{
+  border-color:var(--teal-line);
+  color:var(--teal-bright);
+  background:var(--teal-bg);
+}
 
 .btn-danger{
   display:inline-flex; align-items:center; gap:7px;

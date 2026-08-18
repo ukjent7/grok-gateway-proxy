@@ -19,6 +19,7 @@ const state = {
   activeView: 'overview',
   drawerLog: null,
   drawerTab: 'request-compare',
+  showRawHeaders: false,
   pollTimer: null,
   cmdkSelected: 0,
   cmdkItems: []
@@ -73,16 +74,67 @@ function rangeLabel(range) {
 }
 
 /* ---------------- API client ---------------- */
-async function api(path, opts) {
-  const res = await fetch('/api' + path, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts));
+const TOKEN_KEY = 'grok_gateway_token';
+
+function savedToken() {
+  try { return localStorage.getItem(TOKEN_KEY) || ''; } catch (e) { return ''; }
+}
+function saveToken(token) {
+  try {
+    if (token) localStorage.setItem(TOKEN_KEY, token);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch (e) { /* private mode */ }
+}
+
+async function api(path, opts, _retried) {
+  const headers = Object.assign({ 'Content-Type': 'application/json' }, (opts && opts.headers) || {});
+  const token = savedToken();
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  const res = await fetch('/api' + path, Object.assign({}, opts, { headers }));
   let body = null;
   try { body = await res.json(); } catch (e) { /* no body */ }
+  if (res.status === 401 && !_retried && !opts.retry401) {
+    const entered = window.prompt('此代理的管理接口需要访问令牌。\n请输入令牌（留空则不再提示）:', token || '');
+    if (entered && entered.trim()) {
+      saveToken(entered.trim());
+      return api(path, opts, true);
+    }
+    if (entered === null) {
+      throw new Error('未提供访问令牌');
+    }
+  }
   if (!res.ok) {
     const msg = (body && body.error && body.error.message) || res.statusText || ('HTTP ' + res.status);
     throw new Error(msg);
   }
   return body;
 }
+
+function updateTokenButton() {
+  const btn = $('#tokenBtn');
+  if (!btn) return;
+  const has = savedToken();
+  btn.classList.toggle('is-set', !!has);
+  btn.title = has ? '已设置访问令牌，点击清除' : '设置管理接口访问令牌';
+  const label = btn.querySelector('.token-label');
+  if (label) label.textContent = has ? '令牌已设' : '设置令牌';
+}
+
+$('#tokenBtn').addEventListener('click', () => {
+  if (savedToken()) {
+    saveToken('');
+    updateTokenButton();
+    showToast('已清除访问令牌', 'success');
+    return;
+  }
+  const entered = window.prompt('输入管理接口访问令牌（需与 config.json 中的 api_token 一致）:');
+  if (entered && entered.trim()) {
+    saveToken(entered.trim());
+    updateTokenButton();
+    showToast('访问令牌已保存', 'success');
+    refreshAll();
+  }
+});
 
 /* ---------------- Toast ---------------- */
 const toastIcons = {
@@ -503,7 +555,17 @@ function renderDrawer(log) {
   if (log.error) {
     $('#drawerMeta').innerHTML += '<span class="meta-chip error">错误: <b>' + escapeHtml(log.error) + '</b></span>';
   }
+  if (log.response_truncated) {
+    $('#drawerMeta').innerHTML += '<span class="meta-chip error" title="响应超过记录上限，客户端仍收到完整内容，日志仅保留前 64MB">响应体已截断</span>';
+  }
   renderDrawerTab(state.drawerTab);
+}
+
+// Headers are stored twice: sanitized (credentials replaced with [REDACTED])
+// and raw. The drawer shows the sanitized view by default; the raw toggle in
+// the drawer header switches to the actual header snapshots.
+function headersView(log, actual, sanitized) {
+  return state.showRawHeaders ? (actual || sanitized) : (sanitized || actual);
 }
 
 function renderDrawerTab(tab) {
@@ -511,6 +573,8 @@ function renderDrawerTab(tab) {
   if (!log) return;
   const compare = $('#drawerCompare');
   const code = $('#drawerCode');
+  const rawLabel = $('.raw-headers-label');
+  if (rawLabel) rawLabel.textContent = state.showRawHeaders ? '原始头' : '脱敏头';
   if (tab === 'request-compare' || tab === 'response-compare') {
     compare.style.display = 'grid';
     code.style.display = 'none';
@@ -525,10 +589,10 @@ function renderDrawerTab(tab) {
   else if (tab === 'upstream-response') content = tryPretty(log.upstream_response_body || log.response_body);
   else if (tab === 'response') content = tryPretty(log.response_body);
   else if (tab === 'headers') content =
-    tryPretty(log.request_headers_actual || log.request_headers) +
-    '\n\n--- upstream request headers ---\n\n' + tryPretty(log.upstream_headers_actual || log.upstream_headers) +
-    '\n\n--- upstream response headers ---\n\n' + tryPretty(log.upstream_response_headers_actual || log.upstream_response_headers) +
-    '\n\n--- client response headers ---\n\n' + tryPretty(log.response_headers_actual || log.response_headers);
+    tryPretty(headersView(log, log.request_headers_actual, log.request_headers)) +
+    '\n\n--- upstream request headers ---\n\n' + tryPretty(headersView(log, log.upstream_headers_actual, log.upstream_headers)) +
+    '\n\n--- upstream response headers ---\n\n' + tryPretty(headersView(log, log.upstream_response_headers_actual, log.upstream_response_headers)) +
+    '\n\n--- client response headers ---\n\n' + tryPretty(headersView(log, log.response_headers_actual, log.response_headers));
   code.textContent = content || '(空)';
 }
 
@@ -537,23 +601,23 @@ function renderComparison(tab, log) {
   const left = request ? {
     label: '客户端原请求',
     url: (log.method || 'POST') + ' ' + (log.request_url || log.request_path || '—'),
-    headers: log.request_headers_actual || log.request_headers,
+    headers: headersView(log, log.request_headers_actual, log.request_headers),
     body: log.request_body
   } : {
     label: '上游 API 原始响应',
     url: 'HTTP ' + (log.upstream_response_status_code || log.status_code || '—'),
-    headers: log.upstream_response_headers_actual || log.upstream_response_headers,
+    headers: headersView(log, log.upstream_response_headers_actual, log.upstream_response_headers),
     body: log.upstream_response_body || log.response_body
   };
   const right = request ? {
     label: '代理实际发送',
     url: (log.method || 'POST') + ' ' + (log.upstream_url || '—'),
-    headers: log.upstream_headers_actual || log.upstream_headers,
+    headers: headersView(log, log.upstream_headers_actual, log.upstream_headers),
     body: log.upstream_body
   } : {
     label: '代理实际返回客户端',
     url: 'HTTP ' + (log.client_response_status_code || log.status_code || '—'),
-    headers: log.response_headers_actual || log.response_headers,
+    headers: headersView(log, log.response_headers_actual, log.response_headers),
     body: log.response_body
   };
   const headerDiff = buildDiff(left.headers, right.headers, 'headers');
@@ -780,6 +844,10 @@ $('#drawerTabs').addEventListener('click', (e) => {
   state.drawerTab = btn.dataset.tab;
   $all('.drawer-tab').forEach(t => t.classList.toggle('is-active', t === btn));
   renderDrawerTab(state.drawerTab);
+});
+$('#drawerRawHeadersBtn').addEventListener('click', () => {
+  state.showRawHeaders = !state.showRawHeaders;
+  if (state.drawerLog) renderDrawerTab(state.drawerTab);
 });
 $('#drawerCopyIdBtn').addEventListener('click', () => {
   const id = $('#drawerId').textContent.trim();
@@ -1070,6 +1138,7 @@ async function refreshAll() {
 $('#refreshAllBtn').addEventListener('click', refreshAll);
 
 async function boot() {
+  updateTokenButton();
   try {
     await loadConfig();
     await loadOverview();
