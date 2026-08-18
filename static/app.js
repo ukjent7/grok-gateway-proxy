@@ -260,8 +260,12 @@ function renderSparklines() {
 async function loadGatewayPulses() {
   const container = $('#gatewayPulseList');
   const railContainer = $('#railChannels');
-  container.innerHTML = '';
-  railContainer.innerHTML = '';
+  if (!state.pulseSig) state.pulseSig = {};
+
+  // 先拉数据并计算签名；数据没变就跳过重绘，避免入场动画反复播放导致面板闪烁
+  const sigs = {};
+  const allLogs = {};
+  let changed = false;
   for (const id of GW_ORDER) {
     const gw = state.gateways[id];
     if (!gw) continue;
@@ -270,6 +274,21 @@ async function loadGatewayPulses() {
       const data = await api('/logs?' + new URLSearchParams({ gateway: id, limit: '40' }).toString());
       logs = (data.items || []).slice().reverse();
     } catch (e) { /* ignore per-gateway error */ }
+    allLogs[id] = logs;
+    const sig = logs.length + ':' + logs.map(l => l.id).join(',');
+    sigs[id] = sig;
+    if (sig !== state.pulseSig[id]) changed = true;
+  }
+  state.pulseSig = sigs;
+  if (!changed) return;
+
+  // 数据有变化才重建面板与侧栏实时通道
+  container.innerHTML = '';
+  railContainer.innerHTML = '';
+  for (const id of GW_ORDER) {
+    const gw = state.gateways[id];
+    if (!gw) continue;
+    const logs = allLogs[id] || [];
     const successCount = logs.filter(l => l.success).length;
     const total = logs.length;
     const totalTokens = logs.reduce((acc, l) => acc + ((l.usage && (l.usage.input_tokens || l.usage.prompt_tokens || 0)) + ((l.usage && l.usage.output_tokens) || 0)), 0);
