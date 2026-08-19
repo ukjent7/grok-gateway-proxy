@@ -26,8 +26,14 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      - name: go test
-        run: go test ./... -v
+      - name: go test (race)
+        run: CGO_ENABLED=1 go test -race ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+          args: --timeout 5m
 
   build:
     name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
@@ -70,7 +76,7 @@ jobs:
           echo "binary=${name}" >> "$GITHUB_OUTPUT"
 
       - name: Build
-        run: go build -trimpath -ldflags="-s -w" -o "${{ steps.vars.outputs.binary }}" .
+        run: go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "${{ steps.vars.outputs.binary }}" .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
