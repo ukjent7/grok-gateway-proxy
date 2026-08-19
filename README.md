@@ -18,6 +18,15 @@ The SenseNova adapter includes a narrow compatibility shim for tool-call history
 
 The Vercel adapter normalizes two Responses SSE quirks of Vercel's AI Gateway that break strict clients (e.g. Grok Build's async-openai based parser): it drops the `ping` keepalive events the gateway injects, and it renames the legacy `response.reasoning.delta` / `response.reasoning.done` events to the `response.reasoning_text.delta` / `response.reasoning_text.done` variants the client's enum knows (the payloads are field-for-field identical). Everything else is forwarded byte-for-byte.
 
+The Vercel gateway also has an opt-in **FX free-pool disguise** switch (`fx_disguise_enabled`, default **off**, toggle on the 网关配置 page). When enabled, the proxy rewrites `/ve` requests into the official `fx` CLI's v3 language-model protocol instead of forwarding Responses verbatim:
+
+- Upstream URL becomes `https://ai-gateway.vercel.sh/v3/ai/language-model`.
+- HTTP headers impersonate the fx client: `User-Agent` (default `fx/0.0.3`, overridable via `fx_disguise_user_agent`), `HTTP-Referer: github.com/vercel-labs/fx`, `X-Title`, plus the `ai-gateway-*` / `x-session-*` headers the real client sends.
+- The Responses request body is converted to the v3 payload (`prompt`, `maxOutputTokens`, `tools`/`inputSchema`, `reasoning`, …) with a `headers: {user-agent, x-title}` object injected — the two flags Vercel's gateway matches to grant the promotional pool.
+- The v3 SSE response (`text-delta` / `reasoning-delta` / `tool-input-*` / `finish`) is converted back to Responses protocol SSE for streaming requests, or assembled into a Responses JSON object for non-streaming ones.
+
+Only the `ve` gateway may enable this mode; the switch is hidden on the other cards.
+
 ## Run
 
 ```sh
@@ -66,7 +75,7 @@ For development troubleshooting, SQLite keeps the request body, upstream request
 
 Request bodies are capped at 64 MB (larger requests are rejected with `413`). Response bodies are capped at 64 MB for audit capture only: oversized responses are still forwarded to the client in full, but only the first 64 MB is stored, and the log is flagged with `response_truncated` so a pathological upstream stream cannot balloon proxy memory or the SQLite database.
 
-The **网关配置** page includes one global HTTP/HTTPS proxy URL and an independent proxy switch for each gateway. Enabled gateways use the global URL; disabled gateways connect directly. The proxy URL can be cleared to disable proxying globally, while each gateway's switch remains available for later use. The same page also includes an independent User-Agent override switch and value for each gateway. When enabled, that gateway's configured value is applied to its upstream requests; when disabled, the client User-Agent is forwarded according to that gateway's Header allowlist.
+The **网关配置** page includes one global HTTP/HTTPS proxy URL and an independent proxy switch for each gateway. Enabled gateways use the global URL; disabled gateways connect directly. The proxy URL can be cleared to disable proxying globally, while each gateway's switch remains available for later use. The same page also includes an independent User-Agent override switch and value for each gateway. When enabled, that gateway's configured value is applied to its upstream requests; when disabled, the client User-Agent is forwarded according to that gateway's Header allowlist. The Vercel card additionally exposes the FX free-pool disguise switch described above (hidden on the other gateways).
 
 ## Test
 

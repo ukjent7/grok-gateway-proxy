@@ -161,7 +161,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := p.forwardUpstreamResponse(w, &logEntry, adapter, gateway.Protocol, p.clientFor(gateway), upstreamRequest, logEntry.Stream, bodyLimit); err != nil {
+	if err := p.forwardUpstreamResponse(w, &logEntry, adapter, gateway, p.clientFor(gateway), upstreamRequest, logEntry.Stream, bodyLimit); err != nil {
 		logEntry.Error = err.Error()
 		// If nothing was written to the client yet (a transport-level failure
 		// before any upstream headers arrived), surface a gateway error instead
@@ -206,16 +206,34 @@ func (p *Proxy) resolveGateway(r *http.Request, body []byte) (GatewayConfig, str
 // buildUpstreamRequest assembles the upstream HTTP request: URL, headers,
 // body transformation, and records them in the log entry.
 func (p *Proxy) buildUpstreamRequest(ctx context.Context, r *http.Request, gateway GatewayConfig, subpath string, adapter GatewayAdapter, requestBody []byte, logEntry *RequestLog) (*http.Request, error) {
-	upstreamURL, err := joinUpstreamURL(gateway.BaseURL, subpath, r.URL.RawQuery)
-	if err != nil {
-		return nil, &statusError{status: http.StatusBadGateway, message: err.Error()}
+	fxMode := gateway.ID == "ve" && gateway.FXDisguiseEnabled
+	var upstreamURL string
+	var upstreamBody []byte
+	var err error
+	if fxMode {
+		// FX disguise mode: switch to the v3 language-model endpoint and
+		// convert the Responses body into the v3 payload with the promo
+		// headers injected.
+		upstreamURL = vercelFXUpstreamURL(gateway.BaseURL)
+		ua := gateway.FXDisguiseUserAgent
+		if ua == "" {
+			ua = "fx/0.0.3"
+		}
+		upstreamBody, err = convertResponsesToV3(requestBody, ua)
+		if err != nil {
+			return nil, &statusError{status: http.StatusBadRequest, message: err.Error()}
+		}
+	} else {
+		upstreamURL, err = joinUpstreamURL(gateway.BaseURL, subpath, r.URL.RawQuery)
+		if err != nil {
+			return nil, &statusError{status: http.StatusBadGateway, message: err.Error()}
+		}
+		upstreamBody, err = transformRequestBody(adapter, logEntry.Model, requestBody)
+		if err != nil {
+			return nil, &statusError{status: http.StatusBadRequest, message: err.Error()}
+		}
 	}
 	logEntry.UpstreamURL = upstreamURL
-
-	upstreamBody, err := transformRequestBody(adapter, logEntry.Model, requestBody)
-	if err != nil {
-		return nil, &statusError{status: http.StatusBadRequest, message: err.Error()}
-	}
 	logEntry.UpstreamBody = append([]byte(nil), upstreamBody...)
 
 	// The caller supplies the context that bounds the whole exchange: a
@@ -234,7 +252,22 @@ func (p *Proxy) buildUpstreamRequest(ctx context.Context, r *http.Request, gatew
 	copyForwardHeaders(upstreamRequest.Header, r.Header, allowlist)
 	upstreamRequest.Header.Set("Content-Type", "application/json")
 	upstreamRequest.Header.Del("Content-Length")
-	if gateway.UserAgentOverrideEnabled {
+	if fxMode {
+		sessionID := "pi-" + fxHex(8)
+		for _, h := range []string{"x-session-id", "x-session-affinity", "x-client-request-id"} {
+			if v := r.Header.Get(h); v != "" {
+				sessionID = v
+				break
+			}
+		}
+		ua := gateway.FXDisguiseUserAgent
+		if ua == "" {
+			ua = "fx/0.0.3"
+		}
+		for name, value := range fxDisguiseHeaders(ua, logEntry.Model, sessionID) {
+			upstreamRequest.Header.Set(name, value)
+		}
+	} else if gateway.UserAgentOverrideEnabled {
 		upstreamRequest.Header.Set("User-Agent", gateway.UserAgentOverride)
 	}
 	logEntry.UpstreamHeaders = headersJSON(upstreamRequest.Header)
@@ -274,7 +307,9 @@ func (p *Proxy) clientFor(gateway GatewayConfig) *http.Client {
 
 // forwardUpstreamResponse performs the upstream HTTP call and writes the
 // response back to the client, filling in the response-side audit fields.
-func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *RequestLog, adapter GatewayAdapter, protocol Protocol, client *http.Client, upstreamRequest *http.Request, stream bool, bodyLimit int64) error {
+func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *RequestLog, adapter GatewayAdapter, gateway GatewayConfig, client *http.Client, upstreamRequest *http.Request, stream bool, bodyLimit int64) error {
+	protocol := gateway.Protocol
+	fxMode := gateway.ID == "ve" && gateway.FXDisguiseEnabled
 	upstreamResponse, err := client.Do(upstreamRequest)
 	if err != nil {
 		// Transport-level failure (DNS, connect, timeout) before any upstream
@@ -316,13 +351,45 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *Request
 
 	// Success path: stream or buffer based on content-type.
 	copyResponseHeaders(w.Header(), upstreamResponse.Header)
+	if fxMode && !stream {
+		// The v3 endpoint always streams SSE; a non-streaming client expects a
+		// JSON Responses object instead.
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	}
 	writeResponseStatusAndHeaders(w, upstreamResponse)
 
 	eventStream := isEventStream(upstreamResponse.Header)
 	var responseBody []byte
 	var copyErr error
 
-	if eventStream {
+	if fxMode {
+		// FX disguise mode: the upstream speaks the v3 language-model SSE
+		// protocol. Convert it back to the Responses protocol the client
+		// expects (SSE for streaming, assembled JSON otherwise).
+		rawResponse := newCappedBuffer(bodyLimit)
+		responseReader := io.Reader(io.TeeReader(upstreamResponse.Body, rawResponse))
+		if stream {
+			responseReader = newVercelFXSSEReader(responseReader, logEntry.Model)
+			responseBody, copyErr = copyAndCapture(w, responseReader, true, bodyLimit)
+		} else {
+			raw, readErr := io.ReadAll(responseReader)
+			if readErr != nil {
+				copyErr = readErr
+			} else {
+				var transformErr error
+				responseBody, transformErr = vercelFXSSEToResponses(logEntry.Model, bytes.NewReader(raw))
+				if transformErr != nil {
+					copyErr = transformErr
+					responseBody = raw
+				}
+			}
+			if _, writeErr := w.Write(responseBody); copyErr == nil && writeErr != nil {
+				copyErr = writeErr
+			}
+		}
+		logEntry.UpstreamResponseBody = append([]byte(nil), rawResponse.Bytes()...)
+		logEntry.ResponseTruncated = rawResponse.truncated
+	} else if eventStream {
 		rawResponse := newCappedBuffer(bodyLimit)
 		responseReader := io.Reader(io.TeeReader(upstreamResponse.Body, rawResponse))
 		responseReader = transformSSE(adapter, logEntry.Model, responseReader)

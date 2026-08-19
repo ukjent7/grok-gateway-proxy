@@ -32,6 +32,11 @@ type GatewayConfig struct {
 	UserAgentOverrideEnabled bool     `json:"user_agent_override_enabled"`
 	UserAgentOverride        string   `json:"user_agent_override,omitempty"`
 	UseProxy                 bool     `json:"use_proxy"`
+	// FXDisguiseEnabled rewrites Vercel requests into the official fx client's
+	// v3 language-model protocol (fx UA/referer headers + body headers injection)
+	// to reach the free promotional pool. Only honored by the ve gateway.
+	FXDisguiseEnabled   bool   `json:"fx_disguise_enabled"`
+	FXDisguiseUserAgent string `json:"fx_disguise_user_agent,omitempty"`
 }
 
 // UnmarshalJSON migrates the previous per-gateway proxy switch while keeping
@@ -97,14 +102,15 @@ func buildDefaultGateways() map[string]GatewayConfig {
 			UseProxy:          true,
 		},
 		"ve": {
-			ID:                "ve",
-			Prefix:            "/ve",
-			Name:              "Vercel AI Gateway",
-			BaseURL:           "https://ai-gateway.vercel.sh/v1",
-			Protocol:          ProtocolResponses,
-			Enabled:           true,
-			UserAgentOverride: "grok-gateway-proxy/dev",
-			UseProxy:          true,
+			ID:                  "ve",
+			Prefix:              "/ve",
+			Name:                "Vercel AI Gateway",
+			BaseURL:             "https://ai-gateway.vercel.sh/v1",
+			Protocol:            ProtocolResponses,
+			Enabled:             true,
+			UserAgentOverride:   "grok-gateway-proxy/dev",
+			UseProxy:            true,
+			FXDisguiseUserAgent: "fx/0.0.3",
 		},
 	}
 }
@@ -165,6 +171,9 @@ func LoadConfig(path string, logRetentionDays int) (*Config, error) {
 			}
 			if gateway.UserAgentOverride == "" {
 				gateway.UserAgentOverride = defaultGateway.UserAgentOverride
+			}
+			if gateway.FXDisguiseUserAgent == "" {
+				gateway.FXDisguiseUserAgent = defaultGateway.FXDisguiseUserAgent
 			}
 			gateway.ID = id
 			cfg.Gateways[id] = gateway
@@ -235,6 +244,12 @@ func validateConfig(listenAddr string, gateways map[string]GatewayConfig) error 
 		if gateway.UserAgentOverrideEnabled && strings.TrimSpace(gateway.UserAgentOverride) == "" {
 			return fmt.Errorf("gateway %q user_agent_override is required when the override is enabled", id)
 		}
+		if gateway.FXDisguiseEnabled && id != "ve" {
+			return fmt.Errorf("gateway %q fx_disguise_enabled is only supported on the ve gateway", id)
+		}
+		if gateway.FXDisguiseEnabled && strings.TrimSpace(gateway.FXDisguiseUserAgent) == "" {
+			return fmt.Errorf("gateway %q fx_disguise_user_agent is required when fx disguise is enabled", id)
+		}
 		u, err := url.Parse(gateway.BaseURL)
 		if err != nil || u.Scheme != "https" || u.Host == "" {
 			return fmt.Errorf("gateway %q base_url must be an HTTPS URL", id)
@@ -289,6 +304,8 @@ type GatewayPatch struct {
 	UserAgentOverride        *string   `json:"user_agent_override"`
 	UseProxy                 *bool     `json:"use_proxy"`
 	LegacyUseSystemProxy     *bool     `json:"use_system_proxy"`
+	FXDisguiseEnabled        *bool     `json:"fx_disguise_enabled"`
+	FXDisguiseUserAgent      *string   `json:"fx_disguise_user_agent"`
 }
 
 // PatchGateway applies a partial update to a single gateway and persists the
@@ -324,6 +341,12 @@ func (c *Config) PatchGateway(id string, patch GatewayPatch) (GatewayConfig, err
 		gateway.UseProxy = *patch.UseProxy
 	} else if patch.LegacyUseSystemProxy != nil {
 		gateway.UseProxy = *patch.LegacyUseSystemProxy
+	}
+	if patch.FXDisguiseEnabled != nil {
+		gateway.FXDisguiseEnabled = *patch.FXDisguiseEnabled
+	}
+	if patch.FXDisguiseUserAgent != nil {
+		gateway.FXDisguiseUserAgent = *patch.FXDisguiseUserAgent
 	}
 
 	updated := make(map[string]GatewayConfig, len(c.Gateways))
