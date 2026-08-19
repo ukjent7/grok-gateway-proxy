@@ -78,7 +78,7 @@ func TestVercelFXAssignsUniqueOutputIndexesWhenTextPrecedesTool(t *testing.T) {
 	}
 }
 
-func TestExtractFXUsagePreservesCacheUnsupportedStateRegression(t *testing.T) {
+func TestExtractFXUsageCacheMissIsCacheSupported(t *testing.T) {
 	withoutCache := fxTestEvent(t, map[string]any{
 		"type": "finish",
 		"usage": map[string]any{
@@ -87,8 +87,11 @@ func TestExtractFXUsagePreservesCacheUnsupportedStateRegression(t *testing.T) {
 		},
 	}) + "data: [DONE]\n\n"
 	usage := extractFXUsage([]byte(withoutCache))
-	if !usage.UsagePresent || usage.CacheSupported || usage.InputTokens != 100 || usage.PromptTokens != 100 {
-		t.Fatalf("unexpected unsupported-cache usage: %+v", usage)
+	// cacheRead: 0 + noCache: 100 means cache accounting is supported but the
+	// request was a genuine cache miss (0% hit rate), not that caching is
+	// unsupported.
+	if !usage.UsagePresent || !usage.CacheSupported || usage.CacheReadTokens != 0 || usage.InputTokens != 100 || usage.PromptTokens != 100 {
+		t.Fatalf("unexpected cache-miss usage: %+v", usage)
 	}
 
 	withCache := fxTestEvent(t, map[string]any{
@@ -101,5 +104,21 @@ func TestExtractFXUsagePreservesCacheUnsupportedStateRegression(t *testing.T) {
 	usage = extractFXUsage([]byte(withCache))
 	if !usage.CacheSupported || usage.CacheReadTokens != 60 || usage.InputTokens != 40 || usage.PromptTokens != 100 {
 		t.Fatalf("unexpected cached usage: %+v", usage)
+	}
+}
+
+// When the v3 upstream omits both cacheRead and noCache, caching is genuinely
+// unsupported and must not be reported as a 0% hit.
+func TestExtractFXUsageNoCacheFieldsIsUnsupported(t *testing.T) {
+	noCacheFields := fxTestEvent(t, map[string]any{
+		"type": "finish",
+		"usage": map[string]any{
+			"inputTokens":  map[string]any{"total": 100},
+			"outputTokens": map[string]any{"total": 5},
+		},
+	}) + "data: [DONE]\n\n"
+	usage := extractFXUsage([]byte(noCacheFields))
+	if !usage.UsagePresent || usage.CacheSupported || usage.PromptTokens != 100 || usage.InputTokens != 100 {
+		t.Fatalf("expected cache-unsupported when no cache fields present: %+v", usage)
 	}
 }

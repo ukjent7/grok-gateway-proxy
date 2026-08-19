@@ -1,95 +1,54 @@
 # Grok Gateway Proxy
 
-Local Go proxy for Grok Build with three fixed gateway prefixes:
+本地 AI 网关代理，将多个上游 AI 服务统一为统一的 OpenAI 兼容接口，并提供请求日志与可视化仪表盘。
 
-| Prefix | Default upstream | Protocol |
-| --- | --- | --- |
-| `/oc` | `https://opencode.ai/zen/go/v1` | Responses |
-| `/st` | `https://token.sensenova.cn/v1` | Chat Completions |
-| `/ve` | `https://ai-gateway.vercel.sh/v1` | Responses |
+## 支持的网关
 
-The proxy does not provide a models endpoint and does not fetch models from an upstream. Configure model names directly in Grok Build and point each model at one of the local prefixes.
+| 路径前缀 | 网关 | 协议 |
+|---|---|---|
+| `/oc` | OpenCode Zen | Responses API |
+| `/st` | SenseNova | Chat Completions |
+| `/ve` | Vercel AI Gateway | Responses API |
 
-Each adapter preserves its native protocol. `/oc` and `/ve` accept only `POST /responses`; `/st` accepts only `POST /chat/completions`. There is no generic Responses/Chat Completions conversion layer.
+每个网关支持启用/禁用、自定义 Base URL、请求头转发、UA 覆盖等配置。Vercel 网关还支持 FX 伪装模式。
 
-OpenCode model compatibility is selected from the request's `model` field by **model-family prefix**, so upstream variants inherit their family's rules automatically (e.g. `muse-spark-1.2-contributo` matches the `muse-spark` family just like `muse-spark-1.2`). Convention: models prefixed `muse-spark` use the Muse profile, which removes the unsupported top-level `stream_tool_calls` option before forwarding and filters its `ping` SSE events; models prefixed `deepseek` currently pass through unchanged and will receive their own rules when needed. Other OpenCode models pass through unchanged unless they receive their own profile. Models named `grok` or prefixed with `grok-` are blocked locally and receive an empty completed Responses response without any upstream call.
+## 快速开始
 
-The SenseNova adapter includes a narrow compatibility shim for tool-call history: it sends `messages[].tool_calls[].type` as `function_call` upstream and converts it back to `function` for the client, including SSE responses. It also removes empty `id`/function-name fields from SenseNova's streamed tool-call continuation chunks so clients do not overwrite the identity from the first chunk. `tools[].type` is left unchanged. Incomplete historical tool calls (missing `id`, function name, or arguments) and their orphaned `tool` messages are removed before forwarding because SenseNova rejects the whole request otherwise. Both forms remain visible in the request audit record.
+```bash
+# 直接运行（默认监听 127.0.0.1:8787）
+./grok-gateway-proxy.exe
 
-The Vercel adapter normalizes two Responses SSE quirks of Vercel's AI Gateway that break strict clients (e.g. Grok Build's async-openai based parser): it drops the `ping` keepalive events the gateway injects, and it renames the legacy `response.reasoning.delta` / `response.reasoning.done` events to the `response.reasoning_text.delta` / `response.reasoning_text.done` variants the client's enum knows (the payloads are field-for-field identical). Everything else is forwarded byte-for-byte.
-
-The Vercel gateway also has an opt-in **FX free-pool disguise** switch (`fx_disguise_enabled`, default **off**, toggle on the 网关配置 page). When enabled, the proxy rewrites `/ve` requests into the official `fx` CLI's v3 language-model protocol instead of forwarding Responses verbatim:
-
-- Upstream URL becomes `https://ai-gateway.vercel.sh/v3/ai/language-model`.
-- HTTP headers impersonate the fx client: `User-Agent` (default `fx/0.0.3`, overridable via `fx_disguise_user_agent`), `HTTP-Referer: github.com/vercel-labs/fx`, `X-Title`, plus the `ai-gateway-*` / `x-session-*` headers the real client sends.
-- The Responses request body is converted to the v3 payload (`prompt`, `maxOutputTokens`, `tools`/`inputSchema`, `reasoning`, …) with a `headers: {user-agent, x-title}` object injected — the two flags Vercel's gateway matches to grant the promotional pool.
-- The v3 SSE response (`text-delta` / `reasoning-delta` / `tool-input-*` / `finish`) is converted back to Responses protocol SSE for streaming requests, or assembled into a Responses JSON object for non-streaming ones.
-
-Only the `ve` gateway may enable this mode; the switch is hidden on the other cards.
-
-## Run
-
-```sh
-go run .
+# 自定义监听地址和数据目录
+./grok-gateway-proxy.exe -listen 127.0.0.1:9000 -data-dir ./data
 ```
 
-Open <http://127.0.0.1:8787/> for the dashboard.
+启动后访问 `http://127.0.0.1:8787` 即可打开 Web 仪表盘，查看请求日志、缓存命中率、上游健康状态等。
 
-### Flags and environment
+## 命令行参数
 
-| Flag / env | Purpose |
-| --- | --- |
-| `-listen` / `GROK_PROXY_LISTEN` | Override the saved listen address |
-| `-data-dir` / `GROK_PROXY_DATA_DIR` | Directory for `config.json` and `proxy.db` |
-| `-shutdown-timeout` | Graceful-shutdown grace period for in-flight requests (default `30s`) |
-| `-log-level` | Log level: `debug`, `info`, `warn`, `error` (default `info`) |
-| `-log-retention-days` / `GROK_PROXY_LOG_RETENTION_DAYS` | Prune logs older than N days on startup and hourly (default `30`; `0` disables pruning) |
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `-listen` | 读取配置文件 | HTTP 监听地址 |
+| `-data-dir` | `./data` | 配置与日志数据库目录 |
+| `-log-level` | `info` | 日志级别：debug / info / warn / error |
+| `-log-retention-days` | `30` | 日志保留天数，0 为永久保留 |
+| `-shutdown-timeout` | `30s` | 优雅关闭超时 |
 
-Useful endpoints are`GET /healthz`, `GET /api/config`, `GET /api/metrics`, `GET /api/logs`,
-`GET /api/logs/count`, `GET /api/logs/{id}`, `PATCH /api/proxy`,
-`PATCH /api/gateways/{id}`, and `DELETE /api/logs`.
+也可通过环境变量 `GROK_PROXY_LISTEN`、`GROK_PROXY_DATA_DIR`、`GROK_PROXY_LOG_RETENTION_DAYS` 覆盖。
 
+## 配置
 
-`GET /healthz` returns `{"status":"ok","upstreams":{...}}` where each entry
-reports the last background probe of that gateway's `/models` endpoint
-(reachability and last HTTP status); probes run at startup and every 30s and
-never block the request.
+配置文件位于 `data/config.json`，也可通过 Web 仪表盘在线修改。主要字段：
 
-Upstream request deadlines default to 5 minutes for non-streaming requests
-and can be raised per request with an `X-Proxy-Timeout` header (up to 30
-minutes). Streaming requests are not subject to this total deadline: the
-client enforces its own 300s *idle* timeout (only while the stream is silent),
-so an active stream is only cut off by client disconnect or the 60s
-first-byte timeout — not by an elapsed-time cap.
+- `listen_addr` — 监听地址
+- `proxy_url` — 全局 HTTP/HTTPS 代理
+- `log_retention_days` — 日志保留天数
+- `gateways` — 各网关的配置（启用状态、Base URL、转发头、UA 覆盖、FX 伪装等）
 
-The application stores `config.json` and `proxy.db` in the `data` folder under the current working directory by default. Use `-data-dir` to override this location. API keys remain in Grok Build configuration; the proxy forwards allowlisted headers and redacts credentials in the log fields (本地小工具，管理 API 默认开放，仅监听 `127.0.0.1`，无需鉴权)。
+## 构建
 
-The dashboard can edit the three HTTPS upstream URLs, the global HTTP/HTTPS proxy URL, and per-gateway Header allowlists and proxy switches; filter logs/statistics by gateway, model, and time range; show weighted overall and per-gateway cache hit rates and coverage; inspect raw JSON/SSE bodies; and copy Grok Build configuration snippets.
-
-The request detail drawer also provides GitHub-style, change-focused side-by-side comparisons with added/modified/deleted counts and a reason for each change:
-
-- the original client request versus the request actually sent to the upstream;
-- the upstream API response versus the response actually written back to the client.
-
-For development troubleshooting, SQLite keeps the request body, upstream request body, upstream raw response, final client response, statuses, URLs, and sanitized headers as separate fields. Sensitive header values (`Authorization`, `*Api-Key*`, `*Token*`, `*Secret*`, `Cookie`) are always stored as `[REDACTED]`; on startup the proxy also scrubs any credentials that predate write-time sanitization (旧版的 `*_actual` 字段保留但不再写入，启动时同样会被脱敏)。
-
-Request bodies are capped at 64 MB (larger requests are rejected with `413`). Response bodies are capped at 64 MB for audit capture only: oversized responses are still forwarded to the client in full, but only the first 64 MB is stored, and the log is flagged with `response_truncated` so a pathological upstream stream cannot balloon proxy memory or the SQLite database.
-
-The **网关配置** page includes one global HTTP/HTTPS proxy URL and an independent proxy switch for each gateway. Enabled gateways use the global URL; disabled gateways connect directly. The proxy URL can be cleared to disable proxying globally, while each gateway's switch remains available for later use. The same page also includes an independent User-Agent override switch and value for each gateway. When enabled, that gateway's configured value is applied to its upstream requests; when disabled, the client User-Agent is forwarded according to that gateway's Header allowlist. The Vercel card additionally exposes the FX free-pool disguise switch described above (hidden on the other gateways).
-
-## Test
-
-```sh
-go test ./...
-go vet ./...
-gofmt -l .
-node --check static/js/*.js   # 或 make js-check
+```bash
+go build -o grok-gateway-proxy.exe .
 ```
 
-CI (`.github/workflows/build.yml`) runs `gofmt` formatting checks, `go vet`,
-`go test -race`, and a `node --check` syntax pass over `static/js/*.js`.
-
-## Development
-
-- `make test` / `make vet` / `make fmt` / `make check` — common tasks.
-- The dashboard is plain ES modules in `static/js/` (no build step); `static/index.html` loads `static/js/app.js`, which is embedded via `//go:embed static`.
+需要 Go 1.23+，依赖纯 Go SQLite 驱动，无需 CGO 编译器。

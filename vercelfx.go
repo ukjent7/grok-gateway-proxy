@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -723,14 +724,14 @@ func extractFXUsage(body []byte) UsageMetrics {
 
 func extractFXUsageMap(usage map[string]any) UsageMetrics {
 	result := UsageMetrics{UsagePresent: true}
-	var total, cached, cacheWrite, noCache int64
+	var total, cached, cacheWrite int64
 	var totalOK, cachedOK, cacheWriteOK, noCacheOK bool
 
 	if input, ok := usage["inputTokens"].(map[string]any); ok {
 		total, totalOK = firstNumberOK(input, "total", "totalTokens", "inputTokens")
 		cached, cachedOK = firstNumberOK(input, "cacheRead", "cache_read", "cacheReadTokens", "cachedTokens")
 		cacheWrite, cacheWriteOK = firstNumberOK(input, "cacheWrite", "cache_write", "cacheWriteTokens")
-		noCache, noCacheOK = firstNumberOK(input, "noCache", "no_cache", "uncached")
+		_, noCacheOK = firstNumberOK(input, "noCache", "no_cache", "uncached")
 	} else if value, ok := firstNumberOK(usage, "inputTokens", "input_tokens"); ok {
 		total, totalOK = value, true
 	}
@@ -782,13 +783,11 @@ func extractFXUsageMap(usage map[string]any) UsageMetrics {
 
 	if totalOK {
 		result.PromptTokens = total
-		// The v3 gateway explicitly reports noCache for a request that was
-		// fully uncached. A present cacheRead: 0 alone is not evidence that
-		// cache accounting was supported.
-		if noCacheOK && noCache > 0 && cached == 0 {
-			cachedOK = false
-		}
-		if cachedOK {
+		// When the v3 gateway reports both cacheRead and noCache, cache
+		// accounting is supported — cacheRead: 0 means a genuine cache miss
+		// (0% hit rate), not that caching is unsupported. Only treat caching
+		// as unsupported when neither field is present.
+		if cachedOK || noCacheOK {
 			result.CacheReadTokens = cached
 			result.CacheWriteTokens = cacheWrite
 			result.InputTokens = maxInt64(0, total-cached-cacheWrite)
@@ -808,7 +807,7 @@ func vercelFXSSEToResponses(model string, reader io.Reader) ([]byte, error) {
 	parser := newV3SSEParser(reader)
 	for {
 		ev, err := parser.next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -860,7 +859,7 @@ func (r *vercelFXSSEReader) Read(p []byte) (int, error) {
 			return 0, io.EOF
 		}
 		ev, err := r.parser.next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			r.finalize()
 			if r.pending.Len() > 0 {
 				return r.pending.Read(p)
@@ -1155,13 +1154,4 @@ func mergeToolArgumentSnapshot(current, snapshot string) string {
 	// Do not append an unrelated complete snapshot: that would make the
 	// Responses function arguments invalid JSON. The deltas remain authoritative.
 	return ""
-}
-
-func indexOf(items []string, target string) int {
-	for i, item := range items {
-		if item == target {
-			return i
-		}
-	}
-	return -1
 }

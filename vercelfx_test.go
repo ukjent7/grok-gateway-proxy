@@ -298,7 +298,7 @@ func TestVercelFXDoesNotDuplicateTerminalToolCall(t *testing.T) {
 }
 
 func TestExtractFXUsagePreservesCacheUnsupportedState(t *testing.T) {
-	t.Skip("covered by TestExtractFXUsagePreservesCacheUnsupportedStateRegression")
+	t.Skip("covered by TestExtractFXUsageCacheMissIsCacheSupported and TestExtractFXUsageNoCacheFieldsIsUnsupported")
 	withoutCache := []byte(`data: {"type":"finish","usage":{"inputTokens":{"total":100},"outputTokens":{"total":5}}}\n\ndata: [DONE]\n\n`)
 	usage := extractFXUsage(withoutCache)
 	if !usage.UsagePresent || usage.CacheSupported || usage.InputTokens != 100 || usage.PromptTokens != 100 {

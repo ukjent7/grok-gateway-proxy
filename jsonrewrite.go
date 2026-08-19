@@ -6,10 +6,13 @@ import (
 	"strings"
 )
 
-// jsonrewrite.go holds the byte-level JSON rewrite helpers used by the
-// SenseNova adapter to normalize tool-call payloads without re-serializing the
-// whole document (which would clobber key order, whitespace, and unrelated
-// bytes).
+// jsonrewrite.go holds the JSON rewrite helpers used by the SenseNova adapter
+// to normalize tool-call payloads. The response-side helpers
+// (replaceJSONPropertyStringValueInToolCalls, replaceJSONPropertyStringValue)
+// operate at the byte level to preserve key order, whitespace, and unrelated
+// bytes; the request-side helpers (transformToolCallType,
+// sanitizeSenseNovaToolCallHistory) unmarshal and re-marshal the document
+// because they need structural edits that byte-level rewriting cannot express.
 
 // transformToolCallType rewrites every "type":"from" inside tool_calls arrays
 // to "to", using a JSON-aware walk so unrelated "type" fields are untouched.

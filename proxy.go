@@ -700,7 +700,7 @@ func copyAndCapture(w http.ResponseWriter, reader io.Reader, streaming bool, lim
 			}
 		}
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return capture.Bytes(), nil
 			}
 			return capture.Bytes(), err
