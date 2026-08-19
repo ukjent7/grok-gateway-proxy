@@ -48,7 +48,7 @@ export async function loadSetup() {
         '<div class="setup-card-head">' +
           '<strong>' + escapeHtml(gw.name || id) + ' <span class="gw-card-prefix">' + escapeHtml(gw.prefix || '') + '</span></strong>' +
           '<div class="setup-card-actions">' +
-            '<button class="btn-ghost small setup-action-btn" title="复制配置文件片段">' +
+            '<button class="btn-ghost small setup-action-btn copy-btn" title="复制配置文件片段">' +
               '<svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><rect x="5" y="5" width="8" height="8" rx="1.6" stroke="currentColor" stroke-width="1.4" fill="none"/><path d="M3 11V3.6A1.6 1.6 0 0 1 4.6 2H11" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/></svg>' +
               '复制' +
             '</button>' +

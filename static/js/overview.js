@@ -1,6 +1,6 @@
 'use strict';
 
-import { state } from './state.js';
+import { state, gatewayIds } from './state.js';
 import { api } from './api.js';
 import { $, $all, fmtNum, fmtPct, fmtMs, fmtTimeShort, escapeHtml, rangeToFrom, rangeLabel } from './utils.js';
 import { loadGatewayPulses } from './pulse.js';
@@ -27,7 +27,7 @@ export async function loadOverview() {
 export async function loadMetrics() {
   try {
     const m = await api('/metrics?' + metricsQuery());
-    const sig = JSON.stringify([m.requests, m.successes, m.failures, m.input_tokens, m.output_tokens, m.reasoning_tokens, m.cache_hit_rate, m.cache_coverage_percent, m.cache_read_tokens, m.cache_write_tokens]);
+    const sig = JSON.stringify([m.requests, m.successes, m.failures, m.input_tokens, m.output_tokens, m.reasoning_tokens, m.cache_hit_rate, m.cache_coverage_percent, m.cache_read_tokens, m.cache_write_tokens, m.by_gateway]);
     if (sig === state.metricsSig && state.metrics) return; // 数据未变，跳过重绘
     state.metricsSig = sig;
     state.metrics = m;
@@ -63,11 +63,42 @@ function renderMetrics(m) {
   $('#statCacheCoverage').textContent = (!m || m.cache_coverage_percent === null || m.cache_coverage_percent === undefined) ? '—' : fmtPct(m.cache_coverage_percent);
   $('#statCacheCoverageSub').textContent = m ? fmtNum(m.cache_supported_calls) + ' / ' + fmtNum(m.usage_calls) + ' 次调用' : '—';
   setGauge('#gaugeCoverage', m ? m.cache_coverage_percent : null);
+  renderGatewayCacheRates(m);
 
   $('#statTokens').textContent = m ? fmtNum(m.input_tokens) + ' / ' + fmtNum(m.output_tokens) : '—';
   $('#statTokensSub').textContent = m ? 'prompt ' + fmtNum(m.prompt_tokens) : '—';
   $('#statReasoning').textContent = m ? fmtNum(m.reasoning_tokens) : '—';
   $('#statReasoningSub').textContent = m ? 'cache write ' + fmtNum(m.cache_write_tokens) : '—';
+}
+
+function renderGatewayCacheRates(metrics) {
+  const container = $('#gatewayCacheRates');
+  if (!container) return;
+  const byGateway = metrics && metrics.by_gateway ? metrics.by_gateway : {};
+  container.innerHTML = gatewayIds().map(id => {
+    const gateway = state.gateways[id] || {};
+    const metric = byGateway[id];
+    const valid = metric && metric.cache_hit_rate !== null && metric.cache_hit_rate !== undefined;
+    const rate = valid ? Number(metric.cache_hit_rate) : 0;
+    const width = Math.max(0, Math.min(100, rate));
+    const value = valid ? fmtPct(rate) : '—';
+    const detail = valid
+      ? fmtNum(metric.cache_read_tokens) + ' 读取 tok · ' + fmtNum(metric.cache_supported_calls) + ' 次支持'
+      : metric
+        ? fmtNum(metric.usage_calls) + ' 次调用 · 暂无缓存字段'
+        : '暂无请求数据';
+    return (
+      '<article class="gateway-cache-rate">' +
+        '<div class="gateway-cache-rate-head">' +
+          '<strong>' + escapeHtml(gateway.name || id) + '</strong>' +
+          '<code>' + escapeHtml(gateway.prefix || id) + '</code>' +
+        '</div>' +
+        '<div class="gateway-cache-rate-value">' + value + '</div>' +
+        '<div class="gateway-cache-rate-bar"><span style="width:' + width + '%"></span></div>' +
+        '<div class="gateway-cache-rate-detail">' + escapeHtml(detail) + '</div>' +
+      '</article>'
+    );
+  }).join('');
 }
 
 /* ---------------- Sparklines ---------------- */

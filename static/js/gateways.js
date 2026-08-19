@@ -45,6 +45,10 @@ export function renderGatewayCards() {
         '<input type="text" class="f-baseurl" value="' + escapeAttr(gw.base_url) + '" placeholder="https://…">' +
         '<span class="field-error" hidden></span>' +
       '</div>' +
+      '<div class="toggle-row proxy-toggle-row">' +
+        '<div><span class="switch-label">使用环境代理</span><span class="field-hint">HTTP_PROXY / HTTPS_PROXY，仅作用于此网关</span></div>' +
+        '<label class="toggle"><input type="checkbox" class="f-system-proxy" ' + (gw.use_system_proxy !== false ? 'checked' : '') + '><span class="toggle-track"></span></label>' +
+      '</div>' +
       '<div class="toggle-row ua-toggle-row">' +
         '<div><span class="switch-label">User-Agent 覆盖</span><span class="field-hint">仅作用于此网关</span></div>' +
         '<label class="toggle"><input type="checkbox" class="f-ua-enabled" ' + (gw.user_agent_override_enabled ? 'checked' : '') + '><span class="toggle-track"></span></label>' +
@@ -97,6 +101,7 @@ async function saveGateway(id, card) {
     enabled: card.querySelector('.f-enabled').checked,
     user_agent_override_enabled: card.querySelector('.f-ua-enabled').checked,
     user_agent_override: card.querySelector('.f-ua').value.trim(),
+    use_system_proxy: card.querySelector('.f-system-proxy').checked,
     forward_headers: card.querySelector('.f-headers').value.split('\n').map(s => s.trim()).filter(Boolean)
   };
   // 发送前校验；把出错的字段就地标出。
