@@ -80,6 +80,8 @@ function renderCmdk(query) {
     list.innerHTML = '<div class="cmdk-empty">没有匹配的操作</div>';
     return;
   }
+  // 过滤后列表变短时收敛选中索引，避免高亮丢失 / Enter 落空。
+  if (state.cmdkSelected >= filtered.length) state.cmdkSelected = filtered.length - 1;
   let lastGroup = '';
   let html = '';
   filtered.forEach((it, i) => {
@@ -116,6 +118,7 @@ export function initCmdk({ switchView, refreshAll }) {
   $('#cmdkInput').addEventListener('keydown', (e) => {
     const q = e.target.value.trim().toLowerCase();
     const filtered = q ? state.cmdkItems.filter(it => it.label.toLowerCase().includes(q) || it.group.toLowerCase().includes(q)) : state.cmdkItems;
+    if (!filtered.length) return; // 无匹配项时不做导航（避免 % 0 得 NaN）
     if (e.key === 'ArrowDown') { e.preventDefault(); state.cmdkSelected = (state.cmdkSelected + 1) % filtered.length; renderCmdk(e.target.value); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); state.cmdkSelected = (state.cmdkSelected - 1 + filtered.length) % filtered.length; renderCmdk(e.target.value); }
     else if (e.key === 'Enter') {

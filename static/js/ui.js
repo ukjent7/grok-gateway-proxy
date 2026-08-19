@@ -25,9 +25,7 @@ export function showToast(message, kind) {
 }
 
 /* ---------------- 模态框 ----------------
-   通用 Promise 式模态框：
-   - withInput=true  输入型（promptToken），resolve 输入值或 null（取消）
-   - withInput=false 确认型（confirmModal），resolve 'ok' 或 null
+   通用 Promise 式确认模态框：resolve 'ok'（确定）或 null（取消）。
    打开时焦点移入对话框，Esc / 背景点击 / 取消均 resolve(null)，关闭后还原焦点。 */
 
 let activeModal = null;
@@ -44,7 +42,7 @@ function closeModal() {
   }
 }
 
-function showModal({ title, message = '', placeholder = '', initial = '', confirmLabel = '确定', cancelLabel = '取消', withInput = false, allowEmpty = true }) {
+function showModal({ title, message = '', confirmLabel = '确定', cancelLabel = '取消' }) {
   return new Promise(resolve => {
     closeModal();
     const prevFocus = document.activeElement;
@@ -67,18 +65,6 @@ function showModal({ title, message = '', placeholder = '', initial = '', confir
         '<button type="button" class="btn-primary modal-confirm">' + escapeHtml(confirmLabel) + '</button>' +
       '</div>';
 
-    let input = null;
-    if (withInput) {
-      input = document.createElement('input');
-      input.type = 'text';
-      input.className = 'modal-input';
-      input.placeholder = placeholder;
-      input.value = initial || '';
-      input.autocomplete = 'off';
-      input.spellcheck = false;
-      root.insertBefore(input, root.querySelector('.modal-actions'));
-    }
-
     let finished = false;
     const finish = (value) => {
       if (finished) return;
@@ -97,41 +83,11 @@ function showModal({ title, message = '', placeholder = '', initial = '', confir
     backdrop.addEventListener('click', () => finish(null));
     root.querySelector('.modal-cancel').addEventListener('click', () => finish(null));
     root.querySelector('.modal-close').addEventListener('click', () => finish(null));
-    root.querySelector('.modal-confirm').addEventListener('click', () => {
-      if (!withInput) { finish('ok'); return; }
-      const v = input.value.trim();
-      if (!allowEmpty && !v) return;
-      finish(v);
-    });
+    root.querySelector('.modal-confirm').addEventListener('click', () => finish('ok'));
     document.body.appendChild(backdrop);
     document.body.appendChild(root);
 
-    if (withInput) {
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          const v = input.value.trim();
-          if (!allowEmpty && !v) return;
-          finish(v);
-        }
-      });
-      setTimeout(() => input.focus(), 30);
-    } else {
-      root.querySelector('.modal-confirm').focus();
-    }
-  });
-}
-
-// 令牌输入：resolve Promise<string|null>（null = 用户取消）
-export function promptToken(message, placeholder, initial) {
-  return showModal({
-    title: '访问令牌',
-    message: message || '',
-    placeholder: placeholder || '',
-    initial: initial || '',
-    confirmLabel: '保存',
-    withInput: true,
-    allowEmpty: true
+    root.querySelector('.modal-confirm').focus();
   });
 }
 

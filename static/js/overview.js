@@ -65,8 +65,9 @@ function renderMetrics(m) {
   setGauge('#gaugeCoverage', m ? m.cache_coverage_percent : null);
   renderGatewayCacheRates(m);
 
-  $('#statTokens').textContent = m ? fmtNum(m.input_tokens) + ' / ' + fmtNum(m.output_tokens) : '—';
-  $('#statTokensSub').textContent = m ? 'prompt ' + fmtNum(m.prompt_tokens) : '—';
+  // 本地修复：总输入应为 prompt_tokens（随会话累积增长），input_tokens 仅为未命中缓存的增量
+  $('#statTokens').textContent = m ? fmtNum(m.prompt_tokens) + ' / ' + fmtNum(m.output_tokens) : '—';
+  $('#statTokensSub').textContent = m ? 'uncached ' + fmtNum(m.input_tokens) + ' · cached ' + fmtNum(m.cache_read_tokens) : '—';
   $('#statReasoning').textContent = m ? fmtNum(m.reasoning_tokens) : '—';
   $('#statReasoningSub').textContent = m ? 'cache write ' + fmtNum(m.cache_write_tokens) : '—';
 }
@@ -105,7 +106,10 @@ function renderGatewayCacheRates(metrics) {
 
 export async function loadSparkSeries() {
   try {
-    const data = await api('/logs?limit=30');
+    const params = new URLSearchParams({ limit: 30 });
+    const from = rangeToFrom(state.range);
+    if (from) params.set('from', from.toISOString());
+    const data = await api('/logs?' + params.toString());
     const items = data.items || [];
     const sig = items.map(l => l.id + ':' + (l.success ? 1 : 0)).join(',');
     if (sig === state.sparkSig && state.sparkSeries.length) return; // 无新请求，跳过重绘
@@ -140,10 +144,26 @@ function sparkline(svg, values) {
     '<path class="spark-line" d="' + linePath + '"/>';
 }
 
+// 把窗口内的请求按时间均分 30 桶计数，得到真实请求量分布
+//（替代原先恒为 1..N 递增的占位斜坡）。
+function requestHistogram(items) {
+  const BUCKETS = 30;
+  const times = items.map(l => new Date(l.started_at).getTime()).filter(t => !Number.isNaN(t));
+  if (times.length < 2) return [];
+  const min = Math.min(...times);
+  const max = Math.max(...times);
+  const span = Math.max(max - min, 1);
+  const buckets = new Array(BUCKETS).fill(0);
+  for (const t of times) {
+    buckets[Math.min(BUCKETS - 1, Math.floor(((t - min) / span) * BUCKETS))] += 1;
+  }
+  return buckets;
+}
+
 function renderSparklines() {
   const logs = state.sparkSeries;
   const map = {
-    requests: logs.map((_, i) => i + 1),
+    requests: requestHistogram(logs),
     success: logs.map(l => l.success ? 1 : 0),
     cacheHit: logs.map(l => {
       if (!l.usage || !l.usage.cache_supported || !l.usage.prompt_tokens) return 0;
@@ -152,7 +172,7 @@ function renderSparklines() {
     cacheCoverage: logs.map(l => (l.usage && l.usage.cache_supported) ? 1 : 0),
     tokens: logs.map(l => {
       if (!l.usage) return 0;
-      return (l.usage.input_tokens || l.usage.prompt_tokens || 0) + (l.usage.output_tokens || 0);
+      return (l.usage.prompt_tokens || l.usage.input_tokens || 0) + (l.usage.output_tokens || 0);
     }),
     reasoning: logs.map(l => (l.usage && l.usage.reasoning_tokens) || 0)
   };
@@ -169,7 +189,10 @@ export async function loadRecentLogs() {
   const container = $('#recentLogList');
   if (!container) return;
   try {
-    const data = await api('/logs?limit=12');
+    const params = new URLSearchParams({ limit: 12 });
+    const from = rangeToFrom(state.range);
+    if (from) params.set('from', from.toISOString());
+    const data = await api('/logs?' + params.toString());
     const items = data.items || [];
     const sig = items.map(l => l.id + ':' + (l.success ? 1 : 0)).join(',');
     if (sig === state.recentSig && container.children.length) return; // 无新请求，跳过重绘

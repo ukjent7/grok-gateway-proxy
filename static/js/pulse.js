@@ -2,7 +2,7 @@
 
 import { state, gatewayIds } from './state.js';
 import { api } from './api.js';
-import { $, fmtNum, fmtMs, escapeHtml } from './utils.js';
+import { $, fmtNum, fmtMs, escapeHtml, rangeToFrom } from './utils.js';
 import { healthDotHTML, applyHealthUI } from './health.js';
 
 /* 网关脉冲（总览面板 + 侧栏实时通道）：
@@ -16,12 +16,16 @@ export async function loadGatewayPulses() {
   const sigs = {};
   const allLogs = {};
   let changed = false;
+  // 与总览时间范围保持一致：范围外没有请求的网关显示空状态而非旧数据
+  const from = rangeToFrom(state.range);
   for (const id of gatewayIds()) {
     const gw = state.gateways[id];
     if (!gw) continue;
     let logs = [];
     try {
-      const data = await api('/logs?' + new URLSearchParams({ gateway: id, limit: '40' }).toString());
+      const params = new URLSearchParams({ gateway: id, limit: '40' });
+      if (from) params.set('from', from.toISOString());
+      const data = await api('/logs?' + params.toString());
       logs = (data.items || []).slice().reverse();
     } catch (e) { /* ignore per-gateway error */ }
     allLogs[id] = logs;
@@ -41,7 +45,9 @@ export async function loadGatewayPulses() {
     const logs = allLogs[id] || [];
     const successCount = logs.filter(l => l.success).length;
     const total = logs.length;
-    const totalTokens = logs.reduce((acc, l) => acc + ((l.usage && (l.usage.input_tokens || l.usage.prompt_tokens || 0)) + ((l.usage && l.usage.output_tokens) || 0)), 0);
+    // 与总览"总输入 Token"同口径：prompt_tokens 是含缓存的总输入，
+    // input_tokens 只是未命中缓存的增量，仅作兜底。
+    const totalTokens = logs.reduce((acc, l) => acc + ((l.usage && (l.usage.prompt_tokens || l.usage.input_tokens || 0)) + ((l.usage && l.usage.output_tokens) || 0)), 0);
 
     const row = document.createElement('div');
     row.className = 'gw-pulse-row';

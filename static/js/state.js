@@ -14,12 +14,10 @@ export const state = {
   recentLogs: [],
   sparkSeries: [],
   logsOffset: 0,
-  logsLimit: 50,
   range: '1h',
   activeView: 'overview',
   drawerLog: null,
   drawerTab: 'request-compare',
-  showRawHeaders: false,
   pollTimer: null,
   cmdkSelected: 0,
   cmdkItems: [],
@@ -48,6 +46,8 @@ export async function loadConfig() {
   if (verEl) verEl.textContent = 'v' + (state.version || '?') + ' · 本地模式 · Grok Build 就绪';
   const sel = $('#filterGateway');
   if (sel) {
+    // 重建选项前记住当前选择，避免刷新时把用户已选的网关筛选清掉。
+    const prev = sel.value;
     sel.innerHTML = '<option value="">全部网关</option>';
     gatewayIds().forEach(id => {
       const gw = state.gateways[id];
@@ -57,5 +57,6 @@ export async function loadConfig() {
       opt.textContent = gw.name + ' (' + gw.prefix + ')';
       sel.appendChild(opt);
     });
+    if (prev && [...sel.options].some(o => o.value === prev)) sel.value = prev;
   }
 }

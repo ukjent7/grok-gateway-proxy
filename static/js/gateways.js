@@ -120,11 +120,12 @@ export function renderGatewayCards() {
       '</div>';
     container.appendChild(card);
 
-    // 输入时实时内联校验
+    // 输入时实时内联校验。error 提示框与输入框同属一个 .field，直接反查，
+    // 避免依赖 nth-child 序号（卡片结构一变就错位）。
     const urlInput = card.querySelector('.f-baseurl');
     const nameInput = card.querySelector('.f-name');
-    const urlErr = card.querySelector('.field:nth-child(3) .field-error');
-    const nameErr = card.querySelector('.field:nth-child(2) .field-error');
+    const urlErr = urlInput.closest('.field').querySelector('.field-error');
+    const nameErr = nameInput.closest('.field').querySelector('.field-error');
     urlInput.addEventListener('input', () => {
       const v = urlInput.value.trim();
       const bad = v !== '' && !v.startsWith('https://');
@@ -159,8 +160,8 @@ async function saveGateway(id, card) {
   let ok = true;
   const urlInput = card.querySelector('.f-baseurl');
   const nameInput = card.querySelector('.f-name');
-  const urlErr = card.querySelector('.field:nth-child(3) .field-error');
-  const nameErr = card.querySelector('.field:nth-child(2) .field-error');
+  const urlErr = urlInput.closest('.field').querySelector('.field-error');
+  const nameErr = nameInput.closest('.field').querySelector('.field-error');
   if (!payload.base_url.startsWith('https://')) {
     ok = false;
     urlErr.textContent = 'base_url 必须以 https:// 开头';
