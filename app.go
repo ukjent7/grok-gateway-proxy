@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -42,15 +43,15 @@ func NewApp(config *Config, store *Store, logger *slog.Logger) *App {
 			config:       config,
 			store:        store,
 			logger:       logger,
-			client:       newUpstreamClient(true),
-			directClient: newUpstreamClient(false),
+			client:       newUpstreamClient(config.ProxyURL),
+			directClient: newUpstreamClient(""),
 		},
 		upstreams: make(map[string]upstreamHealth),
 	}
 	return app
 }
 
-func newUpstreamClient(useSystemProxy bool) *http.Client {
+func newUpstreamClient(proxyURL string) *http.Client {
 	transport := &http.Transport{
 		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		TLSHandshakeTimeout:   15 * time.Second,
@@ -62,8 +63,10 @@ func newUpstreamClient(useSystemProxy bool) *http.Client {
 		IdleConnTimeout:       90 * time.Second,
 		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
 	}
-	if useSystemProxy {
-		transport.Proxy = http.ProxyFromEnvironment
+	if strings.TrimSpace(proxyURL) != "" {
+		if parsed, err := url.Parse(proxyURL); err == nil {
+			transport.Proxy = http.ProxyURL(parsed)
+		}
 	}
 	return &http.Client{Transport: transport}
 }
@@ -190,10 +193,13 @@ func (a *App) handleAPI(w http.ResponseWriter, r *http.Request) {
 	case path == "/config" && r.Method == http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]any{
 			"listen_addr":  a.config.ListenAddr,
+			"proxy_url":    a.config.ProxyURL,
 			"auth_enabled": a.config.APIToken != "",
 			"version":      version,
 			"gateways":     a.config.Snapshot(),
 		})
+	case path == "/proxy" && r.Method == http.MethodPatch:
+		a.patchProxy(w, r)
 	case path == "/gateways" && r.Method == http.MethodPut:
 		a.updateGateways(w, r)
 	case strings.HasPrefix(path, "/gateways/") && r.Method == http.MethodPatch:
@@ -240,6 +246,24 @@ func (a *App) updateGateways(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"gateways": a.config.Snapshot()})
+}
+
+func (a *App) patchProxy(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ProxyURL string `json:"proxy_url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := a.config.SetProxyURL(body.ProxyURL); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if a.proxy != nil {
+		a.proxy.SetProxyURL(a.config.ProxyURL)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"proxy_url": a.config.ProxyURL})
 }
 
 // patchGateway applies a partial update to a single gateway. Only the

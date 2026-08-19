@@ -193,17 +193,17 @@ func TestGatewayConfigAPIUpdatesUserAgentOverride(t *testing.T) {
 	}
 }
 
-func TestGatewayConfigAPIUpdatesEnvironmentProxySetting(t *testing.T) {
+func TestGatewayConfigAPIUpdatesGlobalProxySetting(t *testing.T) {
 	cfg := DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
 	app := &App{config: cfg, logger: slog.Default()}
-	req := httptest.NewRequest(http.MethodPatch, "http://127.0.0.1:8787/api/gateways/st", strings.NewReader(`{"use_system_proxy":false}`))
+	req := httptest.NewRequest(http.MethodPatch, "http://127.0.0.1:8787/api/gateways/st", strings.NewReader(`{"use_proxy":false}`))
 	recorder := httptest.NewRecorder()
 	app.ServeHTTP(recorder, req)
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
 	}
-	if cfg.Gateways["st"].UseSystemProxy {
+	if cfg.Gateways["st"].UseProxy {
 		t.Fatal("environment proxy setting should be patched to false")
 	}
 	var response map[string]any
@@ -211,28 +211,63 @@ func TestGatewayConfigAPIUpdatesEnvironmentProxySetting(t *testing.T) {
 		t.Fatal(err)
 	}
 	gateway, ok := response["gateway"].(map[string]any)
-	if !ok || gateway["use_system_proxy"] != false {
+	if !ok || gateway["use_proxy"] != false {
 		t.Fatalf("unexpected gateway response: %+v", response)
 	}
 }
 
-func TestGatewayConfigWithoutProxySettingDefaultsToEnvironmentProxy(t *testing.T) {
+func TestGatewayConfigWithoutProxySettingDefaultsToGlobalProxy(t *testing.T) {
 	var gateway GatewayConfig
 	if err := json.Unmarshal([]byte(`{"id":"st","prefix":"/st","name":"SenseNova","base_url":"https://example.test","protocol":"chat_completions","enabled":true}`), &gateway); err != nil {
 		t.Fatal(err)
 	}
-	if !gateway.UseSystemProxy {
-		t.Fatal("missing use_system_proxy should preserve the environment-proxy default")
+	if !gateway.UseProxy {
+		t.Fatal("missing use_proxy should preserve the global-proxy default")
 	}
 }
 
 func TestUpstreamClientProxyModes(t *testing.T) {
-	proxyTransport, ok := newUpstreamClient(true).Transport.(*http.Transport)
+	proxyTransport, ok := newUpstreamClient("http://127.0.0.1:7890").Transport.(*http.Transport)
 	if !ok || proxyTransport.Proxy == nil {
-		t.Fatal("environment-proxy client must configure a proxy function")
+		t.Fatal("configured-proxy client must configure a proxy function")
 	}
-	directTransport, ok := newUpstreamClient(false).Transport.(*http.Transport)
+	proxyURL, err := proxyTransport.Proxy(httptest.NewRequest(http.MethodGet, "https://example.test/", nil))
+	if err != nil || proxyURL == nil || proxyURL.String() != "http://127.0.0.1:7890" {
+		t.Fatalf("unexpected configured proxy URL: %v, err=%v", proxyURL, err)
+	}
+	directTransport, ok := newUpstreamClient("").Transport.(*http.Transport)
 	if !ok || directTransport.Proxy != nil {
 		t.Fatal("direct client must not configure a proxy function")
+	}
+}
+
+func TestProxyConfigAPIUpdatesGlobalProxyURL(t *testing.T) {
+	cfg := DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
+	app := &App{config: cfg, logger: slog.Default(), proxy: &Proxy{client: newUpstreamClient("")}}
+	req := httptest.NewRequest(http.MethodPatch, "http://127.0.0.1:8787/api/proxy", strings.NewReader(`{"proxy_url":"https://proxy.example.test:8443"}`))
+	recorder := httptest.NewRecorder()
+	app.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if cfg.ProxyURL != "https://proxy.example.test:8443" {
+		t.Fatalf("proxy URL was not updated: %q", cfg.ProxyURL)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["proxy_url"] != cfg.ProxyURL {
+		t.Fatalf("unexpected proxy response: %+v", response)
+	}
+
+	req = httptest.NewRequest(http.MethodPatch, "http://127.0.0.1:8787/api/proxy", strings.NewReader(`{"proxy_url":"socks5://127.0.0.1:1080"}`))
+	recorder = httptest.NewRecorder()
+	app.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for SOCKS URL, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if cfg.ProxyURL != "https://proxy.example.test:8443" {
+		t.Fatalf("invalid proxy URL changed config: %q", cfg.ProxyURL)
 	}
 }

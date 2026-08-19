@@ -57,11 +57,11 @@ type GatewayConfig struct {
 	ForwardHeaders           []string `json:"forward_headers,omitempty"`
 	UserAgentOverrideEnabled bool     `json:"user_agent_override_enabled"`
 	UserAgentOverride        string   `json:"user_agent_override,omitempty"`
-	UseSystemProxy           bool     `json:"use_system_proxy"`
+	UseProxy                 bool     `json:"use_proxy"`
 }
 
-// UnmarshalJSON keeps the current environment-proxy behavior for configuration
-// files created before per-gateway proxy selection was added.
+// UnmarshalJSON migrates the previous per-gateway proxy switch while keeping
+// newly created gateways enabled by default.
 func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 	type gatewayConfig GatewayConfig
 	var decoded gatewayConfig
@@ -72,8 +72,14 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return err
 	}
-	if _, present := fields["use_system_proxy"]; !present {
-		decoded.UseSystemProxy = true
+	if _, present := fields["use_proxy"]; !present {
+		if legacy, ok := fields["use_system_proxy"]; ok {
+			if err := json.Unmarshal(legacy, &decoded.UseProxy); err != nil {
+				return err
+			}
+		} else {
+			decoded.UseProxy = true
+		}
 	}
 	*g = GatewayConfig(decoded)
 	return nil
@@ -81,6 +87,7 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 
 type Config struct {
 	ListenAddr      string                   `json:"listen_addr"`
+	ProxyURL        string                   `json:"proxy_url,omitempty"`
 	APIToken        string                   `json:"api_token,omitempty"`
 	UpstreamTimeout time.Duration            `json:"-"`
 	Retry           RetryConfig              `json:"retry"`
@@ -105,7 +112,7 @@ func buildDefaultGateways() map[string]GatewayConfig {
 			Protocol:          ProtocolResponses,
 			Enabled:           true,
 			UserAgentOverride: "grok-gateway-proxy/dev",
-			UseSystemProxy:    true,
+			UseProxy:          true,
 		},
 		"st": {
 			ID:                "st",
@@ -115,7 +122,7 @@ func buildDefaultGateways() map[string]GatewayConfig {
 			Protocol:          ProtocolChat,
 			Enabled:           true,
 			UserAgentOverride: "grok-gateway-proxy/dev",
-			UseSystemProxy:    true,
+			UseProxy:          true,
 		},
 		"ve": {
 			ID:                "ve",
@@ -125,7 +132,7 @@ func buildDefaultGateways() map[string]GatewayConfig {
 			Protocol:          ProtocolResponses,
 			Enabled:           true,
 			UserAgentOverride: "grok-gateway-proxy/dev",
-			UseSystemProxy:    true,
+			UseProxy:          true,
 		},
 	}
 }
@@ -154,6 +161,7 @@ func LoadConfig(path string, logRetentionDays int) (*Config, error) {
 	}
 	var disk struct {
 		ListenAddr       string                   `json:"listen_addr"`
+		ProxyURL         string                   `json:"proxy_url"`
 		APIToken         string                   `json:"api_token"`
 		UpstreamTimeoutS int                      `json:"upstream_timeout_seconds"`
 		Retry            *RetryConfig             `json:"retry"`
@@ -169,6 +177,7 @@ func LoadConfig(path string, logRetentionDays int) (*Config, error) {
 	if disk.ListenAddr != "" {
 		cfg.ListenAddr = disk.ListenAddr
 	}
+	cfg.ProxyURL = strings.TrimSpace(disk.ProxyURL)
 	cfg.APIToken = disk.APIToken
 	if disk.UpstreamTimeoutS > 0 {
 		cfg.UpstreamTimeout = time.Duration(disk.UpstreamTimeoutS) * time.Second
@@ -228,6 +237,7 @@ func (c *Config) saveLocked() error {
 	}
 	b, err := json.MarshalIndent(struct {
 		ListenAddr             string                   `json:"listen_addr"`
+		ProxyURL               string                   `json:"proxy_url,omitempty"`
 		APIToken               string                   `json:"api_token,omitempty"`
 		UpstreamTimeoutSeconds int                      `json:"upstream_timeout_seconds,omitempty"`
 		Retry                  *RetryConfig             `json:"retry,omitempty"`
@@ -235,6 +245,7 @@ func (c *Config) saveLocked() error {
 		Gateways               map[string]GatewayConfig `json:"gateways"`
 	}{
 		ListenAddr:             c.ListenAddr,
+		ProxyURL:               c.ProxyURL,
 		APIToken:               c.APIToken,
 		UpstreamTimeoutSeconds: int(c.UpstreamTimeout / time.Second),
 		Retry:                  &c.Retry,
@@ -284,7 +295,21 @@ func validateConfig(listenAddr string, gateways map[string]GatewayConfig) error 
 }
 
 func (c *Config) validateLocked() error {
+	if err := validateProxyURL(c.ProxyURL); err != nil {
+		return err
+	}
 	return validateConfig(c.ListenAddr, c.Gateways)
+}
+
+func validateProxyURL(raw string) error {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return errors.New("proxy_url must be an HTTP or HTTPS URL")
+	}
+	return nil
 }
 
 func (c *Config) Validate() error {
@@ -332,7 +357,8 @@ type GatewayPatch struct {
 	ForwardHeaders           *[]string `json:"forward_headers"`
 	UserAgentOverrideEnabled *bool     `json:"user_agent_override_enabled"`
 	UserAgentOverride        *string   `json:"user_agent_override"`
-	UseSystemProxy           *bool     `json:"use_system_proxy"`
+	UseProxy                 *bool     `json:"use_proxy"`
+	LegacyUseSystemProxy     *bool     `json:"use_system_proxy"`
 }
 
 // PatchGateway applies a partial update to a single gateway and persists the
@@ -364,8 +390,10 @@ func (c *Config) PatchGateway(id string, patch GatewayPatch) (GatewayConfig, err
 	if patch.UserAgentOverride != nil {
 		gateway.UserAgentOverride = *patch.UserAgentOverride
 	}
-	if patch.UseSystemProxy != nil {
-		gateway.UseSystemProxy = *patch.UseSystemProxy
+	if patch.UseProxy != nil {
+		gateway.UseProxy = *patch.UseProxy
+	} else if patch.LegacyUseSystemProxy != nil {
+		gateway.UseProxy = *patch.LegacyUseSystemProxy
 	}
 
 	updated := make(map[string]GatewayConfig, len(c.Gateways))
@@ -421,6 +449,23 @@ func (c *Config) commitLocked(updated map[string]GatewayConfig) error {
 	c.Gateways = updated
 	if err := c.saveLocked(); err != nil {
 		c.Gateways = old
+		return err
+	}
+	return nil
+}
+
+// SetProxyURL atomically updates the global HTTP/HTTPS proxy address.
+func (c *Config) SetProxyURL(proxyURL string) error {
+	proxyURL = strings.TrimSpace(proxyURL)
+	if err := validateProxyURL(proxyURL); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	old := c.ProxyURL
+	c.ProxyURL = proxyURL
+	if err := c.saveLocked(); err != nil {
+		c.ProxyURL = old
 		return err
 	}
 	return nil

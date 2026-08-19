@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -36,8 +37,9 @@ type Proxy struct {
 	config           *Config
 	store            *Store
 	logger           *slog.Logger
-	client           *http.Client // environment-proxy client; also test fallback
+	client           *http.Client // global configured-proxy client; also test fallback
 	directClient     *http.Client
+	clientMu         sync.RWMutex
 	responseBodySize int64 // 0 = use maxResponseBodySize
 }
 
@@ -210,16 +212,35 @@ func (p *Proxy) buildUpstreamRequest(ctx context.Context, r *http.Request, gatew
 	return upstreamRequest, nil
 }
 
-// clientFor selects the transport according to the gateway setting. Keeping
-// separate clients also keeps proxy and direct connection pools isolated.
-func (p *Proxy) clientFor(gateway GatewayConfig) *http.Client {
-	if gateway.UseSystemProxy || p.directClient == nil {
-		if p.client != nil {
-			return p.client
-		}
-		return http.DefaultClient
+// SetProxyURL replaces the global proxy client so an address saved in the UI
+// applies to subsequent requests without restarting the process.
+func (p *Proxy) SetProxyURL(proxyURL string) {
+	next := newUpstreamClient(proxyURL)
+	p.clientMu.Lock()
+	old := p.client
+	p.client = next
+	p.clientMu.Unlock()
+	if old != nil {
+		old.CloseIdleConnections()
 	}
-	return p.directClient
+}
+
+// clientFor selects the global configured-proxy or direct transport according
+// to the gateway setting. Separate clients keep their connection pools isolated.
+func (p *Proxy) clientFor(gateway GatewayConfig) *http.Client {
+	p.clientMu.RLock()
+	proxyClient, directClient := p.client, p.directClient
+	p.clientMu.RUnlock()
+	if gateway.UseProxy && proxyClient != nil {
+		return proxyClient
+	}
+	if !gateway.UseProxy && directClient != nil {
+		return directClient
+	}
+	if proxyClient != nil {
+		return proxyClient
+	}
+	return http.DefaultClient
 }
 
 // forwardUpstreamResponse performs the upstream HTTP call and writes the
