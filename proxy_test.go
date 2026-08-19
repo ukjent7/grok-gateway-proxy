@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -612,5 +613,98 @@ func TestProxyBlocksGrokModelsWithoutCallingUpstream(t *testing.T) {
 	}
 	if logs[0].StatusCode != http.StatusOK || !logs[0].Success || !strings.Contains(logs[0].Error, "blocked") {
 		t.Fatalf("blocked request was not logged clearly: %+v", logs[0])
+	}
+}
+
+func TestFxSessionIDFromPromptCacheKey(t *testing.T) {
+	body := []byte(`{"model":"zai/glm-5.2","prompt_cache_key":"01a01ba6-5d84-7403-bbc6-c52a282efc6f","input":"hi"}`)
+	req := httptest.NewRequest(http.MethodPost, "/ve/responses", bytes.NewReader(body))
+	if sid := fxSessionID(req, body); sid != "01a01ba6-5d84-7403-bbc6-c52a282efc6f" {
+		t.Fatalf("expected prompt_cache_key as session id, got %q", sid)
+	}
+}
+
+func TestFxSessionIDFromSessionHeader(t *testing.T) {
+	body := []byte(`{"model":"zai/glm-5.2","input":"hi"}`)
+	req := httptest.NewRequest(http.MethodPost, "/ve/responses", bytes.NewReader(body))
+	req.Header.Set("X-Session-Id", "session-123")
+	if sid := fxSessionID(req, body); sid != "session-123" {
+		t.Fatalf("expected session header, got %q", sid)
+	}
+}
+
+func TestFxSessionIDIgnoresGrokHeaders(t *testing.T) {
+	body := []byte(`{"model":"zai/glm-5.2","input":"hi"}`)
+	req := httptest.NewRequest(http.MethodPost, "/ve/responses", bytes.NewReader(body))
+	req.Header.Set("X-Grok-Session-Id", "grok-session-123")
+	req.Header.Set("X-Grok-Conv-Id", "conv-456")
+	sid := fxSessionID(req, body)
+	if sid == "grok-session-123" || sid == "conv-456" {
+		t.Fatalf("fx session id must not leak grok headers, got %q", sid)
+	}
+	if !strings.HasPrefix(sid, "pi-") {
+		t.Fatalf("expected random pi- fallback when no cache key or session header, got %q", sid)
+	}
+}
+
+func TestFxSessionIDFallbackRandom(t *testing.T) {
+	body := []byte(`{"model":"zai/glm-5.2","input":"hi"}`)
+	req := httptest.NewRequest(http.MethodPost, "/ve/responses", bytes.NewReader(body))
+	sid := fxSessionID(req, body)
+	if !strings.HasPrefix(sid, "pi-") {
+		t.Fatalf("expected random pi- fallback, got %q", sid)
+	}
+}
+
+func TestFxSessionIDStableAcrossRequests(t *testing.T) {
+	body := []byte(`{"model":"zai/glm-5.2","prompt_cache_key":"stable-key","input":"hi"}`)
+	req1 := httptest.NewRequest(http.MethodPost, "/ve/responses", bytes.NewReader(body))
+	req2 := httptest.NewRequest(http.MethodPost, "/ve/responses", bytes.NewReader(body))
+	if fxSessionID(req1, body) != fxSessionID(req2, body) {
+		t.Fatal("session id must be stable across requests with same prompt_cache_key")
+	}
+}
+
+func TestFXModeStableSessionIDEndToEnd(t *testing.T) {
+	var gotSessionIDs []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSessionIDs = append(gotSessionIDs, r.Header.Get("X-Session-Id"))
+		w.Header().Set("Content-Type", "text/event-stream")
+		// Minimal v3 SSE: a finish event with empty output.
+		finish := `data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"},"usage":{"inputTokens":{"total":10,"noCache":10,"cacheRead":0},"outputTokens":{"total":5,"text":5,"reasoning":0}}}` + "\n\n"
+		_, _ = io.WriteString(w, finish)
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	store, err := OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := DefaultConfig(t.TempDir() + "/config.json")
+	gateway := cfg.Gateways["ve"]
+	gateway.BaseURL = upstream.URL
+	gateway.FXDisguiseEnabled = true
+	cfg.Gateways["ve"] = gateway
+	p := &Proxy{config: cfg, store: store, logger: slog.Default(), client: upstream.Client()}
+
+	requestBody := []byte(`{"model":"zai/glm-5.2","prompt_cache_key":"conv-abc","stream":true,"input":"hi"}`)
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/ve/responses", bytes.NewReader(requestBody))
+		recorder := httptest.NewRecorder()
+		p.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("request %d failed: %d %s", i, recorder.Code, recorder.Body.String())
+		}
+	}
+
+	if len(gotSessionIDs) != 3 {
+		t.Fatalf("expected 3 upstream calls, got %d", len(gotSessionIDs))
+	}
+	for i, sid := range gotSessionIDs {
+		if sid != "conv-abc" {
+			t.Fatalf("upstream request %d got session id %q, want %q", i, sid, "conv-abc")
+		}
 	}
 }
