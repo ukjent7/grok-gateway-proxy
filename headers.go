@@ -17,6 +17,8 @@ var hopByHopHeaders = map[string]bool{
 	"upgrade":             true,
 	"host":                true,
 	"content-length":      true,
+	"content-encoding":    true,
+	"content-range":       true,
 }
 
 var defaultForwardHeaders = []string{
@@ -66,12 +68,42 @@ func sensitiveHeader(name string) bool {
 		strings.Contains(lower, "cookie")
 }
 
-func headersJSON(headers http.Header) string {
-	return marshalJSON(sanitizeHeaders(headers))
+// redactStoredHeaders rewrites a stored header JSON blob (audit columns,
+// including the legacy *_actual ones that predate write-time sanitization) so
+// sensitive header values become "[REDACTED]". Blobs that are not valid JSON
+// header maps — or that contain no sensitive values — are returned unchanged.
+func redactStoredHeaders(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return raw
+	}
+	var headers map[string][]string
+	if err := json.Unmarshal([]byte(raw), &headers); err != nil {
+		return raw
+	}
+	changed := false
+	for name, values := range headers {
+		if !sensitiveHeader(name) {
+			continue
+		}
+		for i, value := range values {
+			if value != "[REDACTED]" {
+				values[i] = "[REDACTED]"
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return raw
+	}
+	redacted, err := json.Marshal(headers)
+	if err != nil {
+		return raw
+	}
+	return string(redacted)
 }
 
-func headersJSONActual(headers http.Header) string {
-	return marshalJSON(headers)
+func headersJSON(headers http.Header) string {
+	return marshalJSON(sanitizeHeaders(headers))
 }
 
 func marshalJSON(value any) string {

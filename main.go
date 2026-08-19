@@ -40,7 +40,6 @@ func main() {
 			fmt.Fprintf(os.Stderr, "GROK_PROXY_LOG_RETENTION_DAYS invalid, ignoring: %v\n", err)
 		}
 	}
-	cfgAPIToken := os.Getenv("GROK_PROXY_API_TOKEN")
 
 	level := parseLogLevel(*logLevel)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
@@ -57,9 +56,6 @@ func main() {
 	}
 	if *listen != "" {
 		cfg.ListenAddr = *listen
-	}
-	if cfgAPIToken != "" {
-		cfg.APIToken = cfgAPIToken
 	}
 	if err := os.MkdirAll(dataPath, 0o700); err != nil {
 		logger.Error("create data directory", "error", err)

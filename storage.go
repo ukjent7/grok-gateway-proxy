@@ -56,16 +56,12 @@ CREATE TABLE IF NOT EXISTS request_logs (
     stream INTEGER NOT NULL DEFAULT 0,
     duration_ms INTEGER NOT NULL DEFAULT 0,
     request_headers TEXT NOT NULL,
-    request_headers_actual TEXT NOT NULL DEFAULT '',
     request_body BLOB NOT NULL,
     upstream_headers TEXT NOT NULL,
-    upstream_headers_actual TEXT NOT NULL DEFAULT '',
     upstream_body BLOB NOT NULL,
     upstream_response_headers TEXT NOT NULL DEFAULT '',
-    upstream_response_headers_actual TEXT NOT NULL DEFAULT '',
     upstream_response_body BLOB NOT NULL DEFAULT X'',
     response_headers TEXT NOT NULL,
-    response_headers_actual TEXT NOT NULL DEFAULT '',
     response_body BLOB NOT NULL,
     response_truncated INTEGER NOT NULL DEFAULT 0,
     error TEXT NOT NULL DEFAULT '',
@@ -93,12 +89,8 @@ CREATE INDEX IF NOT EXISTS idx_request_logs_model ON request_logs(model);
 		{name: "request_url", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "client_response_status_code", definition: "INTEGER NOT NULL DEFAULT 0"},
 		{name: "upstream_response_status_code", definition: "INTEGER NOT NULL DEFAULT 0"},
-		{name: "request_headers_actual", definition: "TEXT NOT NULL DEFAULT ''"},
-		{name: "upstream_headers_actual", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "upstream_response_headers", definition: "TEXT NOT NULL DEFAULT ''"},
-		{name: "upstream_response_headers_actual", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "upstream_response_body", definition: "BLOB NOT NULL DEFAULT X''"},
-		{name: "response_headers_actual", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "response_truncated", definition: "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := s.addColumnIfMissing(column.name, column.definition); err != nil {
@@ -113,13 +105,31 @@ SET client_response_status_code = CASE WHEN client_response_status_code = 0 THEN
     upstream_response_body = CASE WHEN length(upstream_response_body) = 0 THEN response_body ELSE upstream_response_body END
 WHERE client_response_status_code = 0 OR upstream_response_status_code = 0
 `)
-	return err
+	if err != nil {
+		return err
+	}
+	// Scrub credentials that may have been stored before write-time header
+	// sanitization existed (the legacy *_actual columns) and keep the current
+	// columns clean as defense in depth.
+	return s.scrubStoredHeaderCredentials()
 }
 
 func (s *Store) addColumnIfMissing(name, definition string) error {
-	rows, err := s.db.Query(`PRAGMA table_info(request_logs)`)
+	exists, err := s.columnExists(name)
 	if err != nil {
 		return err
+	}
+	if exists {
+		return nil
+	}
+	_, err = s.db.Exec(`ALTER TABLE request_logs ADD COLUMN ` + name + ` ` + definition)
+	return err
+}
+
+func (s *Store) columnExists(name string) (bool, error) {
+	rows, err := s.db.Query(`PRAGMA table_info(request_logs)`)
+	if err != nil {
+		return false, err
 	}
 	defer rows.Close()
 	for rows.Next() {
@@ -128,17 +138,69 @@ func (s *Store) addColumnIfMissing(name, definition string) error {
 		var notNull, pk int
 		var defaultValue any
 		if err := rows.Scan(&cid, &existingName, &columnType, &notNull, &defaultValue, &pk); err != nil {
-			return err
+			return false, err
 		}
 		if existingName == name {
-			return nil
+			return true, nil
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return err
+	return false, rows.Err()
+}
+
+// storedHeaderColumns lists every stored header field that may contain
+// credentials. Current columns are sanitized on write; the legacy *_actual
+// columns predate that, so both are scrubbed during migration.
+var storedHeaderColumns = []string{
+	"request_headers", "upstream_headers", "upstream_response_headers", "response_headers",
+	"request_headers_actual", "upstream_headers_actual", "upstream_response_headers_actual", "response_headers_actual",
+}
+
+// scrubStoredHeaderCredentials replaces sensitive header values (Authorization,
+// API keys, tokens, ...) in every stored header field with "[REDACTED]". Rows
+// whose values are unchanged are left untouched; the legacy *_actual columns
+// may not exist on fresh databases and are skipped.
+func (s *Store) scrubStoredHeaderCredentials() error {
+	for _, column := range storedHeaderColumns {
+		exists, err := s.columnExists(column)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			continue
+		}
+		rows, err := s.db.Query(`SELECT id, ` + column + ` FROM request_logs WHERE ` + column + ` != ''`)
+		if err != nil {
+			return err
+		}
+		type pendingUpdate struct {
+			id    string
+			value string
+		}
+		var updates []pendingUpdate
+		for rows.Next() {
+			var id, raw string
+			if err := rows.Scan(&id, &raw); err != nil {
+				rows.Close()
+				return err
+			}
+			if redacted := redactStoredHeaders(raw); redacted != raw {
+				updates = append(updates, pendingUpdate{id: id, value: redacted})
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for _, update := range updates {
+			if _, err := s.db.Exec(`UPDATE request_logs SET `+column+` = ? WHERE id = ?`, update.value, update.id); err != nil {
+				return err
+			}
+		}
 	}
-	_, err = s.db.Exec(`ALTER TABLE request_logs ADD COLUMN ` + name + ` ` + definition)
-	return err
+	return nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -147,10 +209,10 @@ var requestLogInsertColumns = []string{
 	"id", "started_at", "gateway_id", "gateway_name", "prefix", "ingress_protocol",
 	"upstream_protocol", "model", "request_path", "request_url", "upstream_url", "method",
 	"status_code", "client_response_status_code", "upstream_response_status_code",
-	"success", "stream", "duration_ms", "request_headers", "request_headers_actual",
-	"request_body", "upstream_headers", "upstream_headers_actual", "upstream_body",
-	"upstream_response_headers", "upstream_response_headers_actual", "upstream_response_body",
-	"response_headers", "response_headers_actual", "response_body", "response_truncated", "error",
+	"success", "stream", "duration_ms", "request_headers",
+	"request_body", "upstream_headers", "upstream_body",
+	"upstream_response_headers", "upstream_response_body",
+	"response_headers", "response_body", "response_truncated", "error",
 	"input_tokens", "cache_read_tokens", "cache_write_tokens", "prompt_tokens",
 	"output_tokens", "reasoning_tokens", "cache_supported", "usage_present", "cache_source",
 }
@@ -170,10 +232,10 @@ func (s *Store) Insert(ctx context.Context, log RequestLog) error {
 		log.GatewayName, log.Prefix, log.IngressProtocol, log.UpstreamProtocol,
 		log.Model, log.RequestPath, log.RequestURL, log.UpstreamURL, log.Method, log.StatusCode,
 		log.ClientResponseStatusCode, log.UpstreamResponseStatusCode, boolInt(log.Success),
-		boolInt(log.Stream), log.DurationMS, log.RequestHeaders, log.RequestHeadersActual,
-		emptyBlob(log.RequestBody), log.UpstreamHeaders, log.UpstreamHeadersActual,
-		emptyBlob(log.UpstreamBody), log.UpstreamResponseHeaders, log.UpstreamResponseHeadersActual,
-		emptyBlob(log.UpstreamResponseBody), log.ResponseHeaders, log.ResponseHeadersActual,
+		boolInt(log.Stream), log.DurationMS, log.RequestHeaders,
+		emptyBlob(log.RequestBody), log.UpstreamHeaders,
+		emptyBlob(log.UpstreamBody), log.UpstreamResponseHeaders,
+		emptyBlob(log.UpstreamResponseBody), log.ResponseHeaders,
 		emptyBlob(log.ResponseBody), boolInt(log.ResponseTruncated), log.Error, log.Usage.InputTokens, log.Usage.CacheReadTokens,
 		log.Usage.CacheWriteTokens, log.Usage.PromptTokens, log.Usage.OutputTokens,
 		log.Usage.ReasoningTokens, boolInt(log.Usage.CacheSupported),
@@ -222,9 +284,9 @@ func (s *Store) Get(ctx context.Context, id string) (RequestLog, error) {
 SELECT id, started_at, gateway_id, gateway_name, prefix, ingress_protocol,
 upstream_protocol, model, request_path, request_url, upstream_url, method, status_code,
 client_response_status_code, upstream_response_status_code, success, stream, duration_ms,
-request_headers, request_headers_actual, request_body, upstream_headers, upstream_headers_actual,
-upstream_body, upstream_response_headers, upstream_response_headers_actual, upstream_response_body,
-response_headers, response_headers_actual, response_body, response_truncated, error, input_tokens,
+request_headers, request_body, upstream_headers,
+upstream_body, upstream_response_headers, upstream_response_body,
+response_headers, response_body, response_truncated, error, input_tokens,
 cache_read_tokens, cache_write_tokens, prompt_tokens, output_tokens,
 reasoning_tokens, cache_supported, usage_present, cache_source
 FROM request_logs WHERE id = ?`, id)
@@ -470,10 +532,10 @@ func scanFull(row scanner) (RequestLog, error) {
 		&log.Prefix, &ingress, &upstream, &log.Model, &log.RequestPath,
 		&log.RequestURL, &log.UpstreamURL, &log.Method, &log.StatusCode,
 		&log.ClientResponseStatusCode, &log.UpstreamResponseStatusCode, &success, &stream,
-		&log.DurationMS, &log.RequestHeaders, &log.RequestHeadersActual, &log.RequestBody,
-		&log.UpstreamHeaders, &log.UpstreamHeadersActual, &log.UpstreamBody,
-		&log.UpstreamResponseHeaders, &log.UpstreamResponseHeadersActual,
-		&log.UpstreamResponseBody, &log.ResponseHeaders, &log.ResponseHeadersActual,
+		&log.DurationMS, &log.RequestHeaders, &log.RequestBody,
+		&log.UpstreamHeaders, &log.UpstreamBody,
+		&log.UpstreamResponseHeaders,
+		&log.UpstreamResponseBody, &log.ResponseHeaders,
 		&log.ResponseBody, &responseTruncated, &log.Error, &log.Usage.InputTokens,
 		&log.Usage.CacheReadTokens, &log.Usage.CacheWriteTokens,
 		&log.Usage.PromptTokens, &log.Usage.OutputTokens,

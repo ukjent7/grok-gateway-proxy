@@ -83,12 +83,13 @@ func transformSenseNovaSSELine(line []byte) []byte {
 }
 
 // rewriteVercelReasoningEvent renames the legacy reasoning stream event names
-// to the newer `reasoning_text` variants. Only the exact type tag / event name
-// is rewritten, so delta or text content that merely quotes the old name is
-// never corrupted.
+// to the newer `reasoning_text` variants. Handles both compact and spaced JSON
+// (`"type":"..."` and `"type": "..."`).
 func rewriteVercelReasoningEvent(line []byte) []byte {
 	line = bytes.ReplaceAll(line, []byte(`"type":"response.reasoning.delta"`), []byte(`"type":"response.reasoning_text.delta"`))
+	line = bytes.ReplaceAll(line, []byte(`"type": "response.reasoning.delta"`), []byte(`"type": "response.reasoning_text.delta"`))
 	line = bytes.ReplaceAll(line, []byte(`"type":"response.reasoning.done"`), []byte(`"type":"response.reasoning_text.done"`))
+	line = bytes.ReplaceAll(line, []byte(`"type": "response.reasoning.done"`), []byte(`"type": "response.reasoning_text.done"`))
 	line = bytes.ReplaceAll(line, []byte("event: response.reasoning.delta"), []byte("event: response.reasoning_text.delta"))
 	line = bytes.ReplaceAll(line, []byte("event: response.reasoning.done"), []byte("event: response.reasoning_text.done"))
 	return line

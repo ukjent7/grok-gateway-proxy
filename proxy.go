@@ -74,13 +74,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w = capturedResponse
 
 	logEntry := RequestLog{
-		ID:                   newRequestID(),
-		StartedAt:            started,
-		Method:               r.Method,
-		RequestPath:          r.URL.Path,
-		RequestURL:           r.URL.RequestURI(),
-		RequestHeaders:       headersJSON(r.Header),
-		RequestHeadersActual: headersJSONActual(r.Header),
+		ID:             newRequestID(),
+		StartedAt:      started,
+		Method:         r.Method,
+		RequestPath:    r.URL.Path,
+		RequestURL:     r.URL.RequestURI(),
+		RequestHeaders: headersJSON(r.Header),
 	}
 	defer func() {
 		logEntry.ClientResponseStatusCode = capturedResponse.statusCode
@@ -91,7 +90,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			logEntry.StatusCode = http.StatusInternalServerError
 		}
 		logEntry.ResponseHeaders = headersJSON(capturedResponse.headers)
-		logEntry.ResponseHeadersActual = headersJSONActual(capturedResponse.headers)
 		logEntry.ResponseBody = append([]byte(nil), capturedResponse.body.Bytes()...)
 		logEntry.ResponseTruncated = logEntry.ResponseTruncated || capturedResponse.body.truncated
 		p.finishLog(r.Context(), &logEntry, started)
@@ -227,7 +225,6 @@ func (p *Proxy) buildUpstreamRequest(ctx context.Context, r *http.Request, gatew
 		upstreamRequest.Header.Set("User-Agent", gateway.UserAgentOverride)
 	}
 	logEntry.UpstreamHeaders = headersJSON(upstreamRequest.Header)
-	logEntry.UpstreamHeadersActual = headersJSONActual(upstreamRequest.Header)
 	return upstreamRequest, nil
 }
 
@@ -279,7 +276,6 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *Request
 	logEntry.StatusCode = upstreamResponse.StatusCode
 	logEntry.UpstreamResponseStatusCode = upstreamResponse.StatusCode
 	logEntry.UpstreamResponseHeaders = headersJSON(upstreamResponse.Header)
-	logEntry.UpstreamResponseHeadersActual = headersJSONActual(upstreamResponse.Header)
 
 	// Error path: read the full error body, normalize, and write back.
 	if upstreamResponse.StatusCode >= http.StatusBadRequest {

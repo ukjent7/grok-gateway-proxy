@@ -26,22 +26,6 @@ go run .
 
 Open <http://127.0.0.1:8787/> for the dashboard.
 
-Build a single executable with the embedded dashboard:
-
-```sh
-go build -o grok-gateway-proxy .
-# or
-make build
-```
-
-The proxy also ships a multi-stage `Dockerfile` (statically linked, non-root,
-volume-mounted `/data`):
-
-```sh
-docker build -t grok-gateway-proxy .
-docker run --rm -p 8787:8787 -v "$(pwd)/data:/data" grok-gateway-proxy
-```
-
 ### Flags and environment
 
 | Flag / env | Purpose |
@@ -76,7 +60,7 @@ The request detail drawer also provides GitHub-style, change-focused side-by-sid
 - the original client request versus the request actually sent to the upstream;
 - the upstream API response versus the response actually written back to the client.
 
-For development troubleshooting, SQLite keeps the request body, upstream request body, upstream raw response, final client response, statuses, URLs, and sanitized headers as separate fields. Existing databases are migrated automatically on startup (旧版的 `*_actual` 字段保留但不再写入)。
+For development troubleshooting, SQLite keeps the request body, upstream request body, upstream raw response, final client response, statuses, URLs, and sanitized headers as separate fields. Sensitive header values (`Authorization`, `*Api-Key*`, `*Token*`, `*Secret*`, `Cookie`) are always stored as `[REDACTED]`; on startup the proxy also scrubs any credentials that predate write-time sanitization (旧版的 `*_actual` 字段保留但不再写入，启动时同样会被脱敏)。
 
 Request bodies are capped at 64 MB (larger requests are rejected with `413`). Response bodies are capped at 64 MB for audit capture only: oversized responses are still forwarded to the client in full, but only the first 64 MB is stored, and the log is flagged with `response_truncated` so a pathological upstream stream cannot balloon proxy memory or the SQLite database.
 
@@ -92,14 +76,9 @@ node --check static/js/*.js   # 或 make js-check
 ```
 
 CI (`.github/workflows/build.yml`) runs `gofmt` formatting checks, `go vet`,
-`go test -race`, a `node --check` syntax pass over `static/js/*.js`, and
-multi-platform builds (linux/windows/darwin, amd64/arm64),
-publishing release artifacts on version tags. `make check` runs the full local
-gate (vet + JS syntax + tests + build).
+`go test -race`, and a `node --check` syntax pass over `static/js/*.js`.
 
 ## Development
 
-- `make build` / `make test` / `make vet` / `make fmt` / `make check` — common tasks.
+- `make test` / `make vet` / `make fmt` / `make check` — common tasks.
 - The dashboard is plain ES modules in `static/js/` (no build step); `static/index.html` loads `static/js/app.js`, which is embedded via `//go:embed static`.
-- `docker build -t grok-gateway-proxy .` builds a static, non-root container
-  image; mount a volume at `/data` for persistent config and logs.
