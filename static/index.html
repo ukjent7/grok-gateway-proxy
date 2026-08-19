@@ -190,6 +190,16 @@
           </article>
         </div>
 
+        <section class="panel gateway-cache-panel">
+          <div class="panel-head">
+            <div>
+              <h2>各网关缓存命中率</h2>
+              <span class="muted">按当前时间范围统计，使用加权 Token 命中率</span>
+            </div>
+          </div>
+          <div class="gateway-cache-rates" id="gatewayCacheRates"></div>
+        </section>
+
         <div class="panel-row">
           <section class="panel">
             <div class="panel-head">
@@ -295,7 +305,7 @@
         <div class="view-head">
           <div class="view-head-title">
             <h1>网关配置</h1>
-            <p>分别编辑每个网关的上游地址、请求头白名单和 User-Agent 覆盖</p>
+            <p>分别编辑每个网关的上游地址、请求头白名单、环境代理和 User-Agent 覆盖</p>
           </div>
           <div class="head-actions">
             <button id="gatewaysReloadBtn" class="btn-ghost">
