@@ -15,6 +15,10 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"grok-gateway-proxy/internal/config"
+	"grok-gateway-proxy/internal/store"
+	"grok-gateway-proxy/internal/web"
 )
 
 // version is the release version surfaced to the dashboard. Override at
@@ -51,7 +55,7 @@ func main() {
 		dataPath = defaultDataDir()
 	}
 
-	cfg, err := LoadConfig(filepath.Join(dataPath, "config.json"), *logRetentionDays)
+	cfg, err := config.LoadConfig(filepath.Join(dataPath, "config.json"), *logRetentionDays)
 	if err != nil {
 		logger.Error("加载配置失败", "error", err)
 		os.Exit(1)
@@ -74,12 +78,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	store, err := OpenStore(filepath.Join(dataPath, "proxy.db"))
+	st, err := store.OpenStore(filepath.Join(dataPath, "proxy.db"))
 	if err != nil {
 		logger.Error("open SQLite store", "error", err)
 		os.Exit(1)
 	}
-	defer store.Close()
+	defer st.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -89,13 +93,13 @@ func main() {
 	go func() {
 		maintain := func() {
 			if cfg.LogRetention > 0 {
-				if pruned, err := store.PruneOlderThan(ctx, cfg.LogRetention); err != nil {
+				if pruned, err := st.PruneOlderThan(ctx, cfg.LogRetention); err != nil {
 					logger.Warn("log pruning failed", "error", err)
 				} else if pruned > 0 {
 					logger.Info("pruned old logs", "count", pruned)
 				}
 			}
-			if err := store.CheckpointWAL(ctx); err != nil {
+			if err := st.CheckpointWAL(ctx); err != nil {
 				logger.Warn("WAL checkpoint failed", "error", err)
 			}
 		}
@@ -112,14 +116,17 @@ func main() {
 		}
 	}()
 
-	app := NewApp(cfg, store, logger)
+	app := web.NewApp(cfg, st, logger, version)
 
 	// 后台定期探测各启用网关的可达性，供 /healthz 报告真实上游健康状态。
-	go app.startHealthCheck(ctx, 30*time.Second)
+	go app.StartHealthCheck(ctx, 30*time.Second)
 
 	server := &http.Server{
-		Addr:              cfg.ListenAddr,
-		Handler:           app,
+		Addr: cfg.ListenAddr,
+		Handler: web.Chain(app,
+			web.RecoverMiddleware(logger),
+			web.SecurityHeadersMiddleware,
+		),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       2 * time.Minute,
 		WriteTimeout:      0,
