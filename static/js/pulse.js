@@ -15,24 +15,25 @@ export async function loadGatewayPulses() {
 
   const sigs = {};
   const allLogs = {};
-  let changed = false;
   // 与总览时间范围保持一致：范围外没有请求的网关显示空状态而非旧数据
   const from = rangeToFrom(state.range);
-  for (const id of gatewayIds()) {
-    const gw = state.gateways[id];
-    if (!gw) continue;
-    let logs = [];
+  const ids = gatewayIds().filter(id => state.gateways[id]);
+  const results = await Promise.all(ids.map(async id => {
     try {
       const params = new URLSearchParams({ gateway: id, limit: '40' });
       if (from) params.set('from', from.toISOString());
       const data = await api('/logs?' + params.toString());
-      logs = (data.items || []).slice().reverse();
-    } catch (e) { /* ignore per-gateway error */ }
+      return (data.items || []).slice().reverse();
+    } catch (e) { return []; /* ignore per-gateway error */ }
+  }));
+  let changed = false;
+  ids.forEach((id, i) => {
+    const logs = results[i];
     allLogs[id] = logs;
     const sig = logs.length + ':' + logs.map(l => l.id).join(',');
     sigs[id] = sig;
     if (sig !== state.pulseSig[id]) changed = true;
-  }
+  });
   state.pulseSig = sigs;
   if (!changed) return;
 
