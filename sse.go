@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"strings"
 )
 
 // sse.go contains the line-level SSE readers used by the gateway adapters.
@@ -91,6 +92,74 @@ func rewriteVercelReasoningEvent(line []byte) []byte {
 	line = bytes.ReplaceAll(line, []byte("event: response.reasoning.delta"), []byte("event: response.reasoning_text.delta"))
 	line = bytes.ReplaceAll(line, []byte("event: response.reasoning.done"), []byte("event: response.reasoning_text.done"))
 	return line
+}
+
+type museSSEReader struct {
+	reader    *bufio.Reader
+	pending   bytes.Buffer
+	eventLine []byte
+	skipBlank bool
+	done      bool
+	err       error
+}
+
+func (r *museSSEReader) Read(p []byte) (int, error) {
+	for {
+		if r.pending.Len() > 0 {
+			return r.pending.Read(p)
+		}
+		if r.done {
+			return 0, r.err
+		}
+		line, err := r.reader.ReadBytes('\n')
+		if len(line) == 0 && err != nil {
+			r.done = true
+			r.err = err
+			r.flushEventLine()
+			if r.pending.Len() > 0 {
+				return r.pending.Read(p)
+			}
+			return 0, err
+		}
+		if len(line) == 0 {
+			continue
+		}
+		trimmed := bytes.TrimRight(line, "\r\n")
+		switch {
+		case bytes.HasPrefix(trimmed, []byte("event:")):
+			r.flushEventLine()
+			if strings.TrimSpace(string(trimmed[len("event:"):])) == "ping" {
+				r.eventLine = nil
+				r.skipBlank = true
+			} else {
+				r.eventLine = append(r.eventLine[:0], line...)
+			}
+		case bytes.HasPrefix(trimmed, []byte("data:")):
+			payload := bytes.TrimSpace(trimmed[len("data:"):])
+			if isVercelPing(payload) {
+				r.eventLine = nil
+				r.skipBlank = true
+				continue
+			}
+			r.flushEventLine()
+			r.pending.Write(line)
+		default:
+			if r.skipBlank && len(trimmed) == 0 {
+				r.skipBlank = false
+				continue
+			}
+			r.skipBlank = false
+			r.flushEventLine()
+			r.pending.Write(line)
+		}
+	}
+}
+
+func (r *museSSEReader) flushEventLine() {
+	if len(r.eventLine) > 0 {
+		r.pending.Write(r.eventLine)
+		r.eventLine = nil
+	}
 }
 
 type vercelSSEReader struct {

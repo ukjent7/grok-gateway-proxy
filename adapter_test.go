@@ -262,3 +262,23 @@ func TestMuseProfileLeavesRequestsWithoutUnsupportedParameterUnchanged(t *testin
 		t.Fatalf("request without stream_tool_calls was rewritten: %s", transformed)
 	}
 }
+
+func TestMuseProfileFiltersPingEvents(t *testing.T) {
+	profile := MuseSpark12Profile{}
+	input := "event: ping\ndata: {\"type\":\"ping\",\"cost\":\"0\"}\n\n" +
+		"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":1}\n\n" +
+		"data: [DONE]\n\n"
+	reader := profile.TransformSSE(strings.NewReader(input))
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := string(body)
+	if strings.Contains(result, "ping") {
+		t.Fatalf("Muse ping event was not filtered: %q", result)
+	}
+	if !strings.Contains(result, "response.created") || !strings.Contains(result, "response.completed") || !strings.Contains(result, "data: [DONE]") {
+		t.Fatalf("non-ping Responses events were lost: %q", result)
+	}
+}

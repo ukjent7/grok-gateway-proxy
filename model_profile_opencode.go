@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"io"
 )
@@ -28,5 +29,5 @@ func (MuseSpark12Profile) TransformResponseBody(body []byte) ([]byte, error) {
 }
 
 func (MuseSpark12Profile) TransformSSE(reader io.Reader) io.Reader {
-	return reader
+	return &museSSEReader{reader: bufio.NewReaderSize(reader, 64*1024)}
 }
