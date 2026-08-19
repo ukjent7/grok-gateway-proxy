@@ -305,7 +305,7 @@
         <div class="view-head">
           <div class="view-head-title">
             <h1>网关配置</h1>
-            <p>分别编辑每个网关的上游地址、请求头白名单、环境代理和 User-Agent 覆盖</p>
+            <p>配置全局 HTTP/HTTPS 代理，并分别控制每个网关是否使用它</p>
           </div>
           <div class="head-actions">
             <button id="gatewaysReloadBtn" class="btn-ghost">
@@ -314,6 +314,19 @@
             </button>
           </div>
         </div>
+        <section class="panel global-proxy-panel">
+          <div class="panel-head">
+            <div>
+              <h2>全局代理地址</h2>
+              <span class="muted">支持 HTTP / HTTPS；各网关可单独选择是否使用此地址，留空表示无可用代理。</span>
+            </div>
+          </div>
+          <div class="global-proxy-form">
+            <input id="proxyUrlInput" type="text" placeholder="http://127.0.0.1:7890" autocomplete="off" spellcheck="false">
+            <button id="proxyUrlSaveBtn" class="btn-primary small">保存代理地址</button>
+          </div>
+          <div class="field-error global-proxy-error" id="proxyUrlError" hidden></div>
+        </section>
         <div class="gw-config-grid" id="gatewayCards"></div>
       </section>
 

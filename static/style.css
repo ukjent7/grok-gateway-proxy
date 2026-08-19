@@ -725,6 +725,27 @@ kbd{
 @keyframes shimmer{ 0%{ background-position:200% 0; } 100%{ background-position:-200% 0; } }
 
 /* ---------------- 13. 网关配置卡 ---------------- */
+.global-proxy-panel{ margin-bottom:16px; }
+.global-proxy-form{ display:flex; align-items:center; gap:9px; }
+.global-proxy-form input{
+  flex:1;
+  min-width:0;
+  padding:9px 11px;
+  background:rgba(0,0,0,.28);
+  border:1px solid var(--line-1);
+  border-radius:var(--r-s);
+  color:var(--text-0);
+  font-size:12.5px;
+  font-family:var(--font-mono);
+  outline:none;
+}
+.global-proxy-form input:focus{
+  border-color:var(--teal-line);
+  background:rgba(45,212,191,.05);
+  box-shadow:0 0 0 3px rgba(45,212,191,.12);
+}
+.global-proxy-form input::placeholder{ color:var(--text-3); }
+.global-proxy-error{ margin-top:7px; }
 .gw-config-grid{
   display:grid;
   grid-template-columns:repeat(auto-fit, minmax(330px, 1fr));
