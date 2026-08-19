@@ -13,7 +13,7 @@ import (
 func TestStaticAssetsAreNotMatchedAsGatewayPaths(t *testing.T) {
 	app := &App{}
 
-	for _, path := range []string{"/static/style.css", "/static/app.js"} {
+	for _, path := range []string{"/static/style.css", "/static/js/app.js"} {
 		req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787"+path, nil)
 		recorder := httptest.NewRecorder()
 		app.ServeHTTP(recorder, req)
@@ -94,6 +94,75 @@ func TestAPITokenUnsetAllowsManagementAPI(t *testing.T) {
 	app.ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected 200 without token configured, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPatchGatewayPartialUpdate(t *testing.T) {
+	cfg := DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
+	app := &App{config: cfg, logger: slog.Default()}
+	before := cfg.Gateways["st"]
+
+	req := httptest.NewRequest(http.MethodPatch, "http://127.0.0.1:8787/api/gateways/st", strings.NewReader(`{"enabled":false}`))
+	recorder := httptest.NewRecorder()
+	app.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	gw := cfg.Gateways["st"]
+	if gw.Enabled {
+		t.Fatal("enabled flag should be patched to false")
+	}
+	if gw.BaseURL != before.BaseURL || gw.Name != before.Name || gw.UserAgentOverride != before.UserAgentOverride {
+		t.Fatalf("unchanged fields were clobbered: %+v", gw)
+	}
+
+	req = httptest.NewRequest(http.MethodPatch, "http://127.0.0.1:8787/api/gateways/missing", strings.NewReader(`{"enabled":true}`))
+	recorder = httptest.NewRecorder()
+	app.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown gateway, got %d", recorder.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodPatch, "http://127.0.0.1:8787/api/gateways/st", strings.NewReader(`{"enabled":`))
+	recorder = httptest.NewRecorder()
+	app.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid JSON, got %d", recorder.Code)
+	}
+}
+
+func TestHealthzReportsGatewayStatus(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
+	gw := cfg.Gateways["oc"]
+	gw.BaseURL = upstream.URL
+	cfg.Gateways["oc"] = gw
+	app := &App{config: cfg, logger: slog.Default(), upstreams: map[string]upstreamHealth{}}
+	app.proxy = &Proxy{config: cfg, logger: slog.Default(), client: upstream.Client()}
+	app.probeUpstream("oc", cfg.Gateways["oc"])
+
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/healthz", nil)
+	recorder := httptest.NewRecorder()
+	app.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	upstreams, ok := body["upstreams"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected upstreams map, got %s", recorder.Body.String())
+	}
+	oc, ok := upstreams["oc"].(map[string]any)
+	if !ok || oc["reachable"] != true || oc["status"] != float64(200) {
+		t.Fatalf("expected reachable oc gateway with status 200, got: %+v", upstreams)
 	}
 }
 

@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-//go:embed static/*
+//go:embed static
 var staticFiles embed.FS
 
 func (a *App) handleUI(w http.ResponseWriter, r *http.Request) {
@@ -63,16 +63,40 @@ func parseFilter(r *http.Request) LogFilter {
 	return filter
 }
 
-func setupSnippets(gateways map[string]GatewayConfig) map[string]string {
+// setupSnippets renders per-gateway client config snippets. The base URL uses
+// the proxy's actual listen address so the snippets stay correct when the
+// proxy is not on the default 127.0.0.1:8787.
+func setupSnippets(listenAddr string, gateways map[string]GatewayConfig) map[string]string {
+	base := normalizeListenAddr(listenAddr)
 	result := make(map[string]string, len(gateways))
 	for id, gateway := range gateways {
 		modelName := strings.ReplaceAll(gateway.Name, " ", "-")
 		modelName = strings.ToLower(modelName)
 		result[id] = fmt.Sprintf(`[model.%s-model]
 model = "..."
-base_url = "http://127.0.0.1:8787%s"
+base_url = "%s%s"
 api_backend = "%s"
-`, modelName, gateway.Prefix, gateway.Protocol)
+`, modelName, base, gateway.Prefix, gateway.Protocol)
 	}
 	return result
+}
+
+// normalizeListenAddr turns a listen address into a usable base URL, adding a
+// default host when the address is hostless.
+func normalizeListenAddr(listenAddr string) string {
+	addr := strings.TrimSpace(listenAddr)
+	if addr == "" {
+		return "http://127.0.0.1:8787"
+	}
+	if !strings.Contains(addr, "://") {
+		if strings.HasPrefix(addr, ":") {
+			addr = "127.0.0.1" + addr
+		}
+		if strings.HasPrefix(addr, "/") {
+			addr = "http://localhost" + addr
+		} else if !strings.Contains(addr, "://") {
+			addr = "http://" + addr
+		}
+	}
+	return strings.TrimRight(addr, "/")
 }

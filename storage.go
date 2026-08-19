@@ -273,6 +273,23 @@ FROM request_logs`+where, args...)
 	return result, nil
 }
 
+// PruneOlderThan deletes logs older than the given retention window.
+// A retention of zero or less disables pruning.
+func (s *Store) PruneOlderThan(ctx context.Context, retention time.Duration) (int64, error) {
+	if retention <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().Add(-retention)
+	return s.Delete(ctx, &cutoff)
+}
+
+// CheckpointWAL forces a WAL checkpoint to keep the -wal file from growing
+// unbounded. Safe to call periodically.
+func (s *Store) CheckpointWAL(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, "PRAGMA wal_checkpoint(PASSIVE)")
+	return err
+}
+
 func (s *Store) Delete(ctx context.Context, before *time.Time) (int64, error) {
 	var result sql.Result
 	var err error
@@ -285,6 +302,18 @@ func (s *Store) Delete(ctx context.Context, before *time.Time) (int64, error) {
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+// Count returns the total number of stored logs matching the filter.
+func (s *Store) Count(ctx context.Context, filter LogFilter) (int64, error) {
+	where, args := buildLogFilter(filter)
+	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM request_logs`+where, args...)
+	var n int64
+	err := row.Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 func buildLogFilter(filter LogFilter) (string, []any) {

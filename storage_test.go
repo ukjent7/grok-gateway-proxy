@@ -195,6 +195,134 @@ VALUES ('legacy-1', '2026-01-01T00:00:00Z', 've', 'Vercel AI Gateway', '/ve', 'r
 	}
 }
 
+func TestStoreCountRespectsFilters(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Nanosecond)
+	logs := []RequestLog{
+		{ID: "a", StartedAt: now.Add(-2 * time.Hour), GatewayID: "st", Model: "m1", StatusCode: 200, Success: true},
+		{ID: "b", StartedAt: now.Add(-time.Hour), GatewayID: "st", Model: "m1", StatusCode: 200, Success: true},
+		{ID: "c", StartedAt: now.Add(-time.Hour), GatewayID: "oc", Model: "m2", StatusCode: 500},
+	}
+	for _, log := range logs {
+		if err := store.Insert(context.Background(), log); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cases := []struct {
+		name   string
+		filter LogFilter
+		want   int64
+	}{
+		{name: "all", filter: LogFilter{}, want: 3},
+		{name: "gateway", filter: LogFilter{GatewayID: "st"}, want: 2},
+		{name: "model", filter: LogFilter{Model: "m2"}, want: 1},
+		{name: "time range", filter: LogFilter{From: ptrTime(now.Add(-90 * time.Minute))}, want: 2},
+	}
+	for _, tc := range cases {
+		n, err := store.Count(context.Background(), tc.filter)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if n != tc.want {
+			t.Errorf("%s: Count = %d, want %d", tc.name, n, tc.want)
+		}
+	}
+}
+
+func TestStorePruneOlderThan(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Nanosecond)
+	for _, entry := range []struct {
+		id        string
+		startedAt time.Time
+	}{
+		{"old", now.Add(-48 * time.Hour)},
+		{"recent", now.Add(-time.Hour)},
+	} {
+		if err := store.Insert(context.Background(), RequestLog{ID: entry.id, StartedAt: entry.startedAt, GatewayID: "st"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Retention of zero or less disables pruning.
+	n, err := store.PruneOlderThan(context.Background(), 0)
+	if err != nil || n != 0 {
+		t.Fatalf("zero retention should be a no-op: n=%d err=%v", n, err)
+	}
+	if n, _ := store.Count(context.Background(), LogFilter{}); n != 2 {
+		t.Fatalf("expected 2 rows after no-op prune, got %d", n)
+	}
+
+	n, err = store.PruneOlderThan(context.Background(), 24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 row pruned, got %d", n)
+	}
+	if _, err := store.Get(context.Background(), "old"); err == nil {
+		t.Fatal("old log should have been pruned")
+	}
+	if _, err := store.Get(context.Background(), "recent"); err != nil {
+		t.Fatalf("recent log should have survived: %v", err)
+	}
+}
+
+// Rows exactly at the cutoff are kept: Delete uses a strict less-than.
+func TestStoreDeleteKeepsRowsAtBoundary(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	base := time.Now().UTC().Truncate(time.Second)
+	if err := store.Insert(context.Background(), RequestLog{ID: "keep", StartedAt: base}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Insert(context.Background(), RequestLog{ID: "drop", StartedAt: base.Add(-time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := store.Delete(context.Background(), &base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 row deleted, got %d", n)
+	}
+	if _, err := store.Get(context.Background(), "keep"); err != nil {
+		t.Fatalf("boundary row should be kept: %v", err)
+	}
+	if _, err := store.Get(context.Background(), "drop"); err == nil {
+		t.Fatal("row older than cutoff should be deleted")
+	}
+}
+
+func TestStoreCheckpointWALIsNoError(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.CheckpointWAL(context.Background()); err != nil {
+		t.Fatalf("unexpected checkpoint error: %v", err)
+	}
+}
+
+func ptrTime(t time.Time) *time.Time { return &t }
+
 func containsAll(value string, parts ...string) bool {
 	for _, part := range parts {
 		if !strings.Contains(value, part) {

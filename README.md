@@ -28,9 +28,42 @@ Build a single executable with the embedded dashboard:
 
 ```sh
 go build -o grok-gateway-proxy .
+# or
+make build
 ```
 
-Useful endpoints are `GET /healthz`, `GET /api/config`, `GET /api/metrics`, `GET /api/logs`, `GET /api/logs/{id}`, and `DELETE /api/logs`. Use `-listen` to override the saved listen address and `-data-dir` to choose where `config.json` and `proxy.db` are stored.
+The proxy also ships a multi-stage `Dockerfile` (statically linked, non-root,
+volume-mounted `/data`):
+
+```sh
+docker build -t grok-gateway-proxy .
+docker run --rm -p 8787:8787 -v "$(pwd)/data:/data" grok-gateway-proxy
+```
+
+### Flags and environment
+
+| Flag / env | Purpose |
+| --- | --- |
+| `-listen` / `GROK_PROXY_LISTEN` | Override the saved listen address |
+| `-data-dir` / `GROK_PROXY_DATA_DIR` | Directory for `config.json` and `proxy.db` |
+| `-shutdown-timeout` | Graceful-shutdown grace period for in-flight requests (default `30s`) |
+| `-log-level` | Log level: `debug`, `info`, `warn`, `error` (default `info`) |
+| `-log-retention-days` / `GROK_PROXY_LOG_RETENTION_DAYS` | Prune logs older than N days on startup and hourly (default `30`; `0` disables pruning) |
+| `GROK_PROXY_API_TOKEN` | Optional management-API bearer token (see below) |
+
+Useful endpoints are `GET /healthz`, `GET /api/config`, `GET /api/metrics`,
+`GET /api/logs`, `GET /api/logs/count`, `GET /api/logs/{id}`,
+`PUT /api/gateways`, `PATCH /api/gateways/{id}`, and `DELETE /api/logs`.
+
+`GET /healthz` returns `{"status":"ok","upstreams":{...}}` where each entry
+reports the last background probe of that gateway's `/models` endpoint
+(reachability and last HTTP status); probes run at startup and every 30s and
+never block the request.
+
+Upstream request deadlines default to 5 minutes and can be raised per request
+with an `X-Proxy-Timeout` header (up to 30 minutes) for long-running agentic
+streams; there is no fixed client-level timeout that would truncate long
+streams.
 
 The application stores `config.json` and `proxy.db` in the `data` folder under the current working directory by default. Use `-data-dir` to override this location. API keys remain in Grok Build configuration; the proxy forwards allowlisted headers and redacts credentials in the normal log fields.
 
@@ -54,4 +87,19 @@ The **网关配置** page includes an independent User-Agent override switch and
 ```sh
 go test ./...
 go vet ./...
+gofmt -l .
+node --check static/js/*.js   # 或 make js-check
 ```
+
+CI (`.github/workflows/build.yml`) runs `gofmt` formatting checks, `go vet`,
+`go test -race`, a `node --check` syntax pass over `static/js/*.js`, and
+multi-platform builds (linux/windows/darwin, amd64/arm64),
+publishing release artifacts on version tags. `make check` runs the full local
+gate (vet + JS syntax + tests + build).
+
+## Development
+
+- `make build` / `make test` / `make vet` / `make fmt` / `make check` — common tasks.
+- The dashboard is plain ES modules in `static/js/` (no build step); `static/index.html` loads `static/js/app.js`, which is embedded via `//go:embed static`.
+- `docker build -t grok-gateway-proxy .` builds a static, non-root container
+  image; mount a volume at `/data` for persistent config and logs.

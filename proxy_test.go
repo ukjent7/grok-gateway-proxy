@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestProxyForwardsSenseNovaChatAndLogs(t *testing.T) {
@@ -411,5 +412,55 @@ func TestProxyResponseWithinCapIsNotFlagged(t *testing.T) {
 	}
 	if string(detail.ResponseBody) != string(body) {
 		t.Fatalf("response body mismatch: %q", detail.ResponseBody)
+	}
+}
+
+// A slow upstream must be cut off by the per-request timeout and reported as
+// a 504 gateway timeout instead of hanging the client indefinitely.
+func TestProxyEnforcesUpstreamTimeout(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(5 * time.Second):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"late"}`))
+		case <-r.Context().Done():
+			return
+		}
+	}))
+	defer upstream.Close()
+
+	store, err := OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := DefaultConfig(t.TempDir() + "/config.json")
+	cfg.UpstreamTimeout = 200 * time.Millisecond
+	gateway := cfg.Gateways["st"]
+	gateway.BaseURL = upstream.URL
+	cfg.Gateways["st"] = gateway
+	p := &Proxy{config: cfg, store: store, logger: slog.Default(), client: upstream.Client()}
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/st/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("X-Proxy-Timeout", "300ms")
+	recorder := httptest.NewRecorder()
+	start := time.Now()
+	p.ServeHTTP(recorder, req)
+	elapsed := time.Since(start)
+
+	if recorder.Code != http.StatusGatewayTimeout {
+		t.Fatalf("expected 504 gateway timeout, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("timeout was not enforced promptly: %v", elapsed)
+	}
+	logs, err := store.List(context.Background(), LogFilter{Limit: 1})
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("expected one log, got %d, err=%v", len(logs), err)
+	}
+	if logs[0].StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("expected 504 in log, got %d", logs[0].StatusCode)
 	}
 }
