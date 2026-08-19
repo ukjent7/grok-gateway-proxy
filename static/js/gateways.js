@@ -10,7 +10,58 @@ import { healthDotHTML, applyHealthUI } from './health.js';
    网关配置卡片
    ============================================================ */
 
+function renderGlobalProxySettings() {
+  const input = $('#proxyUrlInput');
+  if (input && document.activeElement !== input) input.value = state.proxyURL || '';
+}
+
+function proxyURLIsValid(value) {
+  if (!value) return true;
+  try {
+    const parsed = new URL(value);
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && !!parsed.host;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function saveProxyURL() {
+  const input = $('#proxyUrlInput');
+  const error = $('#proxyUrlError');
+  const button = $('#proxyUrlSaveBtn');
+  if (!input || !button) return;
+  const proxyURL = input.value.trim();
+  if (!proxyURLIsValid(proxyURL)) {
+    if (error) {
+      error.textContent = '代理地址必须是 http:// 或 https:// URL';
+      error.hidden = false;
+    }
+    return;
+  }
+  if (error) error.hidden = true;
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = '保存中…';
+  try {
+    const res = await api('/proxy', { method: 'PATCH', body: JSON.stringify({ proxy_url: proxyURL }) });
+    state.proxyURL = res.proxy_url || '';
+    renderGlobalProxySettings();
+    showToast(state.proxyURL ? '全局代理地址已更新' : '已清空全局代理地址', 'success');
+  } catch (e) {
+    if (error) {
+      error.textContent = '保存失败：' + e.message;
+      error.hidden = false;
+    } else {
+      showToast('保存代理地址失败: ' + e.message, 'error');
+    }
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
 export function renderGatewayCards() {
+  renderGlobalProxySettings();
   const container = $('#gatewayCards');
   if (!container) return;
   container.innerHTML = '';
@@ -46,8 +97,8 @@ export function renderGatewayCards() {
         '<span class="field-error" hidden></span>' +
       '</div>' +
       '<div class="toggle-row proxy-toggle-row">' +
-        '<div><span class="switch-label">使用环境代理</span><span class="field-hint">HTTP_PROXY / HTTPS_PROXY，仅作用于此网关</span></div>' +
-        '<label class="toggle"><input type="checkbox" class="f-system-proxy" ' + (gw.use_system_proxy !== false ? 'checked' : '') + '><span class="toggle-track"></span></label>' +
+        '<div><span class="switch-label">使用全局代理</span><span class="field-hint">使用上方配置的 HTTP / HTTPS 地址</span></div>' +
+        '<label class="toggle"><input type="checkbox" class="f-proxy" ' + (gw.use_proxy !== false ? 'checked' : '') + '><span class="toggle-track"></span></label>' +
       '</div>' +
       '<div class="toggle-row ua-toggle-row">' +
         '<div><span class="switch-label">User-Agent 覆盖</span><span class="field-hint">仅作用于此网关</span></div>' +
@@ -101,7 +152,7 @@ async function saveGateway(id, card) {
     enabled: card.querySelector('.f-enabled').checked,
     user_agent_override_enabled: card.querySelector('.f-ua-enabled').checked,
     user_agent_override: card.querySelector('.f-ua').value.trim(),
-    use_system_proxy: card.querySelector('.f-system-proxy').checked,
+    use_proxy: card.querySelector('.f-proxy').checked,
     forward_headers: card.querySelector('.f-headers').value.split('\n').map(s => s.trim()).filter(Boolean)
   };
   // 发送前校验；把出错的字段就地标出。
@@ -140,9 +191,12 @@ async function saveGateway(id, card) {
 }
 
 export function initGateways() {
-  $('#gatewaysReloadBtn').addEventListener('click', async () => {
+  const reloadButton = $('#gatewaysReloadBtn');
+  if (reloadButton) reloadButton.addEventListener('click', async () => {
     await loadConfig();
     renderGatewayCards();
     showToast('已重新加载网关配置', 'success');
   });
+  const proxyButton = $('#proxyUrlSaveBtn');
+  if (proxyButton) proxyButton.addEventListener('click', saveProxyURL);
 }

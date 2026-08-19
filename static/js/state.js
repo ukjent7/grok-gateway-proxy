@@ -6,6 +6,7 @@ import { $ } from './utils.js';
 export const state = {
   gateways: {},
   listenAddr: '',
+  proxyURL: '',
   version: '',
   metrics: null,
   logs: [],
@@ -40,6 +41,7 @@ export async function loadConfig() {
   const data = await api('/config');
   state.gateways = data.gateways || {};
   state.listenAddr = data.listen_addr || '';
+  state.proxyURL = data.proxy_url || '';
   state.version = data.version || '';
   $('#listenAddr').textContent = state.listenAddr || '—';
   const verEl = $('#railVersion');
