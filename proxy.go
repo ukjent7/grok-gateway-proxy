@@ -51,6 +51,14 @@ type statusError struct {
 
 func (e *statusError) Error() string { return e.message }
 
+type blockedModelError struct {
+	model string
+}
+
+func (e *blockedModelError) Error() string {
+	return fmt.Sprintf("model %q is blocked by the proxy", e.model)
+}
+
 func statusOf(err error) int {
 	var se *statusError
 	if ok := errors.As(err, &se); ok {
@@ -114,6 +122,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		logEntry.IngressProtocol = protocolForPath(subpath)
 	}
 	if resolveErr != nil {
+		var blocked *blockedModelError
+		if errors.As(resolveErr, &blocked) {
+			logEntry.Error = blocked.Error()
+			logEntry.StatusCode = http.StatusOK
+			logEntry.Success = true
+			writeBlockedModelResponse(w, logEntry.Model, logEntry.Stream)
+			return
+		}
 		logEntry.Error = resolveErr.Error()
 		logEntry.StatusCode = statusOf(resolveErr)
 		writeError(w, logEntry.StatusCode, resolveErr)
@@ -169,6 +185,9 @@ func (p *Proxy) resolveGateway(r *http.Request, body []byte) (GatewayConfig, str
 	if err := adapter.ValidateRequest(body); err != nil {
 		return gateway, subpath, adapter, &statusError{status: http.StatusBadRequest, message: err.Error()}
 	}
+	if model := ParseModel(body); isBlockedModel(model) {
+		return gateway, subpath, adapter, &blockedModelError{model: model}
+	}
 	if !gateway.Enabled {
 		return gateway, subpath, adapter, &statusError{status: http.StatusServiceUnavailable, message: fmt.Sprintf("gateway %s is disabled", gateway.ID)}
 	}
@@ -184,7 +203,7 @@ func (p *Proxy) buildUpstreamRequest(ctx context.Context, r *http.Request, gatew
 	}
 	logEntry.UpstreamURL = upstreamURL
 
-	upstreamBody, err := transformRequestBody(adapter, requestBody)
+	upstreamBody, err := transformRequestBody(adapter, logEntry.Model, requestBody)
 	if err != nil {
 		return nil, &statusError{status: http.StatusBadRequest, message: err.Error()}
 	}
@@ -297,9 +316,7 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *Request
 	if eventStream {
 		rawResponse := newCappedBuffer(bodyLimit)
 		responseReader := io.Reader(io.TeeReader(upstreamResponse.Body, rawResponse))
-		if transformer, ok := adapter.(streamTransformer); ok {
-			responseReader = transformer.TransformSSE(responseReader)
-		}
+		responseReader = transformSSE(adapter, logEntry.Model, responseReader)
 		responseBody, copyErr = copyAndCapture(w, responseReader, true, bodyLimit)
 		logEntry.UpstreamResponseBody = append([]byte(nil), rawResponse.Bytes()...)
 		logEntry.ResponseTruncated = rawResponse.truncated
@@ -313,7 +330,7 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *Request
 		logEntry.ResponseTruncated = rawCapture.truncated
 
 		var transformErr error
-		responseBody, transformErr = transformResponseBody(adapter, rawResponse)
+		responseBody, transformErr = transformResponseBody(adapter, logEntry.Model, rawResponse)
 		if transformErr != nil {
 			copyErr = transformErr
 			responseBody = rawResponse
@@ -521,6 +538,49 @@ func requestStream(body []byte) bool {
 		Stream bool `json:"stream"`
 	}
 	return json.Unmarshal(body, &request) == nil && request.Stream
+}
+
+func isBlockedModel(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	return model == "grok" || strings.HasPrefix(model, "grok-")
+}
+
+func writeBlockedModelResponse(w http.ResponseWriter, model string, stream bool) {
+	responseID := "resp-blocked-" + strings.TrimPrefix(newRequestID(), "req-")
+	response := map[string]any{
+		"id":     responseID,
+		"object": "response",
+		"status": "completed",
+		"model":  model,
+		"output": []any{},
+	}
+
+	if !stream {
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+
+	created := map[string]any{
+		"type":            "response.created",
+		"sequence_number": 0,
+		"response":        response,
+	}
+	completed := map[string]any{
+		"type":            "response.completed",
+		"sequence_number": 1,
+		"response":        response,
+	}
+	createdBody, _ := json.Marshal(created)
+	completedBody, _ := json.Marshal(completed)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	_, _ = fmt.Fprintf(w, "event: response.created\ndata: %s\n\n", createdBody)
+	_, _ = fmt.Fprintf(w, "event: response.completed\ndata: %s\n\n", completedBody)
+	_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 func isEventStream(headers http.Header) bool {

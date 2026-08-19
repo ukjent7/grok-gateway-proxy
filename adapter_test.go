@@ -226,3 +226,39 @@ func TestSenseNovaStreamingToolCallContinuationKeepsIdentity(t *testing.T) {
 		t.Fatalf("tool-call argument continuation was changed: %s", result)
 	}
 }
+
+func TestOpenCodeSelectsMuseProfileByModel(t *testing.T) {
+	adapter := OpenCodeResponsesAdapter{}
+	profile := adapter.ProfileForModel("muse-spark-1.2")
+	if profile == nil || profile.ID() != "muse-spark-1.2" {
+		t.Fatalf("Muse profile was not selected: %#v", profile)
+	}
+
+	body := []byte(`{"model":"muse-spark-1.2","stream":true,"stream_tool_calls":true,"input":[]}`)
+	upstreamBody, err := profile.TransformRequestBody(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(upstreamBody), `"stream_tool_calls"`) {
+		t.Fatalf("unsupported Muse parameter survived: %s", upstreamBody)
+	}
+	if !strings.Contains(string(upstreamBody), `"model":"muse-spark-1.2"`) {
+		t.Fatalf("Muse request was changed unexpectedly: %s", upstreamBody)
+	}
+
+	if other := adapter.ProfileForModel("deepseek-chat"); other != nil {
+		t.Fatalf("DeepSeek unexpectedly selected the Muse profile: %#v", other)
+	}
+}
+
+func TestMuseProfileLeavesRequestsWithoutUnsupportedParameterUnchanged(t *testing.T) {
+	profile := MuseSpark12Profile{}
+	body := []byte(`{"model":"muse-spark-1.2","stream":true,"input":[]}`)
+	transformed, err := profile.TransformRequestBody(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(transformed) != string(body) {
+		t.Fatalf("request without stream_tool_calls was rewritten: %s", transformed)
+	}
+}

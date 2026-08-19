@@ -1,6 +1,9 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // OpenCodeResponsesAdapter handles the OpenCode Zen gateway (Responses protocol).
 // No request/response transformation is needed — the protocol passes through.
@@ -20,4 +23,13 @@ func (OpenCodeResponsesAdapter) ValidateRequest(body []byte) error {
 }
 func (OpenCodeResponsesAdapter) NormalizeError(status int, body []byte) []byte {
 	return normalizeUpstreamError(status, body)
+}
+
+func (OpenCodeResponsesAdapter) ProfileForModel(model string) ModelCompatibilityProfile {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "muse-spark-1.2":
+		return MuseSpark12Profile{}
+	default:
+		return nil
+	}
 }

@@ -34,18 +34,66 @@ type streamTransformer interface {
 	TransformSSE(io.Reader) io.Reader
 }
 
-func transformRequestBody(adapter GatewayAdapter, body []byte) ([]byte, error) {
-	if transformer, ok := adapter.(payloadTransformer); ok {
-		return transformer.TransformRequestBody(body)
-	}
-	return body, nil
+// ModelCompatibilityProfile contains model-specific deviations from an
+// adapter's native protocol. Profiles are selected from the request model so
+// models sharing one upstream gateway do not need separate gateway routes.
+type ModelCompatibilityProfile interface {
+	ID() string
+	TransformRequestBody([]byte) ([]byte, error)
+	TransformResponseBody([]byte) ([]byte, error)
+	TransformSSE(io.Reader) io.Reader
 }
 
-func transformResponseBody(adapter GatewayAdapter, body []byte) ([]byte, error) {
-	if transformer, ok := adapter.(payloadTransformer); ok {
-		return transformer.TransformResponseBody(body)
+type modelProfileProvider interface {
+	ProfileForModel(model string) ModelCompatibilityProfile
+}
+
+func profileFor(adapter GatewayAdapter, model string) ModelCompatibilityProfile {
+	provider, ok := adapter.(modelProfileProvider)
+	if !ok {
+		return nil
 	}
-	return body, nil
+	return provider.ProfileForModel(model)
+}
+
+func transformRequestBody(adapter GatewayAdapter, model string, body []byte) ([]byte, error) {
+	transformed := body
+	if transformer, ok := adapter.(payloadTransformer); ok {
+		var err error
+		transformed, err = transformer.TransformRequestBody(transformed)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if profile := profileFor(adapter, model); profile != nil {
+		return profile.TransformRequestBody(transformed)
+	}
+	return transformed, nil
+}
+
+func transformResponseBody(adapter GatewayAdapter, model string, body []byte) ([]byte, error) {
+	transformed := body
+	if transformer, ok := adapter.(payloadTransformer); ok {
+		var err error
+		transformed, err = transformer.TransformResponseBody(transformed)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if profile := profileFor(adapter, model); profile != nil {
+		return profile.TransformResponseBody(transformed)
+	}
+	return transformed, nil
+}
+
+func transformSSE(adapter GatewayAdapter, model string, reader io.Reader) io.Reader {
+	if transformer, ok := adapter.(streamTransformer); ok {
+		reader = transformer.TransformSSE(reader)
+	}
+	if profile := profileFor(adapter, model); profile != nil {
+		reader = profile.TransformSSE(reader)
+	}
+	return reader
 }
 
 func validateJSONRequest(body []byte, protocolName string) error {

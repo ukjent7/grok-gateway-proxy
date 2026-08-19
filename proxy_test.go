@@ -464,3 +464,96 @@ func TestProxyEnforcesUpstreamTimeout(t *testing.T) {
 		t.Fatalf("expected 504 in log, got %d", logs[0].StatusCode)
 	}
 }
+
+func TestProxyAppliesMuseProfileOnlyForMuseModel(t *testing.T) {
+	var upstreamBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&upstreamBody); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"muse-response","output":[]}`))
+	}))
+	defer upstream.Close()
+
+	store, err := OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := DefaultConfig(t.TempDir() + "/config.json")
+	gateway := cfg.Gateways["oc"]
+	gateway.BaseURL = upstream.URL
+	cfg.Gateways["oc"] = gateway
+	p := &Proxy{config: cfg, store: store, logger: slog.Default(), client: upstream.Client()}
+
+	requestBody := []byte(`{"model":"muse-spark-1.2","stream":true,"stream_tool_calls":true,"input":[]}`)
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/oc/responses", strings.NewReader(string(requestBody)))
+	recorder := httptest.NewRecorder()
+	p.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "muse-response") {
+		t.Fatalf("unexpected Muse response: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if _, exists := upstreamBody["stream_tool_calls"]; exists {
+		t.Fatalf("unsupported Muse parameter reached upstream: %+v", upstreamBody)
+	}
+	if upstreamBody["model"] != "muse-spark-1.2" {
+		t.Fatalf("upstream model changed unexpectedly: %+v", upstreamBody)
+	}
+
+	logs, err := store.List(context.Background(), LogFilter{Limit: 1})
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("expected one request log, got %d, err=%v", len(logs), err)
+	}
+	detail, err := store.Get(context.Background(), logs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(detail.RequestBody), `"stream_tool_calls":true`) || strings.Contains(string(detail.UpstreamBody), `"stream_tool_calls"`) {
+		t.Fatalf("request comparison did not preserve the Muse rewrite: request=%s upstream=%s", detail.RequestBody, detail.UpstreamBody)
+	}
+}
+
+func TestProxyBlocksGrokModelsWithoutCallingUpstream(t *testing.T) {
+	upstreamCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		t.Error("blocked Grok request reached upstream")
+	}))
+	defer upstream.Close()
+
+	store, err := OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := DefaultConfig(t.TempDir() + "/config.json")
+	gateway := cfg.Gateways["oc"]
+	gateway.BaseURL = upstream.URL
+	cfg.Gateways["oc"] = gateway
+	p := &Proxy{config: cfg, store: store, logger: slog.Default(), client: upstream.Client()}
+
+	requestBody := []byte(`{"model":"grok-4.6","stream":true,"input":"title this"}`)
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/oc/responses", strings.NewReader(string(requestBody)))
+	recorder := httptest.NewRecorder()
+	p.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected synthetic success, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if upstreamCalls != 0 {
+		t.Fatalf("blocked request called upstream %d times", upstreamCalls)
+	}
+	if !strings.Contains(recorder.Body.String(), "response.completed") || !strings.Contains(recorder.Body.String(), "data: [DONE]") {
+		t.Fatalf("synthetic Responses stream was incomplete: %s", recorder.Body.String())
+	}
+	logs, err := store.List(context.Background(), LogFilter{Limit: 1})
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("expected one blocked request log, got %d, err=%v", len(logs), err)
+	}
+	if logs[0].StatusCode != http.StatusOK || !logs[0].Success || !strings.Contains(logs[0].Error, "blocked") {
+		t.Fatalf("blocked request was not logged clearly: %+v", logs[0])
+	}
+}
