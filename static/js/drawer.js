@@ -10,9 +10,7 @@ import {
 } from './diff.js';
 
 /* ============================================================
-   请求详情抽屉
-   Headers 存了两份：脱敏（credentials 替换为 [REDACTED]）和原始值，
-   默认显示脱敏视图，头部按钮可切换为原始头。
+   请求详情抽屉（本地小工具：仅展示脱敏后的 headers）
    ============================================================ */
 
 const MAX_DIFF_BYTES = 1024 * 1024;   // 超过则跳过 diff，直接显示截断预览
@@ -64,10 +62,6 @@ function renderDrawer(log) {
   renderDrawerTab(state.drawerTab);
 }
 
-function headersView(log, actual, sanitized) {
-  return state.showRawHeaders ? (actual || sanitized) : (sanitized || actual);
-}
-
 // 超大 body 不整段展示，截断后提示
 function previewOrFull(raw) {
   const text = raw || '';
@@ -82,8 +76,6 @@ function renderDrawerTab(tab) {
   if (!log) return;
   const compare = $('#drawerCompare');
   const code = $('#drawerCode');
-  const rawLabel = $('.raw-headers-label');
-  if (rawLabel) rawLabel.textContent = state.showRawHeaders ? '原始头' : '脱敏头';
   if (tab === 'request-compare' || tab === 'response-compare') {
     compare.style.display = 'grid';
     code.style.display = 'none';
@@ -98,10 +90,10 @@ function renderDrawerTab(tab) {
   else if (tab === 'upstream-response') content = previewOrFull(tryPretty(log.upstream_response_body || log.response_body));
   else if (tab === 'response') content = previewOrFull(tryPretty(log.response_body));
   else if (tab === 'headers') content =
-    tryPretty(headersView(log, log.request_headers_actual, log.request_headers)) +
-    '\n\n--- upstream request headers ---\n\n' + tryPretty(headersView(log, log.upstream_headers_actual, log.upstream_headers)) +
-    '\n\n--- upstream response headers ---\n\n' + tryPretty(headersView(log, log.upstream_response_headers_actual, log.upstream_response_headers)) +
-    '\n\n--- client response headers ---\n\n' + tryPretty(headersView(log, log.response_headers_actual, log.response_headers));
+    tryPretty(log.request_headers) +
+    '\n\n--- upstream request headers ---\n\n' + tryPretty(log.upstream_headers) +
+    '\n\n--- upstream response headers ---\n\n' + tryPretty(log.upstream_response_headers) +
+    '\n\n--- client response headers ---\n\n' + tryPretty(log.response_headers);
   code.textContent = content || '(空)';
 }
 
@@ -110,23 +102,23 @@ function renderComparison(tab, log) {
   const left = request ? {
     label: '客户端原请求',
     url: (log.method || 'POST') + ' ' + (log.request_url || log.request_path || '—'),
-    headers: headersView(log, log.request_headers_actual, log.request_headers),
+    headers: log.request_headers,
     body: log.request_body
   } : {
     label: '上游 API 原始响应',
     url: 'HTTP ' + (log.upstream_response_status_code || log.status_code || '—'),
-    headers: headersView(log, log.upstream_response_headers_actual, log.upstream_response_headers),
+    headers: log.upstream_response_headers,
     body: log.upstream_response_body || log.response_body
   };
   const right = request ? {
     label: '代理实际发送',
     url: (log.method || 'POST') + ' ' + (log.upstream_url || '—'),
-    headers: headersView(log, log.upstream_headers_actual, log.upstream_headers),
+    headers: log.upstream_headers,
     body: log.upstream_body
   } : {
     label: '代理实际返回客户端',
     url: 'HTTP ' + (log.client_response_status_code || log.status_code || '—'),
-    headers: headersView(log, log.response_headers_actual, log.response_headers),
+    headers: log.response_headers,
     body: log.response_body
   };
   const oversized = String(left.body || '').length + String(right.body || '').length > MAX_DIFF_BYTES;
@@ -166,9 +158,7 @@ export function closeDrawer() {
 function buildCurlFromLog(log) {
   const url = log.request_url || log.request_path || '';
   let cmd = 'curl ' + JSON.stringify(url) + ' \\\n  -X ' + (log.method || 'POST');
-  const headers = state.showRawHeaders
-    ? (log.request_headers_actual || log.request_headers)
-    : (log.request_headers || log.request_headers_actual);
+  const headers = log.request_headers;
   if (headers) {
     try {
       const obj = JSON.parse(headers);
@@ -195,10 +185,6 @@ export function initDrawer() {
     state.drawerTab = btn.dataset.tab;
     $all('.drawer-tab').forEach(t => t.classList.toggle('is-active', t === btn));
     renderDrawerTab(state.drawerTab);
-  });
-  $('#drawerRawHeadersBtn').addEventListener('click', () => {
-    state.showRawHeaders = !state.showRawHeaders;
-    if (state.drawerLog) renderDrawerTab(state.drawerTab);
   });
   $('#drawerCopyIdBtn').addEventListener('click', () => {
     const id = $('#drawerId').textContent.trim();

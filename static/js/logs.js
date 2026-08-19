@@ -63,7 +63,7 @@ function logRowHTML(l) {
       '<td><span class="status-pill ' + (l.success ? 'ok' : 'err') + '">' + (l.success ? l.status_code : (l.status_code || '错误')) + '</span></td>' +
       '<td>' + fmtMs(l.duration_ms) + '</td>' +
       '<td>' + (l.stream ? '是' : '否') + '</td>' +
-      '<td>' + (l.usage ? fmtNum(l.usage.input_tokens || l.usage.prompt_tokens) + ' / ' + fmtNum(l.usage.output_tokens) : '—') + '</td>' +
+      '<td title="总输入=' + fmtNum(l.usage ? l.usage.prompt_tokens : 0) + ' (uncached ' + fmtNum(l.usage ? l.usage.input_tokens : 0) + ' + cached ' + fmtNum(l.usage ? l.usage.cache_read_tokens : 0) + ')">' + (l.usage ? fmtNum(l.usage.prompt_tokens || l.usage.input_tokens) + ' / ' + fmtNum(l.usage.output_tokens) : '—') + '</td>' +
       '<td>' + cacheHit + '</td>' +
     '</tr>'
   );

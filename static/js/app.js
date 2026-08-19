@@ -7,7 +7,6 @@
    ============================================================ */
 
 import { state, loadConfig } from './state.js';
-import { initTokenButton, updateTokenButton } from './api.js';
 import { $, $all } from './utils.js';
 import { showToast } from './ui.js';
 import { loadOverview, initOverview } from './overview.js';
@@ -90,7 +89,6 @@ document.addEventListener('keydown', (e) => {
 
 /* ---------------- 启动 ---------------- */
 async function boot() {
-  updateTokenButton();
   try {
     await loadConfig();
     await loadOverview();
@@ -101,7 +99,6 @@ async function boot() {
   startPolling();
 }
 
-initTokenButton(refreshAll);
 initOverview();
 initLogs();
 initGateways();
