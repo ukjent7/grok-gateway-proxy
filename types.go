@@ -62,24 +62,25 @@ type RequestLog struct {
 }
 
 type Metrics struct {
-	From                 *time.Time `json:"from,omitempty"`
-	To                   *time.Time `json:"to,omitempty"`
-	GatewayID            string     `json:"gateway_id,omitempty"`
-	Model                string     `json:"model,omitempty"`
-	Requests             int64      `json:"requests"`
-	Successes            int64      `json:"successes"`
-	Failures             int64      `json:"failures"`
-	InputTokens          int64      `json:"input_tokens"`
-	OutputTokens         int64      `json:"output_tokens"`
-	ReasoningTokens      int64      `json:"reasoning_tokens"`
-	PromptTokens         int64      `json:"prompt_tokens"`
-	CachePromptTokens    int64      `json:"cache_prompt_tokens"`
-	CacheReadTokens      int64      `json:"cache_read_tokens"`
-	CacheWriteTokens     int64      `json:"cache_write_tokens"`
-	CacheHitRate         *float64   `json:"cache_hit_rate,omitempty"`
-	CacheSupportedCalls  int64      `json:"cache_supported_calls"`
-	UsageCalls           int64      `json:"usage_calls"`
-	CacheCoveragePercent *float64   `json:"cache_coverage_percent,omitempty"`
+	From                 *time.Time         `json:"from,omitempty"`
+	To                   *time.Time         `json:"to,omitempty"`
+	GatewayID            string             `json:"gateway_id,omitempty"`
+	Model                string             `json:"model,omitempty"`
+	Requests             int64              `json:"requests"`
+	Successes            int64              `json:"successes"`
+	Failures             int64              `json:"failures"`
+	InputTokens          int64              `json:"input_tokens"`
+	OutputTokens         int64              `json:"output_tokens"`
+	ReasoningTokens      int64              `json:"reasoning_tokens"`
+	PromptTokens         int64              `json:"prompt_tokens"`
+	CachePromptTokens    int64              `json:"cache_prompt_tokens"`
+	CacheReadTokens      int64              `json:"cache_read_tokens"`
+	CacheWriteTokens     int64              `json:"cache_write_tokens"`
+	CacheHitRate         *float64           `json:"cache_hit_rate,omitempty"`
+	CacheSupportedCalls  int64              `json:"cache_supported_calls"`
+	UsageCalls           int64              `json:"usage_calls"`
+	CacheCoveragePercent *float64           `json:"cache_coverage_percent,omitempty"`
+	ByGateway            map[string]Metrics `json:"by_gateway,omitempty"`
 }
 
 // MarshalJSON keeps raw payloads readable in the GUI/API while the database

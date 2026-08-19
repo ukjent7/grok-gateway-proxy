@@ -36,7 +36,8 @@ type Proxy struct {
 	config           *Config
 	store            *Store
 	logger           *slog.Logger
-	client           *http.Client
+	client           *http.Client // environment-proxy client; also test fallback
+	directClient     *http.Client
 	responseBodySize int64 // 0 = use maxResponseBodySize
 }
 
@@ -133,7 +134,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := p.forwardUpstreamResponse(w, &logEntry, adapter, gateway.Protocol, upstreamRequest, logEntry.Stream, bodyLimit); err != nil {
+	if err := p.forwardUpstreamResponse(w, &logEntry, adapter, gateway.Protocol, p.clientFor(gateway), upstreamRequest, logEntry.Stream, bodyLimit); err != nil {
 		logEntry.Error = err.Error()
 		// If nothing was written to the client yet (a transport-level failure
 		// before any upstream headers arrived), surface a gateway error instead
@@ -209,10 +210,22 @@ func (p *Proxy) buildUpstreamRequest(ctx context.Context, r *http.Request, gatew
 	return upstreamRequest, nil
 }
 
+// clientFor selects the transport according to the gateway setting. Keeping
+// separate clients also keeps proxy and direct connection pools isolated.
+func (p *Proxy) clientFor(gateway GatewayConfig) *http.Client {
+	if gateway.UseSystemProxy || p.directClient == nil {
+		if p.client != nil {
+			return p.client
+		}
+		return http.DefaultClient
+	}
+	return p.directClient
+}
+
 // forwardUpstreamResponse performs the upstream HTTP call and writes the
 // response back to the client, filling in the response-side audit fields.
-func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *RequestLog, adapter GatewayAdapter, protocol Protocol, upstreamRequest *http.Request, stream bool, bodyLimit int64) error {
-	upstreamResponse, err := p.client.Do(upstreamRequest)
+func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *RequestLog, adapter GatewayAdapter, protocol Protocol, client *http.Client, upstreamRequest *http.Request, stream bool, bodyLimit int64) error {
+	upstreamResponse, err := client.Do(upstreamRequest)
 	if err != nil {
 		// Transport-level failure (DNS, connect, timeout) before any upstream
 		// headers arrived: surface a gateway error instead of a raw error.

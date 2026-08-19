@@ -57,6 +57,26 @@ type GatewayConfig struct {
 	ForwardHeaders           []string `json:"forward_headers,omitempty"`
 	UserAgentOverrideEnabled bool     `json:"user_agent_override_enabled"`
 	UserAgentOverride        string   `json:"user_agent_override,omitempty"`
+	UseSystemProxy           bool     `json:"use_system_proxy"`
+}
+
+// UnmarshalJSON keeps the current environment-proxy behavior for configuration
+// files created before per-gateway proxy selection was added.
+func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
+	type gatewayConfig GatewayConfig
+	var decoded gatewayConfig
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if _, present := fields["use_system_proxy"]; !present {
+		decoded.UseSystemProxy = true
+	}
+	*g = GatewayConfig(decoded)
+	return nil
 }
 
 type Config struct {
@@ -85,6 +105,7 @@ func buildDefaultGateways() map[string]GatewayConfig {
 			Protocol:          ProtocolResponses,
 			Enabled:           true,
 			UserAgentOverride: "grok-gateway-proxy/dev",
+			UseSystemProxy:    true,
 		},
 		"st": {
 			ID:                "st",
@@ -94,6 +115,7 @@ func buildDefaultGateways() map[string]GatewayConfig {
 			Protocol:          ProtocolChat,
 			Enabled:           true,
 			UserAgentOverride: "grok-gateway-proxy/dev",
+			UseSystemProxy:    true,
 		},
 		"ve": {
 			ID:                "ve",
@@ -103,6 +125,7 @@ func buildDefaultGateways() map[string]GatewayConfig {
 			Protocol:          ProtocolResponses,
 			Enabled:           true,
 			UserAgentOverride: "grok-gateway-proxy/dev",
+			UseSystemProxy:    true,
 		},
 	}
 }
@@ -309,6 +332,7 @@ type GatewayPatch struct {
 	ForwardHeaders           *[]string `json:"forward_headers"`
 	UserAgentOverrideEnabled *bool     `json:"user_agent_override_enabled"`
 	UserAgentOverride        *string   `json:"user_agent_override"`
+	UseSystemProxy           *bool     `json:"use_system_proxy"`
 }
 
 // PatchGateway applies a partial update to a single gateway and persists the
@@ -339,6 +363,9 @@ func (c *Config) PatchGateway(id string, patch GatewayPatch) (GatewayConfig, err
 	}
 	if patch.UserAgentOverride != nil {
 		gateway.UserAgentOverride = *patch.UserAgentOverride
+	}
+	if patch.UseSystemProxy != nil {
+		gateway.UseSystemProxy = *patch.UseSystemProxy
 	}
 
 	updated := make(map[string]GatewayConfig, len(c.Gateways))

@@ -49,6 +49,39 @@ func TestMetricsUseWeightedCacheHitRate(t *testing.T) {
 	}
 }
 
+func TestMetricsIncludeWeightedCacheHitRateByGateway(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	started := time.Now().UTC()
+	for _, log := range []RequestLog{
+		{ID: "oc-1", StartedAt: started, GatewayID: "oc", Usage: UsageMetrics{CacheReadTokens: 30, PromptTokens: 100, CacheSupported: true, UsagePresent: true}},
+		{ID: "oc-2", StartedAt: started.Add(time.Second), GatewayID: "oc", Usage: UsageMetrics{CacheReadTokens: 10, PromptTokens: 100, CacheSupported: true, UsagePresent: true}},
+		{ID: "st-1", StartedAt: started.Add(2 * time.Second), GatewayID: "st", Usage: UsageMetrics{CacheReadTokens: 75, PromptTokens: 100, CacheSupported: true, UsagePresent: true}},
+	} {
+		if err := store.Insert(context.Background(), log); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	metrics, err := store.Metrics(context.Background(), LogFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(metrics.ByGateway) != 2 {
+		t.Fatalf("expected two gateway metric groups, got %+v", metrics.ByGateway)
+	}
+	if got := metrics.ByGateway["oc"].CacheHitRate; got == nil || math.Abs(*got-20) > 0.0001 {
+		t.Fatalf("expected oc hit rate 20%%, got %v", got)
+	}
+	if got := metrics.ByGateway["st"].CacheHitRate; got == nil || math.Abs(*got-75) > 0.0001 {
+		t.Fatalf("expected st hit rate 75%%, got %v", got)
+	}
+}
+
 func TestRequestLogJSONContainsRawBodies(t *testing.T) {
 	log := RequestLog{ID: "raw", RequestBody: []byte(`{"model":"demo"}`), ResponseBody: []byte("data: [DONE]\n")}
 	body, err := json.Marshal(log)

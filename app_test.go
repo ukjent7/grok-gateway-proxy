@@ -192,3 +192,47 @@ func TestGatewayConfigAPIUpdatesUserAgentOverride(t *testing.T) {
 		t.Fatalf("config was not updated: %+v", cfg.Gateways["st"])
 	}
 }
+
+func TestGatewayConfigAPIUpdatesEnvironmentProxySetting(t *testing.T) {
+	cfg := DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
+	app := &App{config: cfg, logger: slog.Default()}
+	req := httptest.NewRequest(http.MethodPatch, "http://127.0.0.1:8787/api/gateways/st", strings.NewReader(`{"use_system_proxy":false}`))
+	recorder := httptest.NewRecorder()
+	app.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if cfg.Gateways["st"].UseSystemProxy {
+		t.Fatal("environment proxy setting should be patched to false")
+	}
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	gateway, ok := response["gateway"].(map[string]any)
+	if !ok || gateway["use_system_proxy"] != false {
+		t.Fatalf("unexpected gateway response: %+v", response)
+	}
+}
+
+func TestGatewayConfigWithoutProxySettingDefaultsToEnvironmentProxy(t *testing.T) {
+	var gateway GatewayConfig
+	if err := json.Unmarshal([]byte(`{"id":"st","prefix":"/st","name":"SenseNova","base_url":"https://example.test","protocol":"chat_completions","enabled":true}`), &gateway); err != nil {
+		t.Fatal(err)
+	}
+	if !gateway.UseSystemProxy {
+		t.Fatal("missing use_system_proxy should preserve the environment-proxy default")
+	}
+}
+
+func TestUpstreamClientProxyModes(t *testing.T) {
+	proxyTransport, ok := newUpstreamClient(true).Transport.(*http.Transport)
+	if !ok || proxyTransport.Proxy == nil {
+		t.Fatal("environment-proxy client must configure a proxy function")
+	}
+	directTransport, ok := newUpstreamClient(false).Transport.(*http.Transport)
+	if !ok || directTransport.Proxy != nil {
+		t.Fatal("direct client must not configure a proxy function")
+	}
+}

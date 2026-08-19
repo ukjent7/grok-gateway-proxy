@@ -35,18 +35,23 @@ type App struct {
 
 func NewApp(config *Config, store *Store, logger *slog.Logger) *App {
 	app := &App{
-		config:    config,
-		store:     store,
-		logger:    logger,
-		proxy:     &Proxy{config: config, store: store, logger: logger, client: newUpstreamClient()},
+		config: config,
+		store:  store,
+		logger: logger,
+		proxy: &Proxy{
+			config:       config,
+			store:        store,
+			logger:       logger,
+			client:       newUpstreamClient(true),
+			directClient: newUpstreamClient(false),
+		},
 		upstreams: make(map[string]upstreamHealth),
 	}
 	return app
 }
 
-func newUpstreamClient() *http.Client {
-	return &http.Client{Transport: &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+func newUpstreamClient(useSystemProxy bool) *http.Client {
+	transport := &http.Transport{
 		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: 60 * time.Second,
@@ -56,7 +61,11 @@ func newUpstreamClient() *http.Client {
 		MaxIdleConnsPerHost:   50,
 		IdleConnTimeout:       90 * time.Second,
 		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
-	}}
+	}
+	if useSystemProxy {
+		transport.Proxy = http.ProxyFromEnvironment
+	}
+	return &http.Client{Transport: transport}
 }
 
 // handleHealth reports liveness plus the most recent reachability probe for
@@ -118,7 +127,7 @@ func (a *App) probeUpstream(id string, gateway GatewayConfig) {
 		// token only when it was set explicitly for the gateway.
 		_ = token
 	}
-	resp, err := a.proxy.client.Do(req)
+	resp, err := a.proxy.clientFor(gateway).Do(req)
 	if err != nil {
 		a.setHealth(id, upstreamHealth{Err: err.Error()})
 		return

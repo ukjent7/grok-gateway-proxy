@@ -246,30 +246,113 @@ SELECT COUNT(*),
        COALESCE(SUM(CASE WHEN cache_supported = 1 THEN 1 ELSE 0 END), 0),
        COALESCE(SUM(CASE WHEN usage_present = 1 THEN 1 ELSE 0 END), 0)
 FROM request_logs`+where, args...)
-	var result Metrics
-	var requests, successes, cacheSupported, usageCalls int64
-	if err := row.Scan(&requests, &successes, &result.InputTokens,
-		&result.PromptTokens, &result.CachePromptTokens, &result.CacheReadTokens, &result.CacheWriteTokens,
-		&result.OutputTokens, &result.ReasoningTokens, &cacheSupported, &usageCalls); err != nil {
+	var aggregate metricsAggregate
+	if err := scanMetricsAggregate(row, &aggregate); err != nil {
 		return Metrics{}, err
 	}
-	result.Requests = requests
-	result.Successes = successes
-	result.Failures = requests - successes
-	result.CacheSupportedCalls = cacheSupported
-	result.UsageCalls = usageCalls
-	if usageCalls > 0 {
-		coverage := float64(cacheSupported) / float64(usageCalls) * 100
-		result.CacheCoveragePercent = &coverage
-	}
-	if cacheSupported > 0 && result.CachePromptTokens > 0 {
-		rate := float64(result.CacheReadTokens) / float64(result.CachePromptTokens) * 100
-		result.CacheHitRate = &rate
-	}
+	result := aggregate.metrics()
 	result.From = filter.From
 	result.To = filter.To
 	result.GatewayID = filter.GatewayID
 	result.Model = filter.Model
+
+	// The unfiltered overview gets one weighted aggregate per gateway in the
+	// same time/model window. Filtered metrics remain a single aggregate.
+	if filter.GatewayID == "" {
+		byGateway, err := s.metricsByGateway(ctx, filter)
+		if err != nil {
+			return Metrics{}, err
+		}
+		result.ByGateway = byGateway
+	}
+	return result, nil
+}
+
+type metricsAggregate struct {
+	requests, successes                                  int64
+	inputTokens, promptTokens                            int64
+	cachePromptTokens, cacheReadTokens, cacheWriteTokens int64
+	outputTokens, reasoningTokens                        int64
+	cacheSupported, usageCalls                           int64
+}
+
+func (a *metricsAggregate) scanArgs() []any {
+	return []any{
+		&a.requests, &a.successes, &a.inputTokens, &a.promptTokens,
+		&a.cachePromptTokens, &a.cacheReadTokens, &a.cacheWriteTokens,
+		&a.outputTokens, &a.reasoningTokens, &a.cacheSupported, &a.usageCalls,
+	}
+}
+
+func scanMetricsAggregate(row scanner, aggregate *metricsAggregate) error {
+	return row.Scan(aggregate.scanArgs()...)
+}
+
+func (a metricsAggregate) metrics() Metrics {
+	result := Metrics{
+		Requests:            a.requests,
+		Successes:           a.successes,
+		Failures:            a.requests - a.successes,
+		InputTokens:         a.inputTokens,
+		PromptTokens:        a.promptTokens,
+		CachePromptTokens:   a.cachePromptTokens,
+		CacheReadTokens:     a.cacheReadTokens,
+		CacheWriteTokens:    a.cacheWriteTokens,
+		OutputTokens:        a.outputTokens,
+		ReasoningTokens:     a.reasoningTokens,
+		CacheSupportedCalls: a.cacheSupported,
+		UsageCalls:          a.usageCalls,
+	}
+	if a.usageCalls > 0 {
+		coverage := float64(a.cacheSupported) / float64(a.usageCalls) * 100
+		result.CacheCoveragePercent = &coverage
+	}
+	if a.cachePromptTokens > 0 {
+		rate := float64(a.cacheReadTokens) / float64(a.cachePromptTokens) * 100
+		result.CacheHitRate = &rate
+	}
+	return result
+}
+
+func (s *Store) metricsByGateway(ctx context.Context, filter LogFilter) (map[string]Metrics, error) {
+	where, args := buildLogFilter(filter)
+	rows, err := s.db.QueryContext(ctx, `
+SELECT gateway_id,
+       COUNT(*),
+       COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(input_tokens), 0),
+       COALESCE(SUM(prompt_tokens), 0),
+       COALESCE(SUM(CASE WHEN cache_supported = 1 THEN prompt_tokens ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN cache_supported = 1 THEN cache_read_tokens ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN cache_supported = 1 THEN cache_write_tokens ELSE 0 END), 0),
+       COALESCE(SUM(output_tokens), 0),
+       COALESCE(SUM(reasoning_tokens), 0),
+       COALESCE(SUM(CASE WHEN cache_supported = 1 THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN usage_present = 1 THEN 1 ELSE 0 END), 0)
+FROM request_logs`+where+` GROUP BY gateway_id ORDER BY gateway_id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string]Metrics)
+	for rows.Next() {
+		var gatewayID string
+		var aggregate metricsAggregate
+		rowArgs := append([]any{&gatewayID}, aggregate.scanArgs()...)
+		if err := rows.Scan(rowArgs...); err != nil {
+			return nil, err
+		}
+		metrics := aggregate.metrics()
+		metrics.From = filter.From
+		metrics.To = filter.To
+		metrics.GatewayID = gatewayID
+		metrics.Model = filter.Model
+		result[gatewayID] = metrics
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
