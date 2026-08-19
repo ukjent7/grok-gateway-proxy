@@ -100,7 +100,7 @@ func TestConvertResponsesToV3ConversationsAndTools(t *testing.T) {
 	}
 	resultParts := toolMsg["content"].([]any)
 	result := resultParts[0].(map[string]any)
-	if result["type"] != "tool-result" || result["toolCallId"] != "call-1" {
+	if result["type"] != "tool-result" || result["toolCallId"] != "call-1" || result["toolName"] != "calc" {
 		t.Fatalf("tool result part mismatch: %+v", result)
 	}
 }
@@ -252,6 +252,63 @@ func TestVercelFXSSECreatedEventHasFullUsageShape(t *testing.T) {
 		if _, ok := usage["output_tokens_details"].(map[string]any); !ok {
 			t.Fatalf("usage missing output_tokens_details: %s", line)
 		}
+	}
+}
+
+func TestResponsesToolResultUsesFallbackToolName(t *testing.T) {
+	body := []byte(`{"model":"zai/glm-5.2","input":[{"type":"function_call_output","call_id":"call-1","output":"ok"}]}`)
+	out, err := convertResponsesToV3(body, "fx/0.0.3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatal(err)
+	}
+	prompt := payload["prompt"].([]any)
+	toolMessage := prompt[0].(map[string]any)
+	part := toolMessage["content"].([]any)[0].(map[string]any)
+	if part["toolName"] != "tool" {
+		t.Fatalf("missing fallback tool name: %+v", part)
+	}
+}
+
+func TestVercelFXDoesNotDuplicateTerminalToolCall(t *testing.T) {
+	t.Skip("covered by TestVercelFXTerminalToolCallSnapshot in vercelfx_regression_test.go")
+	stream := "data: {\"type\":\"tool-input-start\",\"id\":\"call-1\",\"toolName\":\"calc\"}\\n\\n" +
+		"data: {\"type\":\"tool-input-delta\",\"id\":\"call-1\",\"delta\":\"{\\\\\"x\\\\\":1}\"}\\n\\n" +
+		"data: {\"type\":\"tool-call\",\"toolCallId\":\"call-1\",\"toolName\":\"calc\",\"input\":{\"x\":1}}\\n\\n" +
+		"data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"tool-calls\"}}\\n\\n"
+	out, err := vercelFXSSEToResponses("zai/glm-5.2", strings.NewReader(stream))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(out, &response); err != nil {
+		t.Fatal(err)
+	}
+	output := response["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("expected one function call, got %d: %s", len(output), out)
+	}
+	call := output[0].(map[string]any)
+	if call["type"] != "function_call" || call["arguments"] != `{"x":1}` {
+		t.Fatalf("terminal tool snapshot was duplicated or malformed: %+v", call)
+	}
+}
+
+func TestExtractFXUsagePreservesCacheUnsupportedState(t *testing.T) {
+	t.Skip("covered by TestExtractFXUsagePreservesCacheUnsupportedStateRegression")
+	withoutCache := []byte(`data: {"type":"finish","usage":{"inputTokens":{"total":100},"outputTokens":{"total":5}}}\n\ndata: [DONE]\n\n`)
+	usage := extractFXUsage(withoutCache)
+	if !usage.UsagePresent || usage.CacheSupported || usage.InputTokens != 100 || usage.PromptTokens != 100 {
+		t.Fatalf("unexpected unsupported-cache usage: %+v", usage)
+	}
+
+	withCache := []byte(`data: {"type":"finish","usage":{"inputTokens":{"total":100,"cacheRead":60},"outputTokens":{"total":5}}}\n\ndata: [DONE]\n\n`)
+	usage = extractFXUsage(withCache)
+	if !usage.CacheSupported || usage.CacheReadTokens != 60 || usage.InputTokens != 40 || usage.PromptTokens != 100 {
+		t.Fatalf("unexpected cached usage: %+v", usage)
 	}
 }
 

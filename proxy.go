@@ -421,7 +421,15 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *Request
 	}
 	logEntry.Success = upstreamResponse.StatusCode >= 200 && upstreamResponse.StatusCode < 300
 	if logEntry.Success {
-		logEntry.Usage = ExtractUsage(responseBody, protocol)
+		if fxMode {
+			// Keep cache support semantics from the original v3 usage. The
+			// Responses envelope intentionally contains cached_tokens: 0 even
+			// when the upstream omitted cache fields for strict clients, so
+			// extracting from responseBody would falsely report 0% cache hits.
+			logEntry.Usage = extractFXUsage(logEntry.UpstreamResponseBody)
+		} else {
+			logEntry.Usage = ExtractUsage(responseBody, protocol)
+		}
 	}
 	if logEntry.StatusCode >= 400 && logEntry.Error == "" {
 		logEntry.Error = fmt.Sprintf("upstream returned HTTP %d", logEntry.StatusCode)

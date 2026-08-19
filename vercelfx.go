@@ -166,6 +166,7 @@ func responsesInputToV3Prompt(input any, instructions any) []map[string]any {
 	}
 
 	var pendingUser []map[string]any
+	toolNames := map[string]string{}
 	flushUser := func() {
 		if len(pendingUser) > 0 {
 			prompt = append(prompt, map[string]any{"role": "user", "content": pendingUser})
@@ -195,6 +196,17 @@ func responsesInputToV3Prompt(input any, instructions any) []map[string]any {
 		case "function_call":
 			flushUser()
 			args := obj["arguments"]
+			callID := asString(obj["call_id"])
+			if callID == "" {
+				callID = asString(obj["id"])
+			}
+			name := asString(obj["name"])
+			if name == "" {
+				name = "tool"
+			}
+			if callID != "" {
+				toolNames[callID] = name
+			}
 			if argsStr, ok := args.(string); ok {
 				var parsed any
 				if json.Unmarshal([]byte(argsStr), &parsed) == nil {
@@ -209,8 +221,8 @@ func responsesInputToV3Prompt(input any, instructions any) []map[string]any {
 				"content": []map[string]any{
 					{
 						"type":       "tool-call",
-						"toolCallId": asString(obj["call_id"]),
-						"toolName":   asString(obj["name"]),
+						"toolCallId": callID,
+						"toolName":   name,
 						"input":      args,
 					},
 				},
@@ -218,6 +230,17 @@ func responsesInputToV3Prompt(input any, instructions any) []map[string]any {
 		case "function_call_output":
 			flushUser()
 			output := obj["output"]
+			callID := asString(obj["call_id"])
+			if callID == "" {
+				callID = asString(obj["id"])
+			}
+			toolName := asString(obj["name"])
+			if toolName == "" {
+				toolName = toolNames[callID]
+			}
+			if toolName == "" {
+				toolName = "tool"
+			}
 			if output == nil {
 				output = ""
 			}
@@ -231,8 +254,8 @@ func responsesInputToV3Prompt(input any, instructions any) []map[string]any {
 				"content": []map[string]any{
 					{
 						"type":       "tool-result",
-						"toolCallId": asString(obj["call_id"]),
-						"toolName":   asString(obj["name"]),
+						"toolCallId": callID,
+						"toolName":   toolName,
 						"output":     map[string]any{"type": "text", "value": output},
 					},
 				},
@@ -496,29 +519,48 @@ func (s *fxResponseState) apply(ev v3Event) {
 	case "reasoning-delta":
 		s.reasoningParts = append(s.reasoningParts, ev.text())
 	case "tool-input-start":
-		id := asString(ev["id"])
+		id := toolEventID(ev)
 		if id == "" {
 			id = "call_" + fxHex(8)
 		}
+		name := asString(ev["toolName"])
+		if call, exists := s.toolCalls[id]; exists {
+			if name != "" {
+				call["name"] = name
+			}
+			break
+		}
 		s.toolCalls[id] = map[string]any{
 			"id":        id,
-			"name":      asString(ev["toolName"]),
+			"name":      name,
 			"arguments": "",
 		}
 		s.toolOrder = append(s.toolOrder, id)
 	case "tool-input-delta":
-		id := asString(ev["id"])
+		id := toolEventID(ev)
 		if call, ok := s.toolCalls[id]; ok {
 			call["arguments"] = asString(call["arguments"]) + ev.text()
 		}
 	case "tool-call":
-		id := asString(ev["toolCallId"])
+		id := toolEventID(ev)
 		if id == "" {
 			id = "call_" + fxHex(8)
 		}
+		name := asString(ev["toolName"])
+		if call, exists := s.toolCalls[id]; exists {
+			if name != "" {
+				call["name"] = name
+			}
+			// tool-call is a complete snapshot in implementations that also
+			// emit tool-input-delta. Do not append it a second time.
+			if incoming := ev.arguments(); incoming != "" {
+				call["arguments"] = incoming
+			}
+			break
+		}
 		s.toolCalls[id] = map[string]any{
 			"id":        id,
-			"name":      asString(ev["toolName"]),
+			"name":      name,
 			"arguments": ev.arguments(),
 		}
 		s.toolOrder = append(s.toolOrder, id)
@@ -646,6 +688,119 @@ func responsesUsage(v3Usage map[string]any) map[string]any {
 	}
 }
 
+// extractFXUsage reads the original v3 usage object rather than the normalized
+// Responses usage object. The latter must always contain cached_tokens: 0 for
+// strict clients, which would incorrectly mark an upstream response as
+// cache-supported when the gateway did not report cache information.
+func extractFXUsage(body []byte) UsageMetrics {
+	var root map[string]any
+	if json.Unmarshal(body, &root) == nil {
+		if usage, ok := root["usage"].(map[string]any); ok {
+			return extractFXUsageMap(usage)
+		}
+		return UsageMetrics{}
+	}
+
+	var last UsageMetrics
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		if json.Unmarshal([]byte(data), &root) != nil {
+			continue
+		}
+		if usage, ok := root["usage"].(map[string]any); ok {
+			last = extractFXUsageMap(usage)
+		}
+	}
+	return last
+}
+
+func extractFXUsageMap(usage map[string]any) UsageMetrics {
+	result := UsageMetrics{UsagePresent: true}
+	var total, cached, cacheWrite, noCache int64
+	var totalOK, cachedOK, cacheWriteOK, noCacheOK bool
+
+	if input, ok := usage["inputTokens"].(map[string]any); ok {
+		total, totalOK = firstNumberOK(input, "total", "totalTokens", "inputTokens")
+		cached, cachedOK = firstNumberOK(input, "cacheRead", "cache_read", "cacheReadTokens", "cachedTokens")
+		cacheWrite, cacheWriteOK = firstNumberOK(input, "cacheWrite", "cache_write", "cacheWriteTokens")
+		noCache, noCacheOK = firstNumberOK(input, "noCache", "no_cache", "uncached")
+	} else if value, ok := firstNumberOK(usage, "inputTokens", "input_tokens"); ok {
+		total, totalOK = value, true
+	}
+
+	if raw, ok := usage["raw"].(map[string]any); ok {
+		if value, ok := firstNumberOK(raw, "prompt_tokens", "input_tokens"); ok && !totalOK {
+			total, totalOK = value, true
+		}
+		if value, ok := firstNumberOK(raw, "cache_read_input_tokens", "cache_read_tokens"); ok && !cachedOK {
+			cached, cachedOK = value, true
+		}
+		if value, ok := firstNumberOK(raw, "cache_write_input_tokens", "cache_write_tokens"); ok && !cacheWriteOK {
+			cacheWrite, cacheWriteOK = value, true
+		}
+		if details, ok := raw["prompt_tokens_details"].(map[string]any); ok {
+			if value, ok := firstNumberOK(details, "cached_tokens", "cache_read_tokens"); ok && !cachedOK {
+				cached, cachedOK = value, true
+			}
+			if value, ok := firstNumberOK(details, "cache_write_tokens"); ok && !cacheWriteOK {
+				cacheWrite, cacheWriteOK = value, true
+			}
+		}
+	}
+
+	if details, ok := usage["input_tokens_details"].(map[string]any); ok {
+		if value, ok := firstNumberOK(details, "cached_tokens", "cache_read_tokens"); ok && !cachedOK {
+			cached, cachedOK = value, true
+		}
+		if value, ok := firstNumberOK(details, "cache_write_tokens"); ok && !cacheWriteOK {
+			cacheWrite, cacheWriteOK = value, true
+		}
+	}
+
+	if output, ok := usage["outputTokens"].(map[string]any); ok {
+		result.OutputTokens, _ = firstNumberOK(output, "total", "totalTokens", "outputTokens")
+		result.ReasoningTokens, _ = firstNumberOK(output, "reasoning", "reasoningTokens")
+	} else {
+		result.OutputTokens = firstNumber(usage, "output_tokens", "completion_tokens")
+		result.ReasoningTokens = firstNumber(usage, "reasoning_tokens")
+	}
+	if raw, ok := usage["raw"].(map[string]any); ok {
+		if value := firstNumber(raw, "completion_tokens", "output_tokens"); value > 0 {
+			result.OutputTokens = value
+		}
+		if value := firstNumber(raw, "reasoning_tokens"); value > 0 {
+			result.ReasoningTokens = value
+		}
+	}
+
+	if totalOK {
+		result.PromptTokens = total
+		// The v3 gateway explicitly reports noCache for a request that was
+		// fully uncached. A present cacheRead: 0 alone is not evidence that
+		// cache accounting was supported.
+		if noCacheOK && noCache > 0 && cached == 0 {
+			cachedOK = false
+		}
+		if cachedOK {
+			result.CacheReadTokens = cached
+			result.CacheWriteTokens = cacheWrite
+			result.InputTokens = maxInt64(0, total-cached-cacheWrite)
+			result.CacheSupported = true
+			result.CacheSource = "v3.inputTokens"
+		} else {
+			result.InputTokens = total
+		}
+	}
+	return result
+}
+
 // vercelFXSSEToResponses converts a full v3 SSE stream (non-streaming client
 // request) into a Responses JSON object.
 func vercelFXSSEToResponses(model string, reader io.Reader) ([]byte, error) {
@@ -676,6 +831,10 @@ type vercelFXSSEReader struct {
 	messageStarted bool
 	// output_index for the message item
 	messageOutputIndex int
+	// nextOutputIndex is assigned when each Responses output item is first
+	// emitted. It must not be derived from tool count because text and tool
+	// events can arrive in either order.
+	nextOutputIndex int
 	// emitted tool-call ids (for done events)
 	emittedTools []string
 	done         bool
@@ -754,7 +913,8 @@ func (r *vercelFXSSEReader) emit(ev v3Event) {
 		if !r.messageStarted {
 			r.messageStarted = true
 			r.messageID = "msg_" + fxHex(8)
-			r.messageOutputIndex = len(r.state.toolOrder)
+			r.messageOutputIndex = r.nextOutputIndex
+			r.nextOutputIndex++
 			r.writeEvent(map[string]any{
 				"type":         "response.output_item.added",
 				"output_index": r.messageOutputIndex,
@@ -798,26 +958,31 @@ func (r *vercelFXSSEReader) emit(ev v3Event) {
 }
 
 func (r *vercelFXSSEReader) emitToolStart(ev v3Event) {
-	id := asString(ev["id"])
-	if id == "" {
-		id = asString(ev["toolCallId"])
-	}
+	id := toolEventID(ev)
 	if id == "" {
 		id = "call_" + fxHex(8)
 	}
 	name := asString(ev["toolName"])
 	call, exists := r.state.toolCalls[id]
-	if !exists {
-		call = map[string]any{
-			"id":        id,
-			"name":      name,
-			"arguments": "",
-			"fc_id":     "fc_" + fxHex(8),
+	if exists {
+		if name != "" {
+			call["name"] = name
 		}
-		r.state.toolCalls[id] = call
-		r.state.toolOrder = append(r.state.toolOrder, id)
+		// A final tool-call event may follow tool-input-start; it is not a
+		// second output item.
+		return
 	}
-	outputIndex := indexOf(r.state.toolOrder, id)
+	call = map[string]any{
+		"id":           id,
+		"name":         name,
+		"arguments":    "",
+		"fc_id":        "fc_" + fxHex(8),
+		"output_index": r.nextOutputIndex,
+	}
+	r.nextOutputIndex++
+	r.state.toolCalls[id] = call
+	r.state.toolOrder = append(r.state.toolOrder, id)
+	outputIndex := int(asInt64(call["output_index"]))
 	r.writeEvent(map[string]any{
 		"type":         "response.output_item.added",
 		"output_index": outputIndex,
@@ -842,11 +1007,14 @@ func (r *vercelFXSSEReader) emitToolDelta(ev v3Event) {
 		return
 	}
 	delta := ev.arguments()
+	if ev.typeName() == "tool-call" {
+		delta = mergeToolArgumentSnapshot(asString(call["arguments"]), delta)
+	}
 	if delta == "" {
 		return
 	}
 	call["arguments"] = asString(call["arguments"]) + delta
-	outputIndex := indexOf(r.state.toolOrder, id)
+	outputIndex := int(asInt64(call["output_index"]))
 	r.writeEvent(map[string]any{
 		"type":         "response.function_call_arguments.delta",
 		"item_id":      asString(call["fc_id"]),
@@ -864,7 +1032,7 @@ func (r *vercelFXSSEReader) finalize() {
 	r.done = true
 	for _, id := range r.state.toolOrder {
 		call := r.state.toolCalls[id]
-		outputIndex := indexOf(r.state.toolOrder, id)
+		outputIndex := int(asInt64(call["output_index"]))
 		fcID := asString(call["fc_id"])
 		r.writeEvent(map[string]any{
 			"type":         "response.function_call_arguments.done",
@@ -960,6 +1128,33 @@ func asFloat(v any) (float64, bool) {
 		return f, err == nil
 	}
 	return 0, false
+}
+
+func toolEventID(ev v3Event) string {
+	for _, key := range []string{"id", "toolCallId", "call_id"} {
+		if id := asString(ev[key]); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+// mergeToolArgumentSnapshot returns only the suffix not already emitted by
+// tool-input-delta events. A terminal tool-call event carries the complete
+// input in current versions of the v3 protocol.
+func mergeToolArgumentSnapshot(current, snapshot string) string {
+	if snapshot == "" || snapshot == current {
+		return ""
+	}
+	if current == "" {
+		return snapshot
+	}
+	if strings.HasPrefix(snapshot, current) {
+		return snapshot[len(current):]
+	}
+	// Do not append an unrelated complete snapshot: that would make the
+	// Responses function arguments invalid JSON. The deltas remain authoritative.
+	return ""
 }
 
 func indexOf(items []string, target string) int {
