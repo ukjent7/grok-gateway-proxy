@@ -108,6 +108,15 @@ export function renderGatewayCards() {
         '<label>User-Agent 覆盖值</label>' +
         '<input type="text" class="f-ua" value="' + escapeAttr(gw.user_agent_override || '') + '" placeholder="grok-gateway-proxy/dev">' +
       '</div>' +
+      (gw.id === 've' ?
+      '<div class="toggle-row fx-toggle-row">' +
+        '<div><span class="switch-label">FX 免费池伪装（默认关闭）</span><span class="field-hint">开启后把 Vercel 请求改写为官方 fx 客户端协议：覆盖 User-Agent / HTTP-Referer / X-Title 头，并在请求体注入 user-agent 与 x-title，同时把 Responses 协议转换为 v3 language-model 协议发往 /v3/ai/language-model</span></div>' +
+        '<label class="toggle"><input type="checkbox" class="f-fx" ' + (gw.fx_disguise_enabled ? 'checked' : '') + '><span class="toggle-track"></span></label>' +
+      '</div>' +
+      '<div class="field">' +
+        '<label>FX 伪装 User-Agent</label>' +
+        '<input type="text" class="f-fx-ua" value="' + escapeAttr(gw.fx_disguise_user_agent || 'fx/0.0.3') + '" placeholder="fx/0.0.3">' +
+      '</div>' : '') +
       '<div class="field">' +
         '<label>请求头白名单（每行一个）</label>' +
         '<textarea class="f-headers" rows="4" placeholder="Authorization&#10;X-Api-Key">' + escapeHtml(headers) + '</textarea>' +
@@ -156,6 +165,10 @@ async function saveGateway(id, card) {
     use_proxy: card.querySelector('.f-proxy').checked,
     forward_headers: card.querySelector('.f-headers').value.split('\n').map(s => s.trim()).filter(Boolean)
   };
+  const fxToggle = card.querySelector('.f-fx');
+  const fxUA = card.querySelector('.f-fx-ua');
+  if (fxToggle) payload.fx_disguise_enabled = fxToggle.checked;
+  if (fxUA) payload.fx_disguise_user_agent = fxUA.value.trim();
   // 发送前校验；把出错的字段就地标出。
   let ok = true;
   const urlInput = card.querySelector('.f-baseurl');
