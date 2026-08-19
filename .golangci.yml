@@ -1,0 +1,54 @@
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - errcheck
+    - gofmt
+    - goimports
+    - revive
+    - misspell
+    - unconvert
+    - gocritic
+    - bodyclose
+
+linters-settings:
+  govet:
+    enable-all: false
+  goimports:
+    local-prefixes: grok-gateway-proxy
+  revive:
+    severity: warning
+    rules:
+      - name: blank-imports
+      - name: context-as-argument
+      - name: context-keys-type
+      - name: dot-imports
+      - name: error-naming
+      - name: error-return
+      - name: error-strings
+      - name: exported
+        disabled: true
+      - name: increment-decrement
+      - name: range
+      - name: receiver-naming
+      - name: time-naming
+      - name: var-declaration
+      - name: var-naming
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck
+        - gocritic
+    - path: \.go
+      linters:
+        - errcheck
+      text: "rows.Close|rows.Err|w.Write|fmt.Fprint|io.Copy|io.ReadAll"
+  max-issues-per-linter: 0
+  max-same-issues: 0
