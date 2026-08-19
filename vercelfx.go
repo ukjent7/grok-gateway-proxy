@@ -679,6 +679,9 @@ type vercelFXSSEReader struct {
 	// emitted tool-call ids (for done events)
 	emittedTools []string
 	done         bool
+	// sequence is the strictly increasing sequence_number each SSE event
+	// carries, as required by strict Responses clients (async-openai).
+	sequence int64
 }
 
 func newVercelFXSSEReader(reader io.Reader, model string) *vercelFXSSEReader {
@@ -917,6 +920,8 @@ func (r *vercelFXSSEReader) finalize() {
 }
 
 func (r *vercelFXSSEReader) writeEvent(event map[string]any) {
+	event["sequence_number"] = r.sequence
+	r.sequence++
 	data, _ := json.Marshal(event)
 	r.pending.WriteString("event: " + asString(event["type"]) + "\n")
 	r.pending.WriteString("data: ")

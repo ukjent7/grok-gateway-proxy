@@ -184,6 +184,41 @@ func TestVercelFXSSEStreamReaderEmitsResponsesEvents(t *testing.T) {
 	}
 }
 
+// Strict Responses clients (async-openai) require every SSE event to carry a
+// strictly increasing sequence_number, matching what the real Vercel gateway
+// emits.
+func TestVercelFXSSEEventsHaveIncreasingSequenceNumber(t *testing.T) {
+	stream := "data: {\"type\":\"text-delta\",\"delta\":\"a\"}\n\n" +
+		"data: {\"type\":\"text-delta\",\"delta\":\"b\"}\n\n" +
+		"data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":4},\"outputTokens\":{\"total\":1}}}\n\n"
+	reader := newVercelFXSSEReader(strings.NewReader(stream), "zai/glm-5.2")
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lastSeq int64 = -1
+	for _, line := range strings.Split(string(body), "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev); err != nil {
+			t.Fatal(err)
+		}
+		seq, ok := ev["sequence_number"].(float64)
+		if !ok {
+			t.Fatalf("event missing sequence_number: %s", line)
+		}
+		if int64(seq) != lastSeq+1 {
+			t.Fatalf("sequence_number not strictly increasing: got %v after %d: %s", seq, lastSeq, line)
+		}
+		lastSeq = int64(seq)
+	}
+	if lastSeq < 0 {
+		t.Fatal("no SSE events emitted")
+	}
+}
+
 // The async-openai parser deserializes the usage object on response.created
 // strictly, so every usage-bearing event must carry the full details shape.
 func TestVercelFXSSECreatedEventHasFullUsageShape(t *testing.T) {
