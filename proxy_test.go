@@ -120,8 +120,8 @@ func TestProxyCapturesBothSidesAndOverridesUserAgent(t *testing.T) {
 	if string(detail.UpstreamResponseBody) != recorder.Body.String() || string(detail.ResponseBody) != recorder.Body.String() {
 		t.Fatal("upstream and client response bodies were not retained")
 	}
-	if !strings.Contains(detail.UpstreamHeadersActual, "proxy-dev-agent/1") {
-		t.Fatalf("actual upstream headers did not contain overridden user agent: %s", detail.UpstreamHeadersActual)
+	if !strings.Contains(detail.UpstreamHeaders, "proxy-dev-agent/1") {
+		t.Fatalf("upstream headers did not contain overridden user agent: %s", detail.UpstreamHeaders)
 	}
 	if detail.UpstreamResponseStatusCode != http.StatusOK || detail.ClientResponseStatusCode != http.StatusOK {
 		t.Fatalf("response statuses were not captured: upstream=%d client=%d", detail.UpstreamResponseStatusCode, detail.ClientResponseStatusCode)
@@ -488,7 +488,7 @@ func TestProxyAppliesMuseProfileOnlyForMuseModel(t *testing.T) {
 	cfg.Gateways["oc"] = gateway
 	p := &Proxy{config: cfg, store: store, logger: slog.Default(), client: upstream.Client()}
 
-	requestBody := []byte(`{"model":"muse-spark-1.2","stream":true,"stream_tool_calls":true,"input":[]}`)
+	requestBody := []byte(`{"model":"muse-spark-1.2-contributo","stream":true,"stream_tool_calls":true,"input":[]}`)
 	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/oc/responses", strings.NewReader(string(requestBody)))
 	recorder := httptest.NewRecorder()
 	p.ServeHTTP(recorder, req)
@@ -499,7 +499,7 @@ func TestProxyAppliesMuseProfileOnlyForMuseModel(t *testing.T) {
 	if _, exists := upstreamBody["stream_tool_calls"]; exists {
 		t.Fatalf("unsupported Muse parameter reached upstream: %+v", upstreamBody)
 	}
-	if upstreamBody["model"] != "muse-spark-1.2" {
+	if upstreamBody["model"] != "muse-spark-1.2-contributo" {
 		t.Fatalf("upstream model changed unexpectedly: %+v", upstreamBody)
 	}
 

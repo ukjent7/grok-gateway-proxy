@@ -227,14 +227,17 @@ func TestSenseNovaStreamingToolCallContinuationKeepsIdentity(t *testing.T) {
 	}
 }
 
-func TestOpenCodeSelectsMuseProfileByModel(t *testing.T) {
+func TestOpenCodeSelectsMuseProfileByModelPrefix(t *testing.T) {
 	adapter := OpenCodeResponsesAdapter{}
-	profile := adapter.ProfileForModel("muse-spark-1.2")
-	if profile == nil || profile.ID() != "muse-spark-1.2" {
-		t.Fatalf("Muse profile was not selected: %#v", profile)
+	for _, model := range []string{"muse-spark-1.2", "muse-spark-1.2-contributo", "MUSE-SPARK-2.0"} {
+		profile := adapter.ProfileForModel(model)
+		if profile == nil || profile.ID() != "muse-spark-1.2" {
+			t.Fatalf("Muse profile was not selected for %q: %#v", model, profile)
+		}
 	}
 
-	body := []byte(`{"model":"muse-spark-1.2","stream":true,"stream_tool_calls":true,"input":[]}`)
+	body := []byte(`{"model":"muse-spark-1.2-contributo","stream":true,"stream_tool_calls":true,"input":[]}`)
+	profile := adapter.ProfileForModel("muse-spark-1.2-contributo")
 	upstreamBody, err := profile.TransformRequestBody(body)
 	if err != nil {
 		t.Fatal(err)
@@ -242,7 +245,7 @@ func TestOpenCodeSelectsMuseProfileByModel(t *testing.T) {
 	if strings.Contains(string(upstreamBody), `"stream_tool_calls"`) {
 		t.Fatalf("unsupported Muse parameter survived: %s", upstreamBody)
 	}
-	if !strings.Contains(string(upstreamBody), `"model":"muse-spark-1.2"`) {
+	if !strings.Contains(string(upstreamBody), `"model":"muse-spark-1.2-contributo"`) {
 		t.Fatalf("Muse request was changed unexpectedly: %s", upstreamBody)
 	}
 

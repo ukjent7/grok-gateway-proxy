@@ -25,9 +25,16 @@ func (OpenCodeResponsesAdapter) NormalizeError(status int, body []byte) []byte {
 	return normalizeUpstreamError(status, body)
 }
 
+// ProfileForModel selects the compatibility profile by model-name prefix so
+// every model in a family inherits its rules: upstream variants such as
+// muse-spark-1.2-contributo match the "muse-spark" family just like
+// muse-spark-1.2. The OpenCode gateway convention is:
+//   - "muse-spark" prefixed models use the Muse profile;
+//   - "deepseek" prefixed models currently pass through unchanged and get
+//     their own case here as soon as DeepSeek needs protocol deviations.
 func (OpenCodeResponsesAdapter) ProfileForModel(model string) ModelCompatibilityProfile {
-	switch strings.ToLower(strings.TrimSpace(model)) {
-	case "muse-spark-1.2":
+	switch normalized := strings.ToLower(strings.TrimSpace(model)); {
+	case strings.HasPrefix(normalized, "muse-spark"):
 		return MuseSpark12Profile{}
 	default:
 		return nil

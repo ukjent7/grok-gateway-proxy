@@ -12,7 +12,7 @@ The proxy does not provide a models endpoint and does not fetch models from an u
 
 Each adapter preserves its native protocol. `/oc` and `/ve` accept only `POST /responses`; `/st` accepts only `POST /chat/completions`. There is no generic Responses/Chat Completions conversion layer.
 
-OpenCode model compatibility is selected from the request's `model` field. The `muse-spark-1.2` profile removes the unsupported top-level `stream_tool_calls` option before forwarding and filters its `ping` SSE events; other OpenCode models pass through unchanged unless they receive their own profile. Models named `grok` or prefixed with `grok-` are blocked locally and receive an empty completed Responses response without any upstream call.
+OpenCode model compatibility is selected from the request's `model` field by **model-family prefix**, so upstream variants inherit their family's rules automatically (e.g. `muse-spark-1.2-contributo` matches the `muse-spark` family just like `muse-spark-1.2`). Convention: models prefixed `muse-spark` use the Muse profile, which removes the unsupported top-level `stream_tool_calls` option before forwarding and filters its `ping` SSE events; models prefixed `deepseek` currently pass through unchanged and will receive their own rules when needed. Other OpenCode models pass through unchanged unless they receive their own profile. Models named `grok` or prefixed with `grok-` are blocked locally and receive an empty completed Responses response without any upstream call.
 
 The SenseNova adapter includes a narrow compatibility shim for tool-call history: it sends `messages[].tool_calls[].type` as `function_call` upstream and converts it back to `function` for the client, including SSE responses. It also removes empty `id`/function-name fields from SenseNova's streamed tool-call continuation chunks so clients do not overwrite the identity from the first chunk. `tools[].type` is left unchanged. Incomplete historical tool calls (missing `id`, function name, or arguments) and their orphaned `tool` messages are removed before forwarding because SenseNova rejects the whole request otherwise. Both forms remain visible in the request audit record.
 
@@ -51,7 +51,6 @@ docker run --rm -p 8787:8787 -v "$(pwd)/data:/data" grok-gateway-proxy
 | `-shutdown-timeout` | Graceful-shutdown grace period for in-flight requests (default `30s`) |
 | `-log-level` | Log level: `debug`, `info`, `warn`, `error` (default `info`) |
 | `-log-retention-days` / `GROK_PROXY_LOG_RETENTION_DAYS` | Prune logs older than N days on startup and hourly (default `30`; `0` disables pruning) |
-| `GROK_PROXY_API_TOKEN` | Optional management-API bearer token (see below) |
 
 Useful endpoints are`GET /healthz`, `GET /api/config`, `GET /api/metrics`, `GET /api/logs`,
 `GET /api/logs/count`, `GET /api/logs/{id}`, `PATCH /api/proxy`,
@@ -68,9 +67,7 @@ with an `X-Proxy-Timeout` header (up to 30 minutes) for long-running agentic
 streams; there is no fixed client-level timeout that would truncate long
 streams.
 
-The application stores `config.json` and `proxy.db` in the `data` folder under the current working directory by default. Use `-data-dir` to override this location. API keys remain in Grok Build configuration; the proxy forwards allowlisted headers and redacts credentials in the normal log fields.
-
-Set an optional `api_token` in `config.json` to require `Authorization: Bearer <token>` on the management API (`/api/*`). When the token is empty (default) the management API stays open to localhost. The dashboard remembers the token in the browser and prompts for it on `401`; the request/response headers drawer also defaults to the sanitized view with a button to reveal the raw header snapshots.
+The application stores `config.json` and `proxy.db` in the `data` folder under the current working directory by default. Use `-data-dir` to override this location. API keys remain in Grok Build configuration; the proxy forwards allowlisted headers and redacts credentials in the log fields (本地小工具，管理 API 默认开放，仅监听 `127.0.0.1`，无需鉴权)。
 
 The dashboard can edit the three HTTPS upstream URLs, the global HTTP/HTTPS proxy URL, and per-gateway Header allowlists and proxy switches; filter logs/statistics by gateway, model, and time range; show weighted overall and per-gateway cache hit rates and coverage; inspect raw JSON/SSE bodies; and copy Grok Build configuration snippets.
 
@@ -79,7 +76,7 @@ The request detail drawer also provides GitHub-style, change-focused side-by-sid
 - the original client request versus the request actually sent to the upstream;
 - the upstream API response versus the response actually written back to the client.
 
-For development troubleshooting, SQLite keeps the request body, upstream request body, upstream raw response, final client response, statuses, URLs, sanitized headers, and actual header snapshots as separate fields. Existing databases are migrated automatically on startup.
+For development troubleshooting, SQLite keeps the request body, upstream request body, upstream raw response, final client response, statuses, URLs, and sanitized headers as separate fields. Existing databases are migrated automatically on startup (旧版的 `*_actual` 字段保留但不再写入)。
 
 Request bodies are capped at 64 MB (larger requests are rejected with `413`). Response bodies are capped at 64 MB for audit capture only: oversized responses are still forwarded to the client in full, but only the first 64 MB is stored, and the log is flagged with `response_truncated` so a pathological upstream stream cannot balloon proxy memory or the SQLite database.
 
