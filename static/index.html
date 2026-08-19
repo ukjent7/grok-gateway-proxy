@@ -35,10 +35,10 @@
       </div>
     </div>
 
-    <div class="rail-status">
-      <span class="dot dot-live"></span>
-      <span class="rail-status-text">代理监听中</span>
-      <code>online</code>
+    <div class="rail-status" id="railStatus">
+      <span class="dot dot-live" id="healthDot"></span>
+      <span class="rail-status-text" id="healthText">代理监听中</span>
+      <code id="healthCode">online</code>
     </div>
 
     <nav class="rail-nav">
@@ -64,7 +64,7 @@
     <div class="rail-channels" id="railChannels"></div>
 
     <div class="rail-foot">
-      <div class="rail-foot-meta">v2.0 · 本地模式 · Grok Build 就绪</div>
+      <div class="rail-foot-meta" id="railVersion">v— · 本地模式 · Grok Build 就绪</div>
     </div>
   </aside>
 
@@ -261,6 +261,14 @@
               </select>
               <span class="select-caret"><svg viewBox="0 0 16 16" width="11" height="11" fill="none"><path d="m4 6.5 4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
             </div>
+            <div class="datetime-wrap">
+              <input id="filterFrom" type="datetime-local" title="起始时间" aria-label="起始时间">
+              <span class="datetime-sep">–</span>
+              <input id="filterTo" type="datetime-local" title="结束时间" aria-label="结束时间">
+              <button id="filterClearBtn" class="btn-ghost small" type="button" title="清除时间筛选" aria-label="清除时间筛选">
+                <svg viewBox="0 0 16 16" width="11" height="11" fill="none" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+              </button>
+            </div>
           </div>
 
           <div class="table-wrap">
@@ -276,6 +284,7 @@
           </div>
 
           <div class="table-foot">
+            <span class="logs-count" id="logsCount"></span>
             <button id="logsLoadMoreBtn" class="btn-ghost">加载更多</button>
           </div>
         </div>
@@ -312,6 +321,7 @@
             </button>
           </div>
         </div>
+        <div class="setup-baseurl" id="setupBaseUrl"></div>
         <div class="setup-grid" id="setupSnippets"></div>
       </section>
 
@@ -321,7 +331,7 @@
 
 <!-- ===================== 请求详情抽屉 ===================== -->
 <div class="drawer-backdrop" id="drawerBackdrop"></div>
-<aside class="drawer" id="logDrawer" aria-hidden="true">
+<aside class="drawer" id="logDrawer" role="dialog" aria-modal="true" aria-labelledby="drawerTitle" aria-hidden="true">
   <div class="drawer-head">
     <div class="drawer-head-main">
       <div class="drawer-eyebrow">请求详情 <code id="drawerId">—</code></div>
@@ -332,11 +342,15 @@
         <svg viewBox="0 0 16 16" width="11" height="11" fill="none"><path d="M2 5.5h12M2 8h12M2 10.5h8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
         <span class="raw-headers-label">脱敏头</span>
       </button>
+      <button id="drawerCopyCurlBtn" class="btn-ghost small" title="复制 cURL 请求示例">
+        <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><path d="M5 4l-3 4 3 4M11 4l3 4-3 4" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        cURL
+      </button>
       <button id="drawerCopyIdBtn" class="btn-ghost small">
         <svg viewBox="0 0 16 16" width="11" height="11" fill="none"><rect x="5" y="5" width="8" height="8" rx="1.6" stroke="currentColor" stroke-width="1.4"/><path d="M3 11V3.6A1.6 1.6 0 0 1 4.6 2H11" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
         复制 ID
       </button>
-      <button id="drawerCloseBtn" class="btn-icon" title="关闭 (esc)">
+      <button id="drawerCloseBtn" class="btn-icon" title="关闭 (esc)" aria-label="关闭详情面板">
         <svg viewBox="0 0 16 16" width="13" height="13" fill="none"><path d="m4 4 8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
       </button>
     </div>
@@ -362,7 +376,7 @@
 
 <!-- ===================== 命令面板 ===================== -->
 <div class="cmdk-backdrop" id="cmdkBackdrop"></div>
-<div class="cmdk" id="cmdk" aria-hidden="true">
+<div class="cmdk" id="cmdk" role="dialog" aria-modal="true" aria-label="命令面板" aria-hidden="true">
   <div class="cmdk-input-wrap">
     <svg viewBox="0 0 16 16" width="15" height="15" fill="none"><circle cx="7" cy="7" r="4.4" stroke="currentColor" stroke-width="1.5"/><path d="m10.5 10.5 3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
     <input id="cmdkInput" type="text" placeholder="输入命令或搜索…" autocomplete="off" spellcheck="false">
@@ -375,8 +389,8 @@
   </div>
 </div>
 
-<div class="toast-stack" id="toastStack"></div>
+<div class="toast-stack" id="toastStack" aria-live="polite"></div>
 
-<script src="/static/app.js"></script>
+<script type="module" src="/static/js/app.js"></script>
 </body>
 </html>
