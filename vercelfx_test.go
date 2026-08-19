@@ -184,6 +184,42 @@ func TestVercelFXSSEStreamReaderEmitsResponsesEvents(t *testing.T) {
 	}
 }
 
+// The async-openai parser deserializes the usage object on response.created
+// strictly, so every usage-bearing event must carry the full details shape.
+func TestVercelFXSSECreatedEventHasFullUsageShape(t *testing.T) {
+	stream := "data: {\"type\":\"text-delta\",\"delta\":\"hi\"}\n\n" +
+		"data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":4},\"outputTokens\":{\"total\":1}}}\n\n"
+	reader := newVercelFXSSEReader(strings.NewReader(stream), "zai/glm-5.2")
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := string(body)
+	for _, line := range strings.Split(result, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev); err != nil {
+			t.Fatal(err)
+		}
+		resp, ok := ev["response"].(map[string]any)
+		if !ok {
+			continue
+		}
+		usage, ok := resp["usage"].(map[string]any)
+		if !ok {
+			t.Fatalf("response event missing usage: %s", line)
+		}
+		if _, ok := usage["input_tokens_details"].(map[string]any); !ok {
+			t.Fatalf("usage missing input_tokens_details: %s", line)
+		}
+		if _, ok := usage["output_tokens_details"].(map[string]any); !ok {
+			t.Fatalf("usage missing output_tokens_details: %s", line)
+		}
+	}
+}
+
 func TestProxyVercelFXDisguiseEndToEnd(t *testing.T) {
 	var gotPath, gotUA, gotReferer, gotTitle string
 	var gotBody map[string]any
