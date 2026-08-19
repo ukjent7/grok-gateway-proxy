@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 )
@@ -43,5 +42,5 @@ func (SenseNovaChatAdapter) TransformResponseBody(body []byte) ([]byte, error) {
 }
 
 func (SenseNovaChatAdapter) TransformSSE(reader io.Reader) io.Reader {
-	return &senseNovaSSEReader{reader: bufio.NewReaderSize(reader, 64*1024)}
+	return newSSELineTransformer(reader, transformSenseNovaSSELine, nil, nil)
 }

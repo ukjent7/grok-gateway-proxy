@@ -140,7 +140,7 @@ func TestHealthzReportsGatewayStatus(t *testing.T) {
 func TestGatewayConfigAPIUpdatesUserAgentOverride(t *testing.T) {
 	cfg := DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
 	app := &App{config: cfg, logger: slog.Default()}
-	req := httptest.NewRequest(http.MethodPut, "http://127.0.0.1:8787/api/gateways", strings.NewReader(`{"gateways":{"st":{"name":"SenseNova","base_url":"https://token.sensenova.cn/v1","enabled":true,"forward_headers":[],"user_agent_override_enabled":true,"user_agent_override":"debug-agent/1"}}}`))
+	req := httptest.NewRequest(http.MethodPatch, "http://127.0.0.1:8787/api/gateways/st", strings.NewReader(`{"user_agent_override_enabled":true,"user_agent_override":"debug-agent/1"}`))
 	recorder := httptest.NewRecorder()
 	app.ServeHTTP(recorder, req)
 
@@ -151,13 +151,9 @@ func TestGatewayConfigAPIUpdatesUserAgentOverride(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	gateways, ok := response["gateways"].(map[string]any)
-	if !ok {
-		t.Fatalf("unexpected gateways response: %+v", response)
-	}
-	st, ok := gateways["st"].(map[string]any)
+	st, ok := response["gateway"].(map[string]any)
 	if !ok || st["user_agent_override_enabled"] != true || st["user_agent_override"] != "debug-agent/1" {
-		t.Fatalf("unexpected config response: %+v", response)
+		t.Fatalf("unexpected gateway response: %+v", response)
 	}
 	if !cfg.Gateways["st"].UserAgentOverrideEnabled || cfg.Gateways["st"].UserAgentOverride != "debug-agent/1" {
 		t.Fatalf("config was not updated: %+v", cfg.Gateways["st"])

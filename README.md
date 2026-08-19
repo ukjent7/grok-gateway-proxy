@@ -38,7 +38,7 @@ Open <http://127.0.0.1:8787/> for the dashboard.
 
 Useful endpoints are`GET /healthz`, `GET /api/config`, `GET /api/metrics`, `GET /api/logs`,
 `GET /api/logs/count`, `GET /api/logs/{id}`, `PATCH /api/proxy`,
-`PUT /api/gateways`, `PATCH /api/gateways/{id}`, and `DELETE /api/logs`.
+`PATCH /api/gateways/{id}`, and `DELETE /api/logs`.
 
 
 `GET /healthz` returns `{"status":"ok","upstreams":{...}}` where each entry
@@ -46,10 +46,12 @@ reports the last background probe of that gateway's `/models` endpoint
 (reachability and last HTTP status); probes run at startup and every 30s and
 never block the request.
 
-Upstream request deadlines default to 5 minutes and can be raised per request
-with an `X-Proxy-Timeout` header (up to 30 minutes) for long-running agentic
-streams; there is no fixed client-level timeout that would truncate long
-streams.
+Upstream request deadlines default to 5 minutes for non-streaming requests
+and can be raised per request with an `X-Proxy-Timeout` header (up to 30
+minutes). Streaming requests are not subject to this total deadline: the
+client enforces its own 300s *idle* timeout (only while the stream is silent),
+so an active stream is only cut off by client disconnect or the 60s
+first-byte timeout — not by an elapsed-time cap.
 
 The application stores `config.json` and `proxy.db` in the `data` folder under the current working directory by default. Use `-data-dir` to override this location. API keys remain in Grok Build configuration; the proxy forwards allowlisted headers and redacts credentials in the log fields (本地小工具，管理 API 默认开放，仅监听 `127.0.0.1`，无需鉴权)。
 

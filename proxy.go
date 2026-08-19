@@ -134,12 +134,23 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Bound the whole upstream exchange (headers + full body) by a timeout a
-	// client may extend via X-Proxy-Timeout. The cancel is deferred here so the
-	// deadline stays in effect for the entire Do and body read in
-	// forwardUpstreamResponse, rather than being cancelled the moment
-	// buildUpstreamRequest returns.
-	upstreamCtx, cancel := context.WithTimeout(r.Context(), p.upstreamTimeout(r))
+	// Non-streaming responses are bounded by a total deadline (overridable via
+	// X-Proxy-Timeout). Streaming responses are deliberately NOT given a total
+	// deadline: the client enforces a 300s idle timeout (only while the stream
+	// is silent), so a total cap here would truncate long, still-active streams
+	// mid-response and make the client synthesize a retriable "No
+	// ResponseCompleted" error. For streams we rely on client disconnect
+	// (r.Context() cancel) plus the transport's ResponseHeaderTimeout for the
+	// first byte. cancel is deferred so the deadline (non-stream) stays in
+	// effect for the entire Do and body read in forwardUpstreamResponse, rather
+	// than being cancelled the moment buildUpstreamRequest returns.
+	upstreamCtx := r.Context()
+	var cancel context.CancelFunc
+	if logEntry.Stream {
+		cancel = func() {}
+	} else {
+		upstreamCtx, cancel = context.WithTimeout(r.Context(), p.upstreamTimeout(r))
+	}
 	defer cancel()
 
 	upstreamRequest, err := p.buildUpstreamRequest(upstreamCtx, r, gateway, subpath, adapter, requestBody, &logEntry)
@@ -207,8 +218,10 @@ func (p *Proxy) buildUpstreamRequest(ctx context.Context, r *http.Request, gatew
 	}
 	logEntry.UpstreamBody = append([]byte(nil), upstreamBody...)
 
-	// The caller supplies an already timeout-bounded context, so the deadline
-	// survives until the upstream response body has been fully read.
+	// The caller supplies the context that bounds the whole exchange: a
+	// deadline-bounded one for non-streaming requests, the raw request
+	// context for streams. Either way it stays in effect until the upstream
+	// response body has been fully read.
 	upstreamRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(upstreamBody))
 	if err != nil {
 		return nil, &statusError{status: http.StatusBadGateway, message: err.Error()}

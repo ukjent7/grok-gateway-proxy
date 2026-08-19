@@ -1,12 +1,16 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 )
 
-// OpenCodeResponsesAdapter handles the OpenCode Zen gateway (Responses protocol).
-// No request/response transformation is needed — the protocol passes through.
+// OpenCodeResponsesAdapter handles the OpenCode Zen gateway (Responses
+// protocol). The protocol itself passes through unchanged; the only
+// deviation is a minimal per-model-family fix for Muse models (see
+// isMuseSparkModel below).
 type OpenCodeResponsesAdapter struct{}
 
 func (OpenCodeResponsesAdapter) ID() string           { return "OpenCodeResponsesAdapter" }
@@ -25,18 +29,44 @@ func (OpenCodeResponsesAdapter) NormalizeError(status int, body []byte) []byte {
 	return normalizeUpstreamError(status, body)
 }
 
-// ProfileForModel selects the compatibility profile by model-name prefix so
-// every model in a family inherits its rules: upstream variants such as
-// muse-spark-1.2-contributo match the "muse-spark" family just like
-// muse-spark-1.2. The OpenCode gateway convention is:
-//   - "muse-spark" prefixed models use the Muse profile;
-//   - "deepseek" prefixed models currently pass through unchanged and get
-//     their own case here as soon as DeepSeek needs protocol deviations.
-func (OpenCodeResponsesAdapter) ProfileForModel(model string) ModelCompatibilityProfile {
-	switch normalized := strings.ToLower(strings.TrimSpace(model)); {
-	case strings.HasPrefix(normalized, "muse-spark"):
-		return MuseSpark12Profile{}
-	default:
-		return nil
+// isMuseSparkModel reports whether the model belongs to the Muse family by
+// name prefix, so upstream variants such as muse-spark-1.2-contributo match
+// the "muse-spark" family just like muse-spark-1.2. "deepseek"-prefixed
+// models currently pass through unchanged and get their own case here as
+// soon as they need protocol deviations.
+func isMuseSparkModel(model string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "muse-spark")
+}
+
+// TransformModelRequest removes the client-only stream_tool_calls option
+// that Muse models reject. Requests without the field, and every non-Muse
+// model, pass through byte-for-byte.
+func (OpenCodeResponsesAdapter) TransformModelRequest(model string, body []byte) ([]byte, error) {
+	if !isMuseSparkModel(model) {
+		return body, nil
 	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body, nil
+	}
+	if _, exists := payload["stream_tool_calls"]; !exists {
+		return body, nil
+	}
+	delete(payload, "stream_tool_calls")
+	return json.Marshal(payload)
+}
+
+// TransformModelResponse is a pass-through; Muse models need no response-side
+// fix today.
+func (OpenCodeResponsesAdapter) TransformModelResponse(_ string, body []byte) ([]byte, error) {
+	return body, nil
+}
+
+// TransformModelSSE drops the ping keepalive events the gateway injects for
+// Muse models. Non-Muse models pass through untouched.
+func (OpenCodeResponsesAdapter) TransformModelSSE(model string, reader io.Reader) io.Reader {
+	if !isMuseSparkModel(model) {
+		return reader
+	}
+	return newMuseSSEReader(reader)
 }

@@ -6,11 +6,13 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -56,6 +58,12 @@ func main() {
 	}
 	if *listen != "" {
 		cfg.ListenAddr = *listen
+	}
+	if !isLoopbackAddr(cfg.ListenAddr) {
+		logger.Warn(
+			"非回环监听地址：管理 API（/api/*）无鉴权，含改网关配置、读全部请求/响应体（含完整 prompt）、清日志等，切勿暴露到网络",
+			"addr", cfg.ListenAddr,
+		)
 	}
 	if err := os.MkdirAll(dataPath, 0o700); err != nil {
 		logger.Error("create data directory", "error", err)
@@ -151,4 +159,19 @@ func parseLogLevel(level string) slog.Level {
 
 func defaultDataDir() string {
 	return filepath.Join(".", "data")
+}
+
+// isLoopbackAddr 判断监听地址是否仅回环（127.0.0.0/8、::1 或 localhost）。
+// 无法解析时保守返回 true（不告警），避免误报。
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.TrimSpace(host)
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip == nil || ip.IsLoopback()
 }

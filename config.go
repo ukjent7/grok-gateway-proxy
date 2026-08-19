@@ -21,32 +21,6 @@ const (
 
 const defaultUpstreamTimeout = 5 * time.Minute
 
-type RetryConfig struct {
-	Retries    int           `json:"retries"`
-	RetryDelay time.Duration `json:"retry_delay"`
-	Backoff    bool          `json:"backoff"`
-	MaxBackoff time.Duration `json:"max_backoff"`
-}
-
-// DefaultRetryConfig is used when the config file has no retry section.
-func DefaultRetryConfig() RetryConfig {
-	return RetryConfig{Retries: 2, RetryDelay: 500 * time.Millisecond, Backoff: true, MaxBackoff: 8 * time.Second}
-}
-
-// retryFor reports whether a response status is one worth retrying. It is
-// available for callers (e.g. a future client-side retry loop) but the proxy
-// itself does not currently auto-retry upstream calls.
-func (r RetryConfig) retryFor(status int) bool {
-	if r.Retries <= 0 {
-		return false
-	}
-	switch status {
-	case 429, 500, 502, 503, 504:
-		return true
-	}
-	return false
-}
-
 type GatewayConfig struct {
 	ID                       string   `json:"id"`
 	Prefix                   string   `json:"prefix"`
@@ -88,9 +62,7 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 type Config struct {
 	ListenAddr      string                   `json:"listen_addr"`
 	ProxyURL        string                   `json:"proxy_url,omitempty"`
-	APIToken        string                   `json:"api_token,omitempty"`
 	UpstreamTimeout time.Duration            `json:"-"`
-	Retry           RetryConfig              `json:"retry"`
 	LogRetention    time.Duration            `json:"-"`
 	ConfigPath      string                   `json:"-"`
 	Gateways        map[string]GatewayConfig `json:"gateways"`
@@ -141,7 +113,6 @@ func DefaultConfig(path string) *Config {
 	return &Config{
 		ListenAddr:      "127.0.0.1:8787",
 		UpstreamTimeout: defaultUpstreamTimeout,
-		Retry:           DefaultRetryConfig(),
 		LogRetention:    30 * 24 * time.Hour,
 		ConfigPath:      path,
 		Gateways:        buildDefaultGateways(),
@@ -162,14 +133,9 @@ func LoadConfig(path string, logRetentionDays int) (*Config, error) {
 	var disk struct {
 		ListenAddr       string                   `json:"listen_addr"`
 		ProxyURL         string                   `json:"proxy_url"`
-		APIToken         string                   `json:"api_token"`
 		UpstreamTimeoutS int                      `json:"upstream_timeout_seconds"`
-		Retry            *RetryConfig             `json:"retry"`
 		LogRetentionDays *int                     `json:"log_retention_days"`
 		Gateways         map[string]GatewayConfig `json:"gateways"`
-		// These fields are read only to migrate the previous global setting.
-		LegacyUserAgentOverrideEnabled bool   `json:"user_agent_override_enabled"`
-		LegacyUserAgentOverride        string `json:"user_agent_override"`
 	}
 	if err := json.Unmarshal(b, &disk); err != nil {
 		return nil, fmt.Errorf("decode config: %w", err)
@@ -178,7 +144,6 @@ func LoadConfig(path string, logRetentionDays int) (*Config, error) {
 		cfg.ListenAddr = disk.ListenAddr
 	}
 	cfg.ProxyURL = strings.TrimSpace(disk.ProxyURL)
-	cfg.APIToken = disk.APIToken
 	if disk.UpstreamTimeoutS > 0 {
 		cfg.UpstreamTimeout = time.Duration(disk.UpstreamTimeoutS) * time.Second
 	}
@@ -187,18 +152,6 @@ func LoadConfig(path string, logRetentionDays int) (*Config, error) {
 			return nil, errors.New("invalid config: log_retention_days must be >= 0")
 		}
 		cfg.LogRetention = time.Duration(*disk.LogRetentionDays) * 24 * time.Hour
-	}
-	if disk.Retry != nil {
-		if disk.Retry.Retries < 0 {
-			return nil, fmt.Errorf("invalid config: retry.retries must be >= 0")
-		}
-		if disk.Retry.RetryDelay < 0 || disk.Retry.MaxBackoff < 0 {
-			return nil, errors.New("invalid config: retry delays must be non-negative")
-		}
-		if disk.Retry.MaxBackoff > 0 && disk.Retry.RetryDelay > disk.Retry.MaxBackoff {
-			return nil, errors.New("invalid config: retry.retry_delay cannot exceed retry.max_backoff")
-		}
-		cfg.Retry = *disk.Retry
 	}
 	for id, gateway := range disk.Gateways {
 		if defaultGateway, ok := defaultGateways[id]; ok {
@@ -238,17 +191,13 @@ func (c *Config) saveLocked() error {
 	b, err := json.MarshalIndent(struct {
 		ListenAddr             string                   `json:"listen_addr"`
 		ProxyURL               string                   `json:"proxy_url,omitempty"`
-		APIToken               string                   `json:"api_token,omitempty"`
 		UpstreamTimeoutSeconds int                      `json:"upstream_timeout_seconds,omitempty"`
-		Retry                  *RetryConfig             `json:"retry,omitempty"`
 		LogRetentionDays       int                      `json:"log_retention_days"`
 		Gateways               map[string]GatewayConfig `json:"gateways"`
 	}{
 		ListenAddr:             c.ListenAddr,
 		ProxyURL:               c.ProxyURL,
-		APIToken:               c.APIToken,
 		UpstreamTimeoutSeconds: int(c.UpstreamTimeout / time.Second),
-		Retry:                  &c.Retry,
 		LogRetentionDays:       int(c.LogRetention / (24 * time.Hour)),
 		Gateways:               c.Gateways,
 	}, "", "  ")
@@ -329,25 +278,6 @@ func (c *Config) Snapshot() map[string]GatewayConfig {
 	return result
 }
 
-// UpdateGateways replaces gateways from the provided map (any gateway not
-// present keeps its current value) and persists the result. The whole
-// read-modify-validate-write cycle runs under a single write lock so
-// concurrent updates cannot race or clobber each other.
-func (c *Config) UpdateGateways(gateways map[string]GatewayConfig) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	updated := make(map[string]GatewayConfig, len(c.Gateways))
-	for id, current := range c.Gateways {
-		candidate, ok := gateways[id]
-		if !ok {
-			candidate = current
-		}
-		updated[id] = normalizeGateway(id, current, candidate)
-	}
-	return c.commitLocked(updated)
-}
-
 // GatewayPatch contains the mutable gateway fields that can be updated
 // partially. Nil fields are left unchanged.
 type GatewayPatch struct {
@@ -407,24 +337,6 @@ func (c *Config) PatchGateway(id string, patch GatewayPatch) (GatewayConfig, err
 	return updated[id], nil
 }
 
-// UpdateGateway updates a single gateway (by id) and persists the result.
-// Unknown ids are rejected.
-func (c *Config) UpdateGateway(id string, gateway GatewayConfig) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	current, ok := c.Gateways[id]
-	if !ok {
-		return fmt.Errorf("unknown gateway %q", id)
-	}
-	updated := make(map[string]GatewayConfig, len(c.Gateways))
-	for k, v := range c.Gateways {
-		updated[k] = v
-	}
-	updated[id] = normalizeGateway(id, current, gateway)
-	return c.commitLocked(updated)
-}
-
 // normalizeGateway pins the immutable identity fields (id/prefix/protocol) to
 // the known gateway and falls back to the current name when the candidate
 // omits it.
@@ -466,22 +378,6 @@ func (c *Config) SetProxyURL(proxyURL string) error {
 	c.ProxyURL = proxyURL
 	if err := c.saveLocked(); err != nil {
 		c.ProxyURL = old
-		return err
-	}
-	return nil
-}
-
-// SetListenAddr atomically updates the listen address and persists it.
-func (c *Config) SetListenAddr(addr string) error {
-	if err := validateConfig(addr, nil); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	old := c.ListenAddr
-	c.ListenAddr = addr
-	if err := c.saveLocked(); err != nil {
-		c.ListenAddr = old
 		return err
 	}
 	return nil

@@ -255,6 +255,9 @@ func TestStoreCountRespectsFilters(t *testing.T) {
 		{name: "all", filter: LogFilter{}, want: 3},
 		{name: "gateway", filter: LogFilter{GatewayID: "st"}, want: 2},
 		{name: "model", filter: LogFilter{Model: "m2"}, want: 1},
+		{name: "model substring", filter: LogFilter{Model: "m"}, want: 3},
+		{name: "status success", filter: LogFilter{Status: "success"}, want: 2},
+		{name: "status failure", filter: LogFilter{Status: "failure"}, want: 1},
 		{name: "time range", filter: LogFilter{From: ptrTime(now.Add(-90 * time.Minute))}, want: 2},
 	}
 	for _, tc := range cases {
@@ -265,6 +268,30 @@ func TestStoreCountRespectsFilters(t *testing.T) {
 		if n != tc.want {
 			t.Errorf("%s: Count = %d, want %d", tc.name, n, tc.want)
 		}
+	}
+}
+
+// Model filter is a substring match with LIKE wildcards escaped, so a literal
+// underscore in the query matches itself and not any single character.
+func TestStoreCountEscapesLikeWildcards(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Nanosecond)
+	for _, id := range []string{"demo_x", "demoX"} {
+		if err := store.Insert(context.Background(), RequestLog{ID: id, StartedAt: now, Model: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A literal underscore must not act as a single-character wildcard.
+	if n, _ := store.Count(context.Background(), LogFilter{Model: "demo_x"}); n != 1 {
+		t.Fatalf("underscore not escaped: got %d, want 1", n)
+	}
+	if n, _ := store.Count(context.Background(), LogFilter{Model: "demo"}); n != 2 {
+		t.Fatalf("substring match failed: got %d, want 2", n)
 	}
 }
 
@@ -351,6 +378,63 @@ func TestStoreCheckpointWALIsNoError(t *testing.T) {
 	defer store.Close()
 	if err := store.CheckpointWAL(context.Background()); err != nil {
 		t.Fatalf("unexpected checkpoint error: %v", err)
+	}
+}
+
+// 已带 schema_version 标记的库再次打开时，不应重复执行全表回填/脱敏扫描：
+// 手工写入的"脏"数据（缺失的派生状态码、未脱敏凭据）必须保持原样。
+func TestStoreSkipsDataMigrationWhenAlreadyMigrated(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "proxy.db")
+	store, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 手工写入一行模拟"旧构建遗留"的脏数据。
+	legacy, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`INSERT INTO request_logs (
+		id, started_at, gateway_id, gateway_name, prefix, ingress_protocol, upstream_protocol,
+		model, request_path, request_url, upstream_url, method, status_code, success, stream,
+		duration_ms, request_headers, request_body, upstream_headers, upstream_body,
+		upstream_response_headers, upstream_response_body, response_headers, response_body,
+		error, input_tokens, cache_read_tokens, cache_write_tokens, prompt_tokens,
+		output_tokens, reasoning_tokens, cache_supported, usage_present, cache_source
+	) VALUES ('dirty', ?, 'st', 'seed', '/st', 'chat_completions', 'chat_completions',
+		'm', '/chat/completions', '', 'https://example.test/v1/chat/completions', 'POST',
+		200, 1, 0, 0, '{"Authorization":["Bearer secret"]}', X'7b7d', '{}', X'7b7d', '{}', X'7b7d', '{}', X'7b7d',
+		'', 0, 0, 0, 0, 0, 0, 0, 0, '')`, time.Now().UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		legacy.Close()
+		t.Fatal(err)
+	}
+	legacy.Close()
+
+	// 重新打开：已有版本标记，数据迁移必须被跳过。
+	store, err = OpenStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var headers string
+	if err := store.db.QueryRow(`SELECT request_headers FROM request_logs WHERE id = 'dirty'`).Scan(&headers); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(headers, "Bearer secret") {
+		t.Fatalf("已迁移库不应再被扫描脱敏: %s", headers)
+	}
+	var clientStatus int
+	if err := store.db.QueryRow(`SELECT client_response_status_code FROM request_logs WHERE id = 'dirty'`).Scan(&clientStatus); err != nil {
+		t.Fatal(err)
+	}
+	if clientStatus != 0 {
+		t.Fatalf("已迁移库不应再被回填: client_response_status_code = %d", clientStatus)
 	}
 }
 

@@ -97,21 +97,52 @@ CREATE INDEX IF NOT EXISTS idx_request_logs_model ON request_logs(model);
 			return err
 		}
 	}
-	_, err = s.db.Exec(`
+	// One-time data migrations, guarded by a version marker so that the
+	// full-table scans only run when upgrading from an older build, not on
+	// every startup.
+	return s.migrateDataIfNeeded()
+}
+
+const currentSchemaVersion = 1
+
+// migrateDataIfNeeded runs one-time data migrations for existing databases:
+// backfilling columns added after the initial schema, and scrubbing
+// credentials that may have been stored before write-time header
+// sanitization existed. The schema_version marker in proxy_meta makes each
+// migration run exactly once per database.
+func (s *Store) migrateDataIfNeeded() error {
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS proxy_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`); err != nil {
+		return err
+	}
+	var version int
+	err := s.db.QueryRow(`SELECT value FROM proxy_meta WHERE key = 'schema_version'`).Scan(&version)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if version >= currentSchemaVersion {
+		return nil
+	}
+
+	// Backfill rows written by older builds that predate the extra columns.
+	if _, err := s.db.Exec(`
 UPDATE request_logs
 SET client_response_status_code = CASE WHEN client_response_status_code = 0 THEN status_code ELSE client_response_status_code END,
     upstream_response_status_code = CASE WHEN upstream_response_status_code = 0 THEN status_code ELSE upstream_response_status_code END,
     upstream_response_headers = CASE WHEN upstream_response_headers = '' THEN response_headers ELSE upstream_response_headers END,
     upstream_response_body = CASE WHEN length(upstream_response_body) = 0 THEN response_body ELSE upstream_response_body END
 WHERE client_response_status_code = 0 OR upstream_response_status_code = 0
-`)
-	if err != nil {
+`); err != nil {
 		return err
 	}
-	// Scrub credentials that may have been stored before write-time header
-	// sanitization existed (the legacy *_actual columns) and keep the current
-	// columns clean as defense in depth.
-	return s.scrubStoredHeaderCredentials()
+	// Scrub credentials stored before write-time sanitization existed.
+	if err := s.scrubStoredHeaderCredentials(); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(
+		`INSERT INTO proxy_meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		strconv.Itoa(currentSchemaVersion),
+	)
+	return err
 }
 
 func (s *Store) addColumnIfMissing(name, definition string) error {
@@ -469,20 +500,30 @@ func buildLogFilter(filter LogFilter) (string, []any) {
 		args = append(args, filter.GatewayID)
 	}
 	if filter.Model != "" {
-		conditions = append(conditions, "model = ?")
-		args = append(args, filter.Model)
+		// 前端把模型筛选当作"搜索"用，所以用 LIKE 子串匹配并对通配符转义，
+		// 否则输入 grok-4 匹配不到 grok-4.6。
+		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(filter.Model)
+		conditions = append(conditions, "model LIKE ? ESCAPE '\\'")
+		args = append(args, "%"+escaped+"%")
 	}
 	if filter.Status != "" {
-		if strings.HasSuffix(filter.Status, "xx") && len(filter.Status) == 3 {
-			prefix := strings.TrimSuffix(filter.Status, "xx")
-			if _, err := strconv.Atoi(prefix); err == nil {
-				conditions = append(conditions, "status_code >= ? AND status_code < ?")
-				base, _ := strconv.Atoi(prefix)
-				args = append(args, base*100, (base+1)*100)
+		switch strings.ToLower(filter.Status) {
+		case "success":
+			conditions = append(conditions, "success = 1")
+		case "failure":
+			conditions = append(conditions, "success = 0")
+		default:
+			if strings.HasSuffix(filter.Status, "xx") && len(filter.Status) == 3 {
+				prefix := strings.TrimSuffix(filter.Status, "xx")
+				if _, err := strconv.Atoi(prefix); err == nil {
+					conditions = append(conditions, "status_code >= ? AND status_code < ?")
+					base, _ := strconv.Atoi(prefix)
+					args = append(args, base*100, (base+1)*100)
+				}
+			} else if status, err := strconv.Atoi(filter.Status); err == nil {
+				conditions = append(conditions, "status_code = ?")
+				args = append(args, status)
 			}
-		} else if status, err := strconv.Atoi(filter.Status); err == nil {
-			conditions = append(conditions, "status_code = ?")
-			args = append(args, status)
 		}
 	}
 	if filter.From != nil {

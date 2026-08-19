@@ -4,37 +4,126 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"io"
 	"strings"
 )
 
-// sse.go contains the line-level SSE readers used by the gateway adapters.
+// sse.go contains the line-level SSE pass-through reader used by the gateway
+// adapters. The proxy forwards the upstream stream byte-for-byte except for
+// minimal, targeted rewrites: at most one injected per-line transform plus an
+// optional ping-keepalive filter.
 
-type senseNovaSSEReader struct {
-	reader  *bufio.Reader
-	pending bytes.Buffer
-	done    bool
-	err     error
+// sseLineTransformer buffers the upstream stream line by line, applies an
+// optional per-line transform, and drops keepalive ping events announced
+// either by an `event: ping` line (isPingEvent) or by their `data:` payload
+// (isPingPayload). When a ping is dropped, the blank line terminating the
+// event is consumed as well so the stream stays byte-identical apart from the
+// removed event.
+type sseLineTransformer struct {
+	reader        *bufio.Reader
+	pending       bytes.Buffer
+	eventLine     []byte
+	skipBlank     bool
+	done          bool
+	err           error
+	transformLine func([]byte) []byte
+	isPingEvent   func(trimmed []byte) bool
+	isPingPayload func(payload []byte) bool
 }
 
-func (r *senseNovaSSEReader) Read(p []byte) (int, error) {
-	if r.pending.Len() > 0 {
-		return r.pending.Read(p)
+func newSSELineTransformer(reader io.Reader, transformLine func([]byte) []byte, isPingEvent, isPingPayload func([]byte) bool) *sseLineTransformer {
+	return &sseLineTransformer{
+		reader:        bufio.NewReaderSize(reader, 64*1024),
+		transformLine: transformLine,
+		isPingEvent:   isPingEvent,
+		isPingPayload: isPingPayload,
 	}
-	if r.done {
-		return 0, r.err
+}
+
+// newMuseSSEReader passes the stream through unchanged except for dropping
+// ping keepalives (`event: ping` lines or `data: ping` payloads).
+func newMuseSSEReader(reader io.Reader) io.Reader {
+	return newSSELineTransformer(reader, nil, isEventPingLine, isVercelPing)
+}
+
+// newVercelSSEReader drops ping keepalives and renames the legacy
+// response.reasoning.* events to the response.reasoning_text.* variants.
+func newVercelSSEReader(reader io.Reader) io.Reader {
+	return newSSELineTransformer(reader, rewriteVercelReasoningEvent, nil, isVercelPing)
+}
+
+func (r *sseLineTransformer) Read(p []byte) (int, error) {
+	for {
+		if r.pending.Len() > 0 {
+			return r.pending.Read(p)
+		}
+		if r.done {
+			return 0, r.err
+		}
+		line, err := r.reader.ReadBytes('\n')
+		if len(line) == 0 && err != nil {
+			r.done = true
+			r.err = err
+			r.flushEventLine()
+			if r.pending.Len() > 0 {
+				return r.pending.Read(p)
+			}
+			return 0, err
+		}
+		if len(line) == 0 {
+			continue
+		}
+		trimmed := bytes.TrimRight(line, "\r\n")
+		switch {
+		case bytes.HasPrefix(trimmed, []byte("event:")):
+			r.flushEventLine()
+			if r.isPingEvent != nil && r.isPingEvent(trimmed) {
+				r.eventLine = nil
+				r.skipBlank = true
+			} else {
+				r.eventLine = append(r.eventLine[:0], r.applyLine(line)...)
+			}
+		case bytes.HasPrefix(trimmed, []byte("data:")):
+			payload := bytes.TrimSpace(trimmed[len("data:"):])
+			if r.isPingPayload != nil && r.isPingPayload(payload) {
+				r.eventLine = nil
+				r.skipBlank = true
+				continue
+			}
+			r.flushEventLine()
+			r.pending.Write(r.applyLine(line))
+		default:
+			// Drop the blank line that terminates a dropped ping event so the
+			// stream stays byte-identical apart from the removed event.
+			if r.skipBlank && len(trimmed) == 0 {
+				r.skipBlank = false
+				continue
+			}
+			r.skipBlank = false
+			r.flushEventLine()
+			r.pending.Write(r.applyLine(line))
+		}
 	}
-	line, err := r.reader.ReadBytes('\n')
-	if len(line) > 0 {
-		r.pending.Write(transformSenseNovaSSELine(line))
+}
+
+func (r *sseLineTransformer) applyLine(line []byte) []byte {
+	if r.transformLine == nil {
+		return line
 	}
-	if err != nil {
-		r.done = true
-		r.err = err
+	return r.transformLine(line)
+}
+
+func (r *sseLineTransformer) flushEventLine() {
+	if len(r.eventLine) > 0 {
+		r.pending.Write(r.eventLine)
+		r.eventLine = nil
 	}
-	if r.pending.Len() > 0 {
-		return r.pending.Read(p)
-	}
-	return 0, err
+}
+
+// isEventPingLine reports whether an `event:` line announces a ping
+// keepalive that should be dropped.
+func isEventPingLine(trimmed []byte) bool {
+	return strings.TrimSpace(string(trimmed[len("event:"):])) == "ping"
 }
 
 func transformSenseNovaSSELine(line []byte) []byte {
@@ -93,139 +182,6 @@ func rewriteVercelReasoningEvent(line []byte) []byte {
 	line = bytes.ReplaceAll(line, []byte("event: response.reasoning.delta"), []byte("event: response.reasoning_text.delta"))
 	line = bytes.ReplaceAll(line, []byte("event: response.reasoning.done"), []byte("event: response.reasoning_text.done"))
 	return line
-}
-
-type museSSEReader struct {
-	reader    *bufio.Reader
-	pending   bytes.Buffer
-	eventLine []byte
-	skipBlank bool
-	done      bool
-	err       error
-}
-
-func (r *museSSEReader) Read(p []byte) (int, error) {
-	for {
-		if r.pending.Len() > 0 {
-			return r.pending.Read(p)
-		}
-		if r.done {
-			return 0, r.err
-		}
-		line, err := r.reader.ReadBytes('\n')
-		if len(line) == 0 && err != nil {
-			r.done = true
-			r.err = err
-			r.flushEventLine()
-			if r.pending.Len() > 0 {
-				return r.pending.Read(p)
-			}
-			return 0, err
-		}
-		if len(line) == 0 {
-			continue
-		}
-		trimmed := bytes.TrimRight(line, "\r\n")
-		switch {
-		case bytes.HasPrefix(trimmed, []byte("event:")):
-			r.flushEventLine()
-			if strings.TrimSpace(string(trimmed[len("event:"):])) == "ping" {
-				r.eventLine = nil
-				r.skipBlank = true
-			} else {
-				r.eventLine = append(r.eventLine[:0], line...)
-			}
-		case bytes.HasPrefix(trimmed, []byte("data:")):
-			payload := bytes.TrimSpace(trimmed[len("data:"):])
-			if isVercelPing(payload) {
-				r.eventLine = nil
-				r.skipBlank = true
-				continue
-			}
-			r.flushEventLine()
-			r.pending.Write(line)
-		default:
-			if r.skipBlank && len(trimmed) == 0 {
-				r.skipBlank = false
-				continue
-			}
-			r.skipBlank = false
-			r.flushEventLine()
-			r.pending.Write(line)
-		}
-	}
-}
-
-func (r *museSSEReader) flushEventLine() {
-	if len(r.eventLine) > 0 {
-		r.pending.Write(r.eventLine)
-		r.eventLine = nil
-	}
-}
-
-type vercelSSEReader struct {
-	reader    *bufio.Reader
-	pending   bytes.Buffer
-	eventLine []byte
-	skipBlank bool
-	done      bool
-	err       error
-}
-
-func (r *vercelSSEReader) Read(p []byte) (int, error) {
-	for {
-		if r.pending.Len() > 0 {
-			return r.pending.Read(p)
-		}
-		if r.done {
-			return 0, r.err
-		}
-		line, err := r.reader.ReadBytes('\n')
-		if len(line) == 0 && err != nil {
-			r.done = true
-			r.err = err
-			r.flushEventLine()
-			if r.pending.Len() > 0 {
-				return r.pending.Read(p)
-			}
-			return 0, err
-		}
-		if len(line) == 0 {
-			continue
-		}
-		trimmed := bytes.TrimRight(line, "\r\n")
-		switch {
-		case bytes.HasPrefix(trimmed, []byte("event:")):
-			r.flushEventLine()
-			r.eventLine = append(r.eventLine[:0], rewriteVercelReasoningEvent(line)...)
-		case bytes.HasPrefix(trimmed, []byte("data:")):
-			payload := bytes.TrimSpace(trimmed[len("data:"):])
-			if isVercelPing(payload) {
-				r.eventLine = nil
-				r.skipBlank = true
-				continue
-			}
-			r.flushEventLine()
-			r.pending.Write(rewriteVercelReasoningEvent(line))
-		default:
-			// Drop the blank line that terminates a dropped ping event so the
-			// stream stays byte-identical apart from the removed event.
-			if r.skipBlank && len(trimmed) == 0 {
-				r.skipBlank = false
-				continue
-			}
-			r.skipBlank = false
-			r.flushEventLine()
-			r.pending.Write(line)
-		}
-	}
-}
-
-func (r *vercelSSEReader) flushEventLine() {
-	if len(r.eventLine) > 0 {
-		r.pending.Write(r.eventLine)
-		r.eventLine = nil
-	}
 }
 
 func isVercelPing(payload []byte) bool {

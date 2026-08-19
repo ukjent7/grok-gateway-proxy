@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 )
@@ -36,5 +35,5 @@ func (VercelResponsesAdapter) NormalizeError(status int, body []byte) []byte {
 }
 
 func (VercelResponsesAdapter) TransformSSE(reader io.Reader) io.Reader {
-	return &vercelSSEReader{reader: bufio.NewReaderSize(reader, 64*1024)}
+	return newVercelSSEReader(reader)
 }

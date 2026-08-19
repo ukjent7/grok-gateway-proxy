@@ -465,6 +465,63 @@ func TestProxyEnforcesUpstreamTimeout(t *testing.T) {
 	}
 }
 
+// A streaming request must NOT be cut off by the total upstream timeout: the
+// client applies its own 300s idle timeout, so an active stream that outlives
+// the configured timeout must be delivered in full.
+func TestProxyStreamingSurvivesUpstreamTimeout(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		for i := 0; i < 8; i++ {
+			select {
+			case <-time.After(120 * time.Millisecond):
+			case <-r.Context().Done():
+				return
+			}
+			chunk := "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":" + strconv.Itoa(i) + ",\"delta\":\"x\"}\n\n"
+			if _, err := w.Write([]byte(chunk)); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	store, err := OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := DefaultConfig(t.TempDir() + "/config.json")
+	cfg.UpstreamTimeout = 300 * time.Millisecond
+	gateway := cfg.Gateways["ve"]
+	gateway.BaseURL = upstream.URL
+	cfg.Gateways["ve"] = gateway
+	p := &Proxy{config: cfg, store: store, logger: slog.Default(), client: upstream.Client()}
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/ve/responses",
+		strings.NewReader(`{"model":"m","stream":true,"input":"hi"}`))
+	recorder := httptest.NewRecorder()
+	p.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	for i := 0; i < 8; i++ {
+		if !strings.Contains(recorder.Body.String(), `"sequence_number":`+strconv.Itoa(i)) {
+			t.Fatalf("stream was truncated before chunk %d: %s", i, recorder.Body.String())
+		}
+	}
+	logs, err := store.List(context.Background(), LogFilter{Limit: 1})
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("expected one log, got %d, err=%v", len(logs), err)
+	}
+	if !logs[0].Success || logs[0].StatusCode != http.StatusOK {
+		t.Fatalf("long stream must be logged as success: %+v", logs[0])
+	}
+}
+
 func TestProxyAppliesMuseProfileOnlyForMuseModel(t *testing.T) {
 	var upstreamBody map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

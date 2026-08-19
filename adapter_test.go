@@ -227,37 +227,37 @@ func TestSenseNovaStreamingToolCallContinuationKeepsIdentity(t *testing.T) {
 	}
 }
 
-func TestOpenCodeSelectsMuseProfileByModelPrefix(t *testing.T) {
+func TestOpenCodeAppliesMuseRulesOnlyForMuseModels(t *testing.T) {
 	adapter := OpenCodeResponsesAdapter{}
+	body := []byte(`{"model":"muse-spark-1.2-contributo","stream":true,"stream_tool_calls":true,"input":[]}`)
 	for _, model := range []string{"muse-spark-1.2", "muse-spark-1.2-contributo", "MUSE-SPARK-2.0"} {
-		profile := adapter.ProfileForModel(model)
-		if profile == nil || profile.ID() != "muse-spark-1.2" {
-			t.Fatalf("Muse profile was not selected for %q: %#v", model, profile)
+		upstreamBody, err := adapter.TransformModelRequest(model, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(upstreamBody), `"stream_tool_calls"`) {
+			t.Fatalf("unsupported Muse parameter survived for %q: %s", model, upstreamBody)
+		}
+		if !strings.Contains(string(upstreamBody), `"model":"muse-spark-1.2-contributo"`) {
+			t.Fatalf("Muse request was changed unexpectedly: %s", upstreamBody)
 		}
 	}
 
-	body := []byte(`{"model":"muse-spark-1.2-contributo","stream":true,"stream_tool_calls":true,"input":[]}`)
-	profile := adapter.ProfileForModel("muse-spark-1.2-contributo")
-	upstreamBody, err := profile.TransformRequestBody(body)
+	// Non-Muse models must pass through byte-for-byte.
+	plain := []byte(`{"model":"deepseek-chat","stream":true,"stream_tool_calls":true,"input":[]}`)
+	out, err := adapter.TransformModelRequest("deepseek-chat", plain)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(upstreamBody), `"stream_tool_calls"`) {
-		t.Fatalf("unsupported Muse parameter survived: %s", upstreamBody)
-	}
-	if !strings.Contains(string(upstreamBody), `"model":"muse-spark-1.2-contributo"`) {
-		t.Fatalf("Muse request was changed unexpectedly: %s", upstreamBody)
-	}
-
-	if other := adapter.ProfileForModel("deepseek-chat"); other != nil {
-		t.Fatalf("DeepSeek unexpectedly selected the Muse profile: %#v", other)
+	if string(out) != string(plain) {
+		t.Fatalf("non-Muse request was rewritten: %s", out)
 	}
 }
 
-func TestMuseProfileLeavesRequestsWithoutUnsupportedParameterUnchanged(t *testing.T) {
-	profile := MuseSpark12Profile{}
+func TestOpenCodeLeavesRequestsWithoutUnsupportedParameterUnchanged(t *testing.T) {
+	adapter := OpenCodeResponsesAdapter{}
 	body := []byte(`{"model":"muse-spark-1.2","stream":true,"input":[]}`)
-	transformed, err := profile.TransformRequestBody(body)
+	transformed, err := adapter.TransformModelRequest("muse-spark-1.2", body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,13 +266,13 @@ func TestMuseProfileLeavesRequestsWithoutUnsupportedParameterUnchanged(t *testin
 	}
 }
 
-func TestMuseProfileFiltersPingEvents(t *testing.T) {
-	profile := MuseSpark12Profile{}
+func TestOpenCodeFiltersPingEventsForMuseModels(t *testing.T) {
+	adapter := OpenCodeResponsesAdapter{}
 	input := "event: ping\ndata: {\"type\":\"ping\",\"cost\":\"0\"}\n\n" +
 		"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0}\n\n" +
 		"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":1}\n\n" +
 		"data: [DONE]\n\n"
-	reader := profile.TransformSSE(strings.NewReader(input))
+	reader := adapter.TransformModelSSE("muse-spark-1.2", strings.NewReader(input))
 	body, err := io.ReadAll(reader)
 	if err != nil {
 		t.Fatal(err)
@@ -283,5 +283,12 @@ func TestMuseProfileFiltersPingEvents(t *testing.T) {
 	}
 	if !strings.Contains(result, "response.created") || !strings.Contains(result, "response.completed") || !strings.Contains(result, "data: [DONE]") {
 		t.Fatalf("non-ping Responses events were lost: %q", result)
+	}
+
+	// Non-Muse models must not have ping events filtered.
+	pingReader := adapter.TransformModelSSE("deepseek-chat", strings.NewReader("event: ping\ndata: {\"type\":\"ping\"}\n\n"))
+	pingOut, _ := io.ReadAll(pingReader)
+	if !strings.Contains(string(pingOut), "ping") {
+		t.Fatalf("ping was filtered for a non-Muse model: %q", pingOut)
 	}
 }

@@ -34,26 +34,13 @@ type streamTransformer interface {
 	TransformSSE(io.Reader) io.Reader
 }
 
-// ModelCompatibilityProfile contains model-specific deviations from an
-// adapter's native protocol. Profiles are selected from the request model so
-// models sharing one upstream gateway do not need separate gateway routes.
-type ModelCompatibilityProfile interface {
-	ID() string
-	TransformRequestBody([]byte) ([]byte, error)
-	TransformResponseBody([]byte) ([]byte, error)
-	TransformSSE(io.Reader) io.Reader
-}
-
-type modelProfileProvider interface {
-	ProfileForModel(model string) ModelCompatibilityProfile
-}
-
-func profileFor(adapter GatewayAdapter, model string) ModelCompatibilityProfile {
-	provider, ok := adapter.(modelProfileProvider)
-	if !ok {
-		return nil
-	}
-	return provider.ProfileForModel(model)
+// modelAwareTransformer is implemented by adapters that apply
+// model-specific (per model-family) protocol deviations, e.g. OpenCode's
+// Muse-family rules. Models that match no rule pass through untouched.
+type modelAwareTransformer interface {
+	TransformModelRequest(model string, body []byte) ([]byte, error)
+	TransformModelResponse(model string, body []byte) ([]byte, error)
+	TransformModelSSE(model string, reader io.Reader) io.Reader
 }
 
 func transformRequestBody(adapter GatewayAdapter, model string, body []byte) ([]byte, error) {
@@ -65,8 +52,8 @@ func transformRequestBody(adapter GatewayAdapter, model string, body []byte) ([]
 			return nil, err
 		}
 	}
-	if profile := profileFor(adapter, model); profile != nil {
-		return profile.TransformRequestBody(transformed)
+	if mt, ok := adapter.(modelAwareTransformer); ok {
+		return mt.TransformModelRequest(model, transformed)
 	}
 	return transformed, nil
 }
@@ -80,8 +67,8 @@ func transformResponseBody(adapter GatewayAdapter, model string, body []byte) ([
 			return nil, err
 		}
 	}
-	if profile := profileFor(adapter, model); profile != nil {
-		return profile.TransformResponseBody(transformed)
+	if mt, ok := adapter.(modelAwareTransformer); ok {
+		return mt.TransformModelResponse(model, transformed)
 	}
 	return transformed, nil
 }
@@ -90,8 +77,8 @@ func transformSSE(adapter GatewayAdapter, model string, reader io.Reader) io.Rea
 	if transformer, ok := adapter.(streamTransformer); ok {
 		reader = transformer.TransformSSE(reader)
 	}
-	if profile := profileFor(adapter, model); profile != nil {
-		reader = profile.TransformSSE(reader)
+	if mt, ok := adapter.(modelAwareTransformer); ok {
+		reader = mt.TransformModelSSE(model, reader)
 	}
 	return reader
 }

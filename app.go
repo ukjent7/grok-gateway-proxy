@@ -173,8 +173,6 @@ func (a *App) handleAPI(w http.ResponseWriter, r *http.Request) {
 		})
 	case path == "/proxy" && r.Method == http.MethodPatch:
 		a.patchProxy(w, r)
-	case path == "/gateways" && r.Method == http.MethodPut:
-		a.updateGateways(w, r)
 	case strings.HasPrefix(path, "/gateways/") && r.Method == http.MethodPatch:
 		a.patchGateway(w, r, strings.TrimPrefix(path, "/gateways/"))
 	case path == "/metrics" && r.Method == http.MethodGet:
@@ -204,21 +202,6 @@ func (a *App) handleAPI(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusNotFound, fmt.Errorf("unknown management endpoint %s", r.URL.Path))
 	}
-}
-
-func (a *App) updateGateways(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Gateways map[string]GatewayConfig `json:"gateways"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := a.config.UpdateGateways(body.Gateways); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"gateways": a.config.Snapshot()})
 }
 
 func (a *App) patchProxy(w http.ResponseWriter, r *http.Request) {
