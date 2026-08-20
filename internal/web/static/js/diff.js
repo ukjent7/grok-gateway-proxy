@@ -4,8 +4,9 @@ import { escapeHtml } from './utils.js';
 
 /* ============================================================
    Diff 引擎（纯函数，无 DOM 依赖，便于独立维护与测试）
-   - JSON 差异：扁平化后按路径对比
-   - 文本差异：行级 LCS（对超大文本有保护性折叠）
+   - JSON 差异：扁平化后按路径对比 + 期望转换折叠
+   - 文本差异：行级 LCS + 行内字符高亮（对超大文本有保护性折叠）
+   - 新增：单字级 inline 高亮、V3 协议预期变更自动归组
    ============================================================ */
 
 export function tryParseJSON(raw) {
@@ -51,6 +52,13 @@ export function hopByHopHeaderNames() {
   return ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'host'];
 }
 
+/* ---------- 预期变更判定（用于优雅折叠） ---------- */
+export function isExpectedFXChange(row) {
+  const exp = row.explanation || '';
+  // 包含这些字样的都属 V3 协议转换的预期行为
+  return exp.includes('V3') || exp.includes('已转 header') || exp.includes('FX') || exp.includes('prompt 不承载') || exp.includes('已按 V3 重写');
+}
+
 export function explainJSONChange(path, kind, before, after, category) {
   if (category === 'headers') {
     const header = headerNameFromPath(path);
@@ -65,6 +73,11 @@ export function explainJSONChange(path, kind, before, after, category) {
   }
   if (path.endsWith('.type') && path.includes('.tool_calls[') && before === '"function"' && after === '"function_call"') return '商汤协议兼容：将客户端 tool_calls 类型 function 转为上游要求的 function_call';
   if (path.endsWith('.type') && path.includes('.tool_calls[') && before === '"function_call"' && after === '"function"') return '客户端协议兼容：将商汤返回的 function_call 转回客户端使用的 function';
+  // FX V3 协议：历史 reasoning / include 等在 V3 prompt 中无对应字段，属预期丢弃（已对齐官方 fx / fx-gateway-proxy）
+  if (kind === 'deleted' && path.includes('reasoning')) return '删除 reasoning 历史：V3 的 prompt 不承载历史 reasoning（仅保留顶层 reasoning.effort -> reasoning），已与官方 fx 行为对齐';
+  if (kind === 'deleted' && (path === '$.store' || path === '$.include' || path.includes('prompt_cache_key'))) return '删除字段 ' + path + '：已转 header（prompt_cache_key -> X-Session-Id）或 V3 不支持，属预期协议转换';
+  if (kind === 'deleted' && path.startsWith('$.input[')) return '删除字段 ' + path + '：Responses 的 input 已按 V3 重写为 prompt（message/function_call -> user/assistant/tool），属 FX 协议转换，非误删';
+  if (kind === 'added' && path.startsWith('$.prompt[')) return '新增字段 ' + path + '：V3 的 prompt 由 Responses input 转换生成';
   if (kind === 'added') return '新增字段 ' + path;
   if (kind === 'deleted') return '删除字段 ' + path;
   return '修改字段 ' + path;
@@ -79,13 +92,18 @@ export function buildJSONDiff(before, after, category) {
     const hasBefore = beforeMap.has(path);
     const hasAfter = afterMap.has(path);
     if (!hasBefore) {
-      rows.push({ kind: 'added', path, after: formatDiffValue(afterMap.get(path)), explanation: explainJSONChange(path, 'added', '', formatDiffValue(afterMap.get(path)), category) });
+      const afterVal = formatDiffValue(afterMap.get(path));
+      const explanation = explainJSONChange(path, 'added', '', afterVal, category);
+      rows.push({ kind: 'added', path, after: afterVal, explanation, expected: explanation.includes('V3') || explanation.includes('FX') || explanation.includes('已转 header') });
     } else if (!hasAfter) {
-      rows.push({ kind: 'deleted', path, before: formatDiffValue(beforeMap.get(path)), explanation: explainJSONChange(path, 'deleted', formatDiffValue(beforeMap.get(path)), '', category) });
+      const beforeVal = formatDiffValue(beforeMap.get(path));
+      const explanation = explainJSONChange(path, 'deleted', beforeVal, '', category);
+      rows.push({ kind: 'deleted', path, before: beforeVal, explanation, expected: explanation.includes('V3') || explanation.includes('FX') || explanation.includes('已转 header') || explanation.includes('prompt 不承载') });
     } else if (JSON.stringify(beforeMap.get(path)) !== JSON.stringify(afterMap.get(path))) {
       const beforeValue = formatDiffValue(beforeMap.get(path));
       const afterValue = formatDiffValue(afterMap.get(path));
-      rows.push({ kind: 'modified', path, before: beforeValue, after: afterValue, explanation: explainJSONChange(path, 'modified', beforeValue, afterValue, category) });
+      const explanation = explainJSONChange(path, 'modified', beforeValue, afterValue, category);
+      rows.push({ kind: 'modified', path, before: beforeValue, after: afterValue, explanation, expected: false });
     }
   });
   return rows;
@@ -93,7 +111,7 @@ export function buildJSONDiff(before, after, category) {
 
 export function buildValueDiff(path, before, after) {
   if (String(before) === String(after)) return { rows: [] };
-  return { rows: [{ kind: 'modified', path, before: String(before), after: String(after), explanation: path + ' 从 ' + before + ' 变为 ' + after }] };
+  return { rows: [{ kind: 'modified', path, before: String(before), after: String(after), explanation: path + ' 从 ' + before + ' 变为 ' + after, expected: false }] };
 }
 
 export function truncateDiffText(text, max) {
@@ -101,9 +119,107 @@ export function truncateDiffText(text, max) {
   return text.length > max ? text.slice(0, max) + '\n… (已折叠)' : text;
 }
 
+/* ---------- 行内字符级高亮 ---------- */
+function escapeHtmlRaw(s) { return escapeHtml(s); }
+
+// 前后缀法：O(n) 找到首个差异区，适合“几百字里改一个字”
+function prefixSuffixHighlight(before, after, context) {
+  context = context || 64;
+  let pre = 0;
+  const minLen = Math.min(before.length, after.length);
+  while (pre < minLen && before[pre] === after[pre]) pre++;
+  let suf = 0;
+  while (suf < minLen - pre && before[before.length - 1 - suf] === after[after.length - 1 - suf]) suf++;
+  // 完全相同
+  if (pre === before.length && pre === after.length) return { beforeHTML: escapeHtmlRaw(before), afterHTML: escapeHtmlRaw(after) };
+  const beforeMid = before.slice(pre, before.length - suf);
+  const afterMid = after.slice(pre, after.length - suf);
+  const beforePre = before.slice(0, pre);
+  const beforeSuf = before.slice(before.length - suf);
+  const afterPre = after.slice(0, pre);
+  const afterSuf = after.slice(after.length - suf);
+  // 上下文截断
+  function withContext(preStr, mid, sufStr) {
+    let out = '';
+    if (preStr.length > context) out += '…' + escapeHtmlRaw(preStr.slice(-context));
+    else out += escapeHtmlRaw(preStr);
+    if (mid) out += '<span class="diff-char-hl ' + (mid === beforeMid ? 'diff-char-del' : 'diff-char-add') + '">' + escapeHtmlRaw(mid) + '</span>';
+    if (sufStr.length > context) out += escapeHtmlRaw(sufStr.slice(0, context)) + '…';
+    else out += escapeHtmlRaw(sufStr);
+    return out;
+  }
+  // 需区分 before/after 的中段样式
+  const beforeHTML = (pre > 0 || beforeMid || suf > 0) ? (function(){
+    let html = '';
+    if (beforePre.length > context) html += '…' + escapeHtmlRaw(beforePre.slice(-context));
+    else html += escapeHtmlRaw(beforePre);
+    if (beforeMid) html += '<span class="diff-char-del">' + escapeHtmlRaw(beforeMid) + '</span>';
+    if (beforeSuf.length > context) html += escapeHtmlRaw(beforeSuf.slice(0, context)) + '…';
+    else html += escapeHtmlRaw(beforeSuf);
+    // 若全被截断且 mid 为空，给提示
+    if (!beforeMid && before.length > context*2) html = escapeHtmlRaw(before.slice(0, context)) + ' … ' + escapeHtmlRaw(before.slice(-context));
+    return html;
+  })() : escapeHtmlRaw(before);
+  const afterHTML = (function(){
+    let html = '';
+    if (afterPre.length > context) html += '…' + escapeHtmlRaw(afterPre.slice(-context));
+    else html += escapeHtmlRaw(afterPre);
+    if (afterMid) html += '<span class="diff-char-add">' + escapeHtmlRaw(afterMid) + '</span>';
+    if (afterSuf.length > context) html += escapeHtmlRaw(afterSuf.slice(0, context)) + '…';
+    else html += escapeHtmlRaw(afterSuf);
+    if (!afterMid && after.length > context*2) html = escapeHtmlRaw(after.slice(0, context)) + ' … ' + escapeHtmlRaw(after.slice(-context));
+    return html;
+  })();
+  return { beforeHTML, afterHTML };
+}
+
+// LCS 字符级（仅对短串 ≤2000 字符启用，超长回退到前后缀法）
+function charLcsHighlight(before, after) {
+  const n = before.length, m = after.length;
+  if (n * m > 1200000 || n > 2500 || m > 2500) return prefixSuffixHighlight(before, after, 80);
+  // DP 表用两行滚动
+  const prev = new Uint16Array(m + 1);
+  const cur = new Uint16Array(m + 1);
+  const table = Array(n + 1);
+  for (let i = 0; i <= n; i++) table[i] = new Uint16Array(m + 1);
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      table[i][j] = before[i] === after[j] ? table[i + 1][j + 1] + 1 : Math.max(table[i + 1][j], table[i][j + 1]);
+    }
+  }
+  let i = 0, j = 0;
+  let bHTML = '', aHTML = '';
+  while (i < n && j < m) {
+    if (before[i] === after[j]) { bHTML += escapeHtmlRaw(before[i]); aHTML += escapeHtmlRaw(after[j]); i++; j++; }
+    else if (table[i + 1][j] >= table[i][j + 1]) { bHTML += '<span class="diff-char-del">' + escapeHtmlRaw(before[i]) + '</span>'; i++; }
+    else { aHTML += '<span class="diff-char-add">' + escapeHtmlRaw(after[j]) + '</span>'; j++; }
+  }
+  while (i < n) { bHTML += '<span class="diff-char-del">' + escapeHtmlRaw(before[i++]) + '</span>'; }
+  while (j < m) { aHTML += '<span class="diff-char-add">' + escapeHtmlRaw(after[j++]) + '</span>'; }
+  // 过长时加上下文折叠
+  const limit = 2200;
+  if (bHTML.length > limit || aHTML.length > limit) return prefixSuffixHighlight(before, after, 80);
+  return { beforeHTML: bHTML, afterHTML: aHTML };
+}
+
+export function inlineHighlight(before, after) {
+  // 空值保护
+  before = String(before || '');
+  after = String(after || '');
+  if (before === after) return { beforeHTML: escapeHtmlRaw(before), afterHTML: escapeHtmlRaw(after) };
+  // 短串用 LCS 精细高亮，长串用前后缀
+  if (Math.max(before.length, after.length) < 800) return charLcsHighlight(before, after);
+  return prefixSuffixHighlight(before, after, 80);
+}
+
 export function buildTextDiff(before, after) {
+  // 单行超长文本（常见于 body 单行 JSON）直接做字符级对比，避免整行标为 modified 看不出差异
   const oldLines = before.split(/\r?\n/);
   const newLines = after.split(/\r?\n/);
+  if (oldLines.length === 1 && newLines.length === 1 && Math.max(before.length, after.length) > 200) {
+    // 单行大文本：用字符级高亮的单条 modified
+    return [{ kind: 'modified', path: '文本', before, after, explanation: '单行文本字符级差异（已高亮改动处，前后各保留约80字上下文）' }];
+  }
   const maxCells = 1600000;
   if (oldLines.length * newLines.length > maxCells) {
     return [{ kind: 'modified', path: '文本', before: truncateDiffText(before), after: truncateDiffText(after), explanation: '文本内容发生变化，内容过大，已折叠显示' }];
@@ -128,14 +244,14 @@ export function buildTextDiff(before, after) {
     const current = operations[index];
     const next = operations[index + 1];
     if (current.kind === 'deleted' && next && next.kind === 'added') {
-      rows.push({ kind: 'modified', path: '第 ' + (index + 1) + ' 行', before: current.text, after: next.text, explanation: '修改第 ' + (index + 1) + ' 行' });
+      rows.push({ kind: 'modified', path: '第 ' + (index + 1) + ' 行', before: current.text, after: next.text, explanation: '修改第 ' + (index + 1) + ' 行（已对行内字符做高亮）', expected: false });
       index++;
     } else if (current.kind === 'deleted') {
-      rows.push({ kind: 'deleted', path: '文本行', before: current.text, explanation: '删除文本行' });
+      rows.push({ kind: 'deleted', path: '文本行', before: current.text, explanation: '删除文本行', expected: false });
     } else if (current.kind === 'added') {
-      rows.push({ kind: 'added', path: '文本行', after: current.text, explanation: '新增文本行' });
+      rows.push({ kind: 'added', path: '文本行', after: current.text, explanation: '新增文本行', expected: false });
     } else {
-      rows.push({ kind: 'same', path: '', before: current.text, after: current.text });
+      rows.push({ kind: 'same', path: '', before: current.text, after: current.text, expected: false });
     }
   }
   return rows;
@@ -154,6 +270,7 @@ export function buildDiff(beforeRaw, afterRaw, category) {
 export function diffStats(diffs) {
   return diffs.filter(Boolean).reduce((total, diff) => {
     for (const row of diff.rows) {
+      if (row.expected) continue; // 预期转换不计入顶部数字，避免“一堆删除”吓人
       if (row.kind === 'added') total.added++;
       if (row.kind === 'modified') total.modified++;
       if (row.kind === 'deleted') total.deleted++;
@@ -169,13 +286,22 @@ export function diffSummaryBadge(label, count, kind) {
 
 export function renderDiffSection(diff, title, subtitle) {
   const changedRows = diff.rows.filter(row => row.kind !== 'same');
+  const unexpected = changedRows.filter(r => !r.expected);
+  const expected = changedRows.filter(r => r.expected);
   if (!changedRows.length) {
     return '<section class="diff-section diff-section-empty"><div class="diff-section-head"><div><strong>' + escapeHtml(title) + '</strong><span>' + escapeHtml(subtitle) + '</span></div><span class="diff-no-change">无变化</span></div></section>';
   }
+  // 若全是预期转换，直接给出友好提示而非吓人的数字
+  if (!unexpected.length && expected.length) {
+    return '<section class="diff-section diff-section-empty"><div class="diff-section-head"><div><strong>' + escapeHtml(title) + '</strong><span>' + escapeHtml(subtitle) + '</span></div><span class="diff-no-change">仅含预期协议转换</span></div>' +
+      '<div class="diff-expected-note">检测到 ' + expected.length + ' 处 V3/FX 预期转换（reasoning 历史删除、input→prompt 重写等），已自动折叠。<details style="margin-top:8px"><summary style="cursor:pointer;color:var(--teal)">展开查看 ' + expected.length + ' 条预期变更</summary><div class="diff-rows" style="margin-top:8px">' + renderDiffRows(expected) + '</div></details></div></section>';
+  }
   return '<section class="diff-section">' +
-    '<div class="diff-section-head"><div><strong>' + escapeHtml(title) + '</strong><span>' + escapeHtml(subtitle) + '</span></div><span class="diff-change-count">' + changedRows.length + ' 处变更</span></div>' +
+    '<div class="diff-section-head"><div><strong>' + escapeHtml(title) + '</strong><span>' + escapeHtml(subtitle) + '</span></div><span class="diff-change-count">' + unexpected.length + ' 处实质变更' + (expected.length ? '（+' + expected.length + ' 预期已折叠）' : '') + '</span></div>' +
     '<div class="diff-column-head"><span>原始</span><span>代理实际</span></div>' +
-    '<div class="diff-rows">' + renderDiffRows(diff.rows) + '</div>' +
+    '<div class="diff-rows">' + renderDiffRows(unexpected) + 
+      (expected.length ? '<details class="diff-expected-wrap"><summary>展开 ' + expected.length + ' 条预期协议转换（V3/FX）</summary><div class="diff-rows">' + renderDiffRows(expected) + '</div></details>' : '') +
+    '</div>' +
   '</section>';
 }
 
@@ -207,14 +333,33 @@ function diffLineText(row, value) {
 }
 
 function renderDiffRow(row) {
-  const oldLine = row.kind === 'added' ? '' : diffLineText(row, row.before || '');
-  const newLine = row.kind === 'deleted' ? '' : diffLineText(row, row.after || '');
-  const oldClass = row.kind === 'deleted' || row.kind === 'modified' ? 'diff-line-old' : 'diff-line-empty';
-  const newClass = row.kind === 'added' || row.kind === 'modified' ? 'diff-line-new' : 'diff-line-empty';
-  const marker = row.kind === 'added' ? '+' : row.kind === 'deleted' ? '−' : row.kind === 'modified' ? '±' : ' ';
-  return '<div class="diff-row ' + row.kind + '">' +
-    '<div class="diff-line ' + oldClass + '"><i>' + (row.kind === 'added' ? ' ' : marker) + '</i><code>' + escapeHtml(oldLine) + '</code></div>' +
-    '<div class="diff-line ' + newClass + '"><i>' + (row.kind === 'deleted' ? ' ' : marker) + '</i><code>' + escapeHtml(newLine) + '</code></div>' +
+  const isMod = row.kind === 'modified';
+  let oldLine = '', newLine = '';
+  let oldHTML = '', newHTML = '';
+  if (row.kind === 'added') {
+    newLine = diffLineText(row, row.after || '');
+    newHTML = escapeHtml(newLine);
+  } else if (row.kind === 'deleted') {
+    oldLine = diffLineText(row, row.before || '');
+    oldHTML = escapeHtml(oldLine);
+  } else if (isMod) {
+    const leftRaw = diffLineText(row, row.before || '');
+    const rightRaw = diffLineText(row, row.after || '');
+    // 行内字符高亮：几百字里改一个字也能一眼看见
+    const inline = inlineHighlight(leftRaw, rightRaw);
+    oldHTML = inline.beforeHTML;
+    newHTML = inline.afterHTML;
+  } else {
+    oldHTML = escapeHtml(diffLineText(row, row.before || ''));
+    newHTML = escapeHtml(diffLineText(row, row.after || ''));
+  }
+  const oldClass = row.kind === 'deleted' || isMod ? 'diff-line-old' : 'diff-line-empty';
+  const newClass = row.kind === 'added' || isMod ? 'diff-line-new' : 'diff-line-empty';
+  const marker = row.kind === 'added' ? '+' : row.kind === 'deleted' ? '−' : isMod ? '±' : ' ';
+  const expClass = row.expected ? ' diff-row-expected' : '';
+  return '<div class="diff-row ' + row.kind + expClass + '">' +
+    '<div class="diff-line ' + oldClass + '"><i>' + (row.kind === 'added' ? ' ' : marker) + '</i><code>' + (isMod ? oldHTML : escapeHtml(oldLine ? oldLine : '')) + (isMod ? '' : '') + '</code></div>' +
+    '<div class="diff-line ' + newClass + '"><i>' + (row.kind === 'deleted' ? ' ' : marker) + '</i><code>' + (isMod ? newHTML : escapeHtml(newLine ? newLine : '')) + '</code></div>' +
     (row.kind === 'same' ? '' : '<div class="diff-explanation">' + escapeHtml(row.explanation || '') + (row.path ? ' <code>' + escapeHtml(row.path) + '</code>' : '') + '</div>') +
   '</div>';
 }
