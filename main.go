@@ -30,7 +30,7 @@ func main() {
 	dataDir := flag.String("data-dir", "", "配置文件与日志数据库所在目录（默认 ./data，可用 GROK_PROXY_DATA_DIR 覆盖）")
 	shutdownTimeout := flag.Duration("shutdown-timeout", 30*time.Second, "优雅关闭等待在途请求的最长时间")
 	logLevel := flag.String("log-level", "info", "日志级别：debug / info / warn / error")
-	logRetentionDays := flag.Int("log-retention-days", 30, "日志保留天数（0 表示永久保留，可用 GROK_PROXY_LOG_RETENTION_DAYS 覆盖）")
+	logRetentionDays := flag.Int("log-retention-days", 30, "日志保留天数（0 表示永久保留）；显式指定时优先于配置文件，未指定则读配置 log_retention_days（默认 30），GROK_PROXY_LOG_RETENTION_DAYS 可覆盖")
 	flag.Parse()
 
 	if env := os.Getenv("GROK_PROXY_LISTEN"); env != "" && *listen == "" {
@@ -39,13 +39,25 @@ func main() {
 	if env := os.Getenv("GROK_PROXY_DATA_DIR"); env != "" && *dataDir == "" {
 		*dataDir = env
 	}
+	// Retention precedence: explicit --log-retention-days flag >
+	// GROK_PROXY_LOG_RETENTION_DAYS env var > config file value > built-in
+	// default (30 days). Only an explicitly provided value overrides the
+	// file, so a saved config.json is not silently shadowed.
+	var explicitRetention *int
 	if env := os.Getenv("GROK_PROXY_LOG_RETENTION_DAYS"); env != "" {
 		if days, err := strconv.Atoi(env); err == nil {
-			*logRetentionDays = days
+			d := days
+			explicitRetention = &d
 		} else {
 			fmt.Fprintf(os.Stderr, "GROK_PROXY_LOG_RETENTION_DAYS invalid, ignoring: %v\n", err)
 		}
 	}
+	// An explicitly passed flag outranks the env var.
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "log-retention-days" {
+			explicitRetention = logRetentionDays
+		}
+	})
 
 	level := parseLogLevel(*logLevel)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
@@ -55,7 +67,7 @@ func main() {
 		dataPath = defaultDataDir()
 	}
 
-	cfg, err := config.LoadConfig(filepath.Join(dataPath, "config.json"), *logRetentionDays)
+	cfg, err := config.LoadConfig(filepath.Join(dataPath, "config.json"), explicitRetention)
 	if err != nil {
 		logger.Error("加载配置失败", "error", err)
 		os.Exit(1)
