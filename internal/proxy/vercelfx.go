@@ -266,6 +266,11 @@ func responsesInputToV3Prompt(input any, instructions any) []map[string]any {
 			pendingUser = append(pendingUser, v3TextPart(asString(obj["text"])))
 		case "input_image", "image_url":
 			pendingUser = append(pendingUser, v3ImagePart(obj))
+		case "reasoning":
+			// Historical reasoning (Responses `reasoning` items) has no V3 prompt slot.
+			// Drop it to match official fx (fx-main) and fx-gateway-proxy behavior:
+			// both ignore reasoning history and only forward reasoning.effort -> reasoning.
+			continue
 		default:
 			pendingUser = append(pendingUser, v3TextPart(" "))
 		}
