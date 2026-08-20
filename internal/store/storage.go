@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"grok-gateway-proxy/internal/config"
+	"grok-gateway-proxy/internal/redact"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver
 )
@@ -272,7 +273,7 @@ func (s *Store) scrubStoredHeaderCredentials() error {
 				rows.Close()
 				return err
 			}
-			if redacted := redactStoredHeaders(raw); redacted != raw {
+			if redacted := redact.RedactStoredHeaders(raw); redacted != raw {
 				updates = append(updates, pendingUpdate{id: id, value: redacted})
 			}
 		}
