@@ -39,11 +39,11 @@ type App struct {
 
 func NewApp(cfg *config.Config, st *store.Store, logger *slog.Logger, version string) *App {
 	app := &App{
-		config:   cfg,
-		store:    st,
-		logger:   logger,
-		version:  version,
-		proxy:    proxy.NewProxy(cfg, st, logger),
+		config:    cfg,
+		store:     st,
+		logger:    logger,
+		version:   version,
+		proxy:     proxy.NewProxy(cfg, st, logger),
 		upstreams: make(map[string]upstreamHealth),
 	}
 	app.apiMux = app.buildAPIRoutes()
