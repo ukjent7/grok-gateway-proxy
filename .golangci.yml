@@ -1,54 +1,69 @@
+version: "2"
+
 run:
   timeout: 5m
 
 linters:
+  default: none
   enable:
+    - bodyclose
+    - errcheck
+    - gocritic
     - govet
     - ineffassign
+    - misspell
+    - revive
     - staticcheck
+    - unconvert
     - unused
-    - errcheck
+
+  settings:
+    gocritic:
+      disabled-checks:
+        - ifElseChain
+        - assignOp
+    revive:
+      severity: warning
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-naming
+        - name: error-return
+        - name: error-strings
+        - name: increment-decrement
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: var-declaration
+        - name: var-naming
+
+  exclusions:
+    presets:
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gocritic
+      - path: \.go$
+        linters:
+          - errcheck
+        text: "rows.Close|rows.Err|w.Write|fmt.Fprint|io.Copy|io.ReadAll"
+
+formatters:
+  default: none
+  enable:
     - gofmt
     - goimports
-    - revive
-    - misspell
-    - unconvert
-    - gocritic
-    - bodyclose
-
-linters-settings:
-  govet:
-    enable-all: false
-  goimports:
-    local-prefixes: grok-gateway-proxy
-  revive:
-    severity: warning
-    rules:
-      - name: blank-imports
-      - name: context-as-argument
-      - name: context-keys-type
-      - name: dot-imports
-      - name: error-naming
-      - name: error-return
-      - name: error-strings
-      - name: exported
-        disabled: true
-      - name: increment-decrement
-      - name: range
-      - name: receiver-naming
-      - name: time-naming
-      - name: var-declaration
-      - name: var-naming
+  settings:
+    goimports:
+      local-prefixes:
+        - grok-gateway-proxy
 
 issues:
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - errcheck
-        - gocritic
-    - path: \.go
-      linters:
-        - errcheck
-      text: "rows.Close|rows.Err|w.Write|fmt.Fprint|io.Copy|io.ReadAll"
   max-issues-per-linter: 0
   max-same-issues: 0
