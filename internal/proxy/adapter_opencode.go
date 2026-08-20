@@ -15,9 +15,9 @@ import (
 // isMuseSparkModel below).
 type OpenCodeResponsesAdapter struct{}
 
-func (OpenCodeResponsesAdapter) ID() string               { return "OpenCodeResponsesAdapter" }
+func (OpenCodeResponsesAdapter) ID() string                { return "OpenCodeResponsesAdapter" }
 func (OpenCodeResponsesAdapter) Protocol() config.Protocol { return config.ProtocolResponses }
-func (OpenCodeResponsesAdapter) EndpointPath() string { return "/responses" }
+func (OpenCodeResponsesAdapter) EndpointPath() string      { return "/responses" }
 func (a OpenCodeResponsesAdapter) AcceptsPath(path string) bool {
 	return path == a.EndpointPath()
 }
@@ -32,7 +32,7 @@ func (OpenCodeResponsesAdapter) NormalizeError(status int, body []byte) []byte {
 }
 
 // isMuseSparkModel reports whether the model belongs to the Muse family by
-// name prefix, so upstream variants such as muse-spark-1.2-contributo match
+// name prefix, so upstream variants such as muse-spark-1.2-contributor match
 // the "muse-spark" family just like muse-spark-1.2. "deepseek"-prefixed
 // models currently pass through unchanged and get their own case here as
 // soon as they need protocol deviations.

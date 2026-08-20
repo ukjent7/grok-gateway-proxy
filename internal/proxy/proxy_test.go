@@ -549,7 +549,7 @@ func TestProxyAppliesMuseProfileOnlyForMuseModel(t *testing.T) {
 	cfg.Gateways["oc"] = gateway
 	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client()}
 
-	requestBody := []byte(`{"model":"muse-spark-1.2-contributo","stream":true,"stream_tool_calls":true,"input":[]}`)
+	requestBody := []byte(`{"model":"muse-spark-1.2-contributor","stream":true,"stream_tool_calls":true,"input":[]}`)
 	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/oc/responses", strings.NewReader(string(requestBody)))
 	recorder := httptest.NewRecorder()
 	p.ServeHTTP(recorder, req)
@@ -560,7 +560,7 @@ func TestProxyAppliesMuseProfileOnlyForMuseModel(t *testing.T) {
 	if _, exists := upstreamBody["stream_tool_calls"]; exists {
 		t.Fatalf("unsupported Muse parameter reached upstream: %+v", upstreamBody)
 	}
-	if upstreamBody["model"] != "muse-spark-1.2-contributo" {
+	if upstreamBody["model"] != "muse-spark-1.2-contributor" {
 		t.Fatalf("upstream model changed unexpectedly: %+v", upstreamBody)
 	}
 

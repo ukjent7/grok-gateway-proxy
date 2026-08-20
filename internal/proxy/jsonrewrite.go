@@ -221,7 +221,7 @@ func replaceJSONPropertyStringValueInToolCalls(body []byte, from, to string) ([]
 				result = append(result, body[end:]...)
 				body = result
 				changed = true
-				index = index + len(toToken)
+				index += len(toToken)
 				continue
 			}
 			index = end

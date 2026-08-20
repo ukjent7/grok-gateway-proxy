@@ -12,9 +12,9 @@ import (
 // format (function) and SenseNova's internal representation (function_call).
 type SenseNovaChatAdapter struct{}
 
-func (SenseNovaChatAdapter) ID() string               { return "SenseNovaChatAdapter" }
+func (SenseNovaChatAdapter) ID() string                { return "SenseNovaChatAdapter" }
 func (SenseNovaChatAdapter) Protocol() config.Protocol { return config.ProtocolChat }
-func (SenseNovaChatAdapter) EndpointPath() string { return "/chat/completions" }
+func (SenseNovaChatAdapter) EndpointPath() string      { return "/chat/completions" }
 func (a SenseNovaChatAdapter) AcceptsPath(path string) bool {
 	return path == a.EndpointPath()
 }

@@ -20,9 +20,9 @@ import (
 // passed through untouched.
 type VercelResponsesAdapter struct{}
 
-func (VercelResponsesAdapter) ID() string           { return "VercelResponsesAdapter" }
+func (VercelResponsesAdapter) ID() string                { return "VercelResponsesAdapter" }
 func (VercelResponsesAdapter) Protocol() config.Protocol { return config.ProtocolResponses }
-func (VercelResponsesAdapter) EndpointPath() string { return "/responses" }
+func (VercelResponsesAdapter) EndpointPath() string      { return "/responses" }
 func (a VercelResponsesAdapter) AcceptsPath(path string) bool {
 	return path == a.EndpointPath()
 }

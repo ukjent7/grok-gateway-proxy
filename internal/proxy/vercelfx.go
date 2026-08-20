@@ -84,10 +84,9 @@ func convertResponsesToV3(body []byte, userAgent string) ([]byte, error) {
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, err
 	}
-	model := asString(req["model"])
-	if model == "" {
-		model = "zai/glm-5.2"
-	}
+	// model is passed via the ai-language-model-id header in fxDisguiseHeaders,
+	// not in the v3 request body.
+	_ = asString(req["model"])
 	prompt := responsesInputToV3Prompt(req["input"], req["instructions"])
 
 	v3 := map[string]any{
@@ -763,7 +762,7 @@ func extractFXUsageMap(usage map[string]any) store.UsageMetrics {
 			cached, cachedOK = value, true
 		}
 		if value, ok := firstNumberOK(details, "cache_write_tokens"); ok && !cacheWriteOK {
-			cacheWrite, cacheWriteOK = value, true
+			cacheWrite = value
 		}
 	}
 
@@ -836,9 +835,7 @@ type vercelFXSSEReader struct {
 	// emitted. It must not be derived from tool count because text and tool
 	// events can arrive in either order.
 	nextOutputIndex int
-	// emitted tool-call ids (for done events)
-	emittedTools []string
-	done         bool
+	done            bool
 	// sequence is the strictly increasing sequence_number each SSE event
 	// carries, as required by strict Responses clients (async-openai).
 	sequence int64

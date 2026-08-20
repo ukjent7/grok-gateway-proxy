@@ -367,7 +367,7 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 		// protocol. Convert it back to the Responses protocol the client
 		// expects (SSE for streaming, assembled JSON otherwise).
 		rawResponse := newCappedBuffer(bodyLimit)
-		responseReader := io.Reader(io.TeeReader(upstreamResponse.Body, rawResponse))
+		responseReader := io.TeeReader(upstreamResponse.Body, rawResponse)
 		if stream {
 			responseReader = newVercelFXSSEReader(responseReader, logEntry.Model)
 			responseBody, copyErr = copyAndCapture(w, responseReader, true, bodyLimit)
@@ -391,7 +391,7 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 		logEntry.ResponseTruncated = rawResponse.truncated
 	} else if eventStream {
 		rawResponse := newCappedBuffer(bodyLimit)
-		responseReader := io.Reader(io.TeeReader(upstreamResponse.Body, rawResponse))
+		responseReader := io.TeeReader(upstreamResponse.Body, rawResponse)
 		responseReader = transformSSE(adapter, logEntry.Model, responseReader)
 		responseBody, copyErr = copyAndCapture(w, responseReader, true, bodyLimit)
 		logEntry.UpstreamResponseBody = append([]byte(nil), rawResponse.Bytes()...)
@@ -401,7 +401,10 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 		// the complete (possibly transformed) response. Only the audit
 		// capture is capped.
 		rawCapture := newCappedBuffer(bodyLimit)
-		rawResponse, copyErr := io.ReadAll(io.TeeReader(upstreamResponse.Body, rawCapture))
+		rawResponse, readErr := io.ReadAll(io.TeeReader(upstreamResponse.Body, rawCapture))
+		if readErr != nil {
+			copyErr = readErr
+		}
 		logEntry.UpstreamResponseBody = append([]byte(nil), rawCapture.Bytes()...)
 		logEntry.ResponseTruncated = rawCapture.truncated
 
@@ -513,7 +516,7 @@ func (w *responseCapture) WriteHeader(statusCode int) {
 		return
 	}
 	w.statusCode = statusCode
-	w.headers = cloneHeaders(w.ResponseWriter.Header())
+	w.headers = cloneHeaders(w.Header())
 	w.ResponseWriter.WriteHeader(statusCode)
 }
 

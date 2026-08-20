@@ -229,8 +229,8 @@ func TestSenseNovaStreamingToolCallContinuationKeepsIdentity(t *testing.T) {
 
 func TestOpenCodeAppliesMuseRulesOnlyForMuseModels(t *testing.T) {
 	adapter := OpenCodeResponsesAdapter{}
-	body := []byte(`{"model":"muse-spark-1.2-contributo","stream":true,"stream_tool_calls":true,"input":[]}`)
-	for _, model := range []string{"muse-spark-1.2", "muse-spark-1.2-contributo", "MUSE-SPARK-2.0"} {
+	body := []byte(`{"model":"muse-spark-1.2-contributor","stream":true,"stream_tool_calls":true,"input":[]}`)
+	for _, model := range []string{"muse-spark-1.2", "muse-spark-1.2-contributor", "MUSE-SPARK-2.0"} {
 		upstreamBody, err := adapter.TransformModelRequest(model, body)
 		if err != nil {
 			t.Fatal(err)
@@ -238,7 +238,7 @@ func TestOpenCodeAppliesMuseRulesOnlyForMuseModels(t *testing.T) {
 		if strings.Contains(string(upstreamBody), `"stream_tool_calls"`) {
 			t.Fatalf("unsupported Muse parameter survived for %q: %s", model, upstreamBody)
 		}
-		if !strings.Contains(string(upstreamBody), `"model":"muse-spark-1.2-contributo"`) {
+		if !strings.Contains(string(upstreamBody), `"model":"muse-spark-1.2-contributor"`) {
 			t.Fatalf("Muse request was changed unexpectedly: %s", upstreamBody)
 		}
 	}

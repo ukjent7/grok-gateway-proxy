@@ -83,7 +83,7 @@ func extractChatUsage(usage map[string]any, result store.UsageMetrics) store.Usa
 			hit, hitOK = firstNumberOK(details, "cached_tokens", "cache_read_tokens")
 		}
 		if !writeOK {
-			write, writeOK = firstNumberOK(details, "cache_write_tokens")
+			write, _ = firstNumberOK(details, "cache_write_tokens")
 		}
 	}
 	total, totalOK := firstNumberOK(usage, "prompt_tokens")
