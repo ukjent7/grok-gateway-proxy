@@ -185,6 +185,39 @@ func TestVercelPassesResponsesStreamThroughUnchanged(t *testing.T) {
 	}
 }
 
+// TestVercelRenameHandlesSpacedAndNestedSerialization verifies the structured
+// type-field rewrite copes with serialization variants the old byte-replace
+// approach missed: extra whitespace around the colon, and the legacy event
+// name appearing as the value of a different key (e.g. "delta" text) where it
+// must survive untouched. Only "type" properties whose value is the legacy
+// event name are renamed; other string values are left intact.
+func TestVercelRenameHandlesSpacedAndNestedSerialization(t *testing.T) {
+	adapter := VercelResponsesAdapter{}
+	// Extra spaces around the colon; the legacy name also appears as a "delta"
+	// string value, which must NOT be rewritten (it is payload text, not an
+	// event name).
+	input := "event: response.reasoning.delta\n" +
+		`data: {"type" : "response.reasoning.delta","delta":"response.reasoning.delta"}` + "\n\n"
+	reader := adapter.TransformSSE(strings.NewReader(input))
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(body)
+	// The top-level type field and the event: line must be renamed.
+	if !strings.Contains(got, "event: response.reasoning_text.delta") {
+		t.Fatalf("event: line was not renamed: %s", got)
+	}
+	if !strings.Contains(got, `"type" : "response.reasoning_text.delta"`) {
+		t.Fatalf("type field was not renamed despite spaced colon: %s", got)
+	}
+	// The "delta" string value must survive untouched — it is payload text,
+	// not the event name.
+	if !strings.Contains(got, `"delta":"response.reasoning.delta"`) {
+		t.Fatalf("delta string value was wrongly renamed: %s", got)
+	}
+}
+
 func TestSenseNovaTransformsStreamingToolCalls(t *testing.T) {
 	adapter := SenseNovaChatAdapter{}
 	input := "data: {\"id\":\"chunk-1\",\"created\":1,\"model\":\"demo\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"type\":\"function_call\"}]},\"finish_reason\":\"\"}],\"request_id\":\"chunk-1\"}\n\ndata: [DONE]\n\n"

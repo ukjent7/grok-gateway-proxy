@@ -172,15 +172,28 @@ func transformSenseNovaSSELine(line []byte) []byte {
 }
 
 // rewriteVercelReasoningEvent renames the legacy reasoning stream event names
-// to the newer `reasoning_text` variants. Handles both compact and spaced JSON
-// (`"type":"..."` and `"type": "..."`).
+// to the newer `reasoning_text` variants. `data:` lines are rewritten via
+// structured JSON property replacement so only the "type" field value is
+// touched — event names embedded in other string values (e.g. delta text)
+// survive intact, and the rename is immune to key-order/whitespace variations
+// in the upstream serialization. `event:` lines are plain text and use a
+// targeted match on the event name.
 func rewriteVercelReasoningEvent(line []byte) []byte {
-	line = bytes.ReplaceAll(line, []byte(`"type":"response.reasoning.delta"`), []byte(`"type":"response.reasoning_text.delta"`))
-	line = bytes.ReplaceAll(line, []byte(`"type": "response.reasoning.delta"`), []byte(`"type": "response.reasoning_text.delta"`))
-	line = bytes.ReplaceAll(line, []byte(`"type":"response.reasoning.done"`), []byte(`"type":"response.reasoning_text.done"`))
-	line = bytes.ReplaceAll(line, []byte(`"type": "response.reasoning.done"`), []byte(`"type": "response.reasoning_text.done"`))
-	line = bytes.ReplaceAll(line, []byte("event: response.reasoning.delta"), []byte("event: response.reasoning_text.delta"))
-	line = bytes.ReplaceAll(line, []byte("event: response.reasoning.done"), []byte("event: response.reasoning_text.done"))
+	// `event:` lines are not JSON — match the announced event name directly.
+	if trimmed := bytes.TrimLeft(line, " \t"); bytes.HasPrefix(trimmed, []byte("event:")) {
+		name := bytes.TrimSpace(trimmed[len("event:"):])
+		switch string(name) {
+		case "response.reasoning.delta":
+			return bytes.Replace(line, name, []byte("response.reasoning_text.delta"), 1)
+		case "response.reasoning.done":
+			return bytes.Replace(line, name, []byte("response.reasoning_text.done"), 1)
+		}
+		return line
+	}
+	// `data:` and other lines: parse JSON string boundaries and rewrite only
+	// the value of the "type" property.
+	line, _ = replaceJSONPropertyStringValue(line, "type", "response.reasoning.delta", `"response.reasoning_text.delta"`)
+	line, _ = replaceJSONPropertyStringValue(line, "type", "response.reasoning.done", `"response.reasoning_text.done"`)
 	return line
 }
 
