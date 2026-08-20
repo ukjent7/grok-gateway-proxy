@@ -55,7 +55,6 @@ linters:
         text: "rows.Close|rows.Err|w.Write|fmt.Fprint|io.Copy|io.ReadAll"
 
 formatters:
-  default: none
   enable:
     - gofmt
     - goimports
