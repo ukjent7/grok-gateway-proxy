@@ -66,7 +66,7 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 
 type Config struct {
 	ListenAddr      string                   `json:"listen_addr"`
-	ProxyURL        string                   `json:"proxy_url,omitempty"`
+	proxyURL        string                   `json:"-"`
 	UpstreamTimeout time.Duration            `json:"-"`
 	LogRetention    time.Duration            `json:"-"`
 	ConfigPath      string                   `json:"-"`
@@ -125,12 +125,24 @@ func DefaultConfig(path string) *Config {
 	}
 }
 
-func LoadConfig(path string, logRetentionDays int) (*Config, error) {
+// LoadConfig loads configuration from path. logRetentionDays is the explicit
+// retention (in days) supplied via the --log-retention-days flag or the
+// GROK_PROXY_LOG_RETENTION_DAYS env var; it is nil when neither was provided.
+//
+// Precedence (highest to lowest): explicit flag/env > config file value >
+// built-in default (30 days). Passing nil means "no explicit value", so the
+// file value (or the default) applies. A nil value is preserved on the next
+// Save so an explicit runtime value is only made permanent if you also Save.
+func LoadConfig(path string, logRetentionDays *int) (*Config, error) {
 	cfg := DefaultConfig(path)
-	cfg.LogRetention = time.Duration(logRetentionDays) * 24 * time.Hour
 
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
+		if logRetentionDays != nil {
+			if err := cfg.setLogRetention(*logRetentionDays); err != nil {
+				return nil, fmt.Errorf("invalid log retention: %w", err)
+			}
+		}
 		return cfg, nil
 	}
 	if err != nil {
@@ -149,15 +161,20 @@ func LoadConfig(path string, logRetentionDays int) (*Config, error) {
 	if disk.ListenAddr != "" {
 		cfg.ListenAddr = disk.ListenAddr
 	}
-	cfg.ProxyURL = strings.TrimSpace(disk.ProxyURL)
+	cfg.proxyURL = strings.TrimSpace(disk.ProxyURL)
 	if disk.UpstreamTimeoutS > 0 {
 		cfg.UpstreamTimeout = time.Duration(disk.UpstreamTimeoutS) * time.Second
 	}
+	// Precedence: explicit flag/env (logRetentionDays) > file value > default.
 	if disk.LogRetentionDays != nil {
-		if *disk.LogRetentionDays < 0 {
-			return nil, errors.New("invalid config: log_retention_days must be >= 0")
+		if err := cfg.setLogRetention(*disk.LogRetentionDays); err != nil {
+			return nil, fmt.Errorf("invalid config: %w", err)
 		}
-		cfg.LogRetention = time.Duration(*disk.LogRetentionDays) * 24 * time.Hour
+	}
+	if logRetentionDays != nil {
+		if err := cfg.setLogRetention(*logRetentionDays); err != nil {
+			return nil, fmt.Errorf("invalid log retention: %w", err)
+		}
 	}
 	for id, gateway := range disk.Gateways {
 		if defaultGateway, ok := DefaultGateways[id]; ok {
@@ -185,6 +202,16 @@ func LoadConfig(path string, logRetentionDays int) (*Config, error) {
 	return cfg, nil
 }
 
+// setLogRetention validates and applies a retention duration in days. Zero
+// means "keep forever"; negative values are rejected.
+func (c *Config) setLogRetention(days int) error {
+	if days < 0 {
+		return errors.New("log_retention_days must be >= 0")
+	}
+	c.LogRetention = time.Duration(days) * 24 * time.Hour
+	return nil
+}
+
 func (c *Config) Save() error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -205,7 +232,7 @@ func (c *Config) saveLocked() error {
 		Gateways               map[string]GatewayConfig `json:"gateways"`
 	}{
 		ListenAddr:             c.ListenAddr,
-		ProxyURL:               c.ProxyURL,
+		ProxyURL:               c.proxyURL,
 		UpstreamTimeoutSeconds: int(c.UpstreamTimeout / time.Second),
 		LogRetentionDays:       int(c.LogRetention / (24 * time.Hour)),
 		Gateways:               c.Gateways,
@@ -259,7 +286,7 @@ func ValidateConfig(listenAddr string, gateways map[string]GatewayConfig) error 
 }
 
 func (c *Config) validateLocked() error {
-	if err := ValidateProxyURL(c.ProxyURL); err != nil {
+	if err := ValidateProxyURL(c.proxyURL); err != nil {
 		return err
 	}
 	return ValidateConfig(c.ListenAddr, c.Gateways)
@@ -397,11 +424,21 @@ func (c *Config) SetProxyURL(proxyURL string) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	old := c.ProxyURL
-	c.ProxyURL = proxyURL
+	old := c.proxyURL
+	c.proxyURL = proxyURL
 	if err := c.saveLocked(); err != nil {
-		c.ProxyURL = old
+		c.proxyURL = old
 		return err
 	}
 	return nil
+}
+
+// ProxyURL returns the current global HTTP/HTTPS proxy URL. Reads must go
+// through this accessor (rather than the proxyURL field directly) because the
+// value is mutated by SetProxyURL under c.mu while the HTTP server may read it
+// concurrently.
+func (c *Config) ProxyURL() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.proxyURL
 }
