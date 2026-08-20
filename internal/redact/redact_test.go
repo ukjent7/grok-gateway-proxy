@@ -7,18 +7,18 @@ import (
 
 func TestSensitiveHeader(t *testing.T) {
 	cases := map[string]bool{
-		"Authorization":           true,
-		"authorization":           true,
-		"X-Api-Key":               true,
-		"x-api-key":               true,
-		"x-vendor-secret":         true,
-		"X-Vendor-Secret":         true,
-		"Cookie":                  true,
-		"Set-Cookie":              true,
-		"Bearer-Token":            true,
-		"Content-Type":            false,
-		"Accept":                  false,
-		"X-Request-Id":            false,
+		"Authorization":   true,
+		"authorization":   true,
+		"X-Api-Key":       true,
+		"x-api-key":       true,
+		"x-vendor-secret": true,
+		"X-Vendor-Secret": true,
+		"Cookie":          true,
+		"Set-Cookie":      true,
+		"Bearer-Token":    true,
+		"Content-Type":    false,
+		"Accept":          false,
+		"X-Request-Id":    false,
 	}
 	for name, want := range cases {
 		if got := SensitiveHeader(name); got != want {
