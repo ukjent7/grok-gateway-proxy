@@ -132,12 +132,12 @@ func TestStoreInsertEmptyBody(t *testing.T) {
 	defer store.Close()
 
 	log := RequestLog{
-		ID:        "empty-body",
-		StartedAt: time.Now().UTC(),
-		GatewayID: "oc",
-		RequestBody:     nil,
-		UpstreamBody:    nil,
-		ResponseBody:    nil,
+		ID:                   "empty-body",
+		StartedAt:            time.Now().UTC(),
+		GatewayID:            "oc",
+		RequestBody:          nil,
+		UpstreamBody:         nil,
+		ResponseBody:         nil,
 		UpstreamResponseBody: nil,
 	}
 	if err := store.Insert(context.Background(), log); err != nil {

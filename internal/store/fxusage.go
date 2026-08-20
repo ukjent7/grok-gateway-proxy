@@ -77,7 +77,7 @@ func extractFXUsageMap(usage map[string]any) UsageMetrics {
 			cached, cachedOK = value, true
 		}
 		if value, ok := fxFirstNumberOK(details, "cache_write_tokens"); ok && !cacheWriteOK {
-			cacheWrite, cacheWriteOK = value, true
+			cacheWrite = value
 		}
 	}
 

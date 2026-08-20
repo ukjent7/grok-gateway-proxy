@@ -11,7 +11,7 @@ import (
 
 	"grok-gateway-proxy/internal/config"
 
-	_ "modernc.org/sqlite"
+	_ "modernc.org/sqlite" // pure-Go SQLite driver
 )
 
 type Store struct {
