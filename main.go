@@ -146,7 +146,7 @@ func main() {
 	logger.Info("grok gateway proxy listening", "addr", cfg.ListenAddr, "data_dir", dataPath)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("HTTP server", "error", err)
-		os.Exit(1)
+		return
 	}
 	fmt.Fprintln(os.Stdout, "grok gateway proxy stopped")
 }
