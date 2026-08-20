@@ -8,7 +8,7 @@ import (
 func TestSensitiveHeader(t *testing.T) {
 	cases := map[string]bool{
 		"Authorization":           true,
-		"authorization":            true,
+		"authorization":           true,
 		"X-Api-Key":               true,
 		"x-api-key":               true,
 		"x-vendor-secret":         true,
