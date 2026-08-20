@@ -1067,6 +1067,10 @@ kbd{
 .diff-line-empty code{ color:transparent; user-select:none; }
 .diff-row.modified .diff-line-old i,
 .diff-row.modified .diff-line-new i{ color:var(--amber); }
+.diff-row.moved .diff-line-old i,
+.diff-row.moved .diff-line-new i{ color:var(--sky); }
+.diff-row.moved .diff-line-old{ background:rgba(56,189,248,.07); }
+.diff-row.moved .diff-line-new{ background:rgba(56,189,248,.07); }
 .diff-explanation{
   grid-column:1 / -1;
   padding:5px 10px 6px 25px;
