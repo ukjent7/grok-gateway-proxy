@@ -78,6 +78,12 @@ export function explainJSONChange(path, kind, before, after, category) {
   if (kind === 'deleted' && (path === '$.store' || path === '$.include' || path.includes('prompt_cache_key'))) return '删除字段 ' + path + '：已转 header（prompt_cache_key -> X-Session-Id）或 V3 不支持，属预期协议转换';
   if (kind === 'deleted' && path.startsWith('$.input[')) return '删除字段 ' + path + '：Responses 的 input 已按 V3 重写为 prompt（message/function_call -> user/assistant/tool），属 FX 协议转换，非误删';
   if (kind === 'added' && path.startsWith('$.prompt[')) return '新增字段 ' + path + '：V3 的 prompt 由 Responses input 转换生成';
+  // V3 tools：Responses 的 parameters -> V3 的 inputSchema 重命名（你看到的 foreground.description 就是这个）
+  if (path.includes('.tools[') && (path.includes('.parameters') || path.includes('.inputSchema'))) {
+    if (kind === 'deleted' && path.includes('.parameters')) return '删除字段 ' + path + '：V3 将 parameters 重命名为 inputSchema，属预期协议转换（同值已在 inputSchema 同路径下新增）';
+    if (kind === 'added' && path.includes('.inputSchema')) return '新增字段 ' + path + '：由 parameters 重命名而来（V3 inputSchema），属预期协议转换';
+    return '修改字段 ' + path + '：tools 参数结构（V3 parameters ↔ inputSchema）';
+  }
   if (kind === 'added') return '新增字段 ' + path;
   if (kind === 'deleted') return '删除字段 ' + path;
   return '修改字段 ' + path;
@@ -106,7 +112,42 @@ export function buildJSONDiff(before, after, category) {
       rows.push({ kind: 'modified', path, before: beforeValue, after: afterValue, explanation, expected: false });
     }
   });
-  return rows;
+  return mergeRenameRows(rows);
+}
+
+/* 将 V3 的 parameters -> inputSchema 重命名对合并为一条 moved，避免显示为 删除+新增 */
+function mergeRenameRows(rows) {
+  const delMap = new Map();
+  const addMap = new Map();
+  rows.forEach(r => {
+    if (r.kind === 'deleted' && r.path.includes('.parameters')) delMap.set(r.path, r);
+    if (r.kind === 'added' && r.path.includes('.inputSchema')) addMap.set(r.path, r);
+  });
+  if (!delMap.size || !addMap.size) return rows;
+  const toRemove = new Set();
+  const merged = [];
+  for (const [delPath, delRow] of delMap) {
+    const addPath = delPath.replace('.parameters', '.inputSchema');
+    const addRow = addMap.get(addPath);
+    if (!addRow) continue;
+    // 值相同或都是字符串描述，视为重命名搬运
+    const sameValue = delRow.before === addRow.after;
+    merged.push({
+      kind: sameValue ? 'moved' : 'modified',
+      path: delPath + ' → ' + addPath,
+      before: delRow.before,
+      after: addRow.after,
+      explanation: sameValue
+        ? 'V3 重命名：' + delPath + ' → ' + addPath + '（parameters → inputSchema，值未变，属预期协议转换）'
+        : 'V3 重命名+修改：' + delPath + ' → ' + addPath + '（parameters → inputSchema）',
+      expected: true,
+    });
+    toRemove.add(delPath);
+    toRemove.add(addPath);
+  }
+  if (!merged.length) return rows;
+  const filtered = rows.filter(r => !toRemove.has(r.path));
+  return [...filtered, ...merged].sort((a, b) => a.path.localeCompare(b.path));
 }
 
 export function buildValueDiff(path, before, after) {
@@ -272,7 +313,7 @@ export function diffStats(diffs) {
     for (const row of diff.rows) {
       if (row.expected) continue; // 预期转换不计入顶部数字，避免“一堆删除”吓人
       if (row.kind === 'added') total.added++;
-      if (row.kind === 'modified') total.modified++;
+      if (row.kind === 'modified' || row.kind === 'moved') total.modified++;
       if (row.kind === 'deleted') total.deleted++;
       if (row.kind !== 'same') total.total++;
     }
@@ -333,7 +374,7 @@ function diffLineText(row, value) {
 }
 
 function renderDiffRow(row) {
-  const isMod = row.kind === 'modified';
+  const isMod = row.kind === 'modified' || row.kind === 'moved';
   let oldLine = '', newLine = '';
   let oldHTML = '', newHTML = '';
   if (row.kind === 'added') {
@@ -343,22 +384,32 @@ function renderDiffRow(row) {
     oldLine = diffLineText(row, row.before || '');
     oldHTML = escapeHtml(oldLine);
   } else if (isMod) {
-    const leftRaw = diffLineText(row, row.before || '');
-    const rightRaw = diffLineText(row, row.after || '');
-    // 行内字符高亮：几百字里改一个字也能一眼看见
-    const inline = inlineHighlight(leftRaw, rightRaw);
-    oldHTML = inline.beforeHTML;
-    newHTML = inline.afterHTML;
+    // moved: 路径已包含 →，值相同则无需字符高亮，直接展示
+    if (row.kind === 'moved') {
+      oldHTML = escapeHtml(diffLineText({ path: row.path.split(' → ')[0], kind: 'modified' }, row.before || ''));
+      newHTML = escapeHtml(diffLineText({ path: row.path.split(' → ')[1] || row.path, kind: 'modified' }, row.after || ''));
+      // 同值搬运时在行尾加提示，避免用户以为是修改
+      if (row.before === row.after) {
+        oldHTML += ' <span style="color:var(--text-3);font-size:10px">(搬运)</span>';
+        newHTML += ' <span style="color:var(--text-3);font-size:10px">(搬运)</span>';
+      }
+    } else {
+      const leftRaw = diffLineText(row, row.before || '');
+      const rightRaw = diffLineText(row, row.after || '');
+      const inline = inlineHighlight(leftRaw, rightRaw);
+      oldHTML = inline.beforeHTML;
+      newHTML = inline.afterHTML;
+    }
   } else {
     oldHTML = escapeHtml(diffLineText(row, row.before || ''));
     newHTML = escapeHtml(diffLineText(row, row.after || ''));
   }
   const oldClass = row.kind === 'deleted' || isMod ? 'diff-line-old' : 'diff-line-empty';
   const newClass = row.kind === 'added' || isMod ? 'diff-line-new' : 'diff-line-empty';
-  const marker = row.kind === 'added' ? '+' : row.kind === 'deleted' ? '−' : isMod ? '±' : ' ';
+  const marker = row.kind === 'added' ? '+' : row.kind === 'deleted' ? '−' : row.kind === 'moved' ? '↔' : isMod ? '±' : ' ';
   const expClass = row.expected ? ' diff-row-expected' : '';
   return '<div class="diff-row ' + row.kind + expClass + '">' +
-    '<div class="diff-line ' + oldClass + '"><i>' + (row.kind === 'added' ? ' ' : marker) + '</i><code>' + (isMod ? oldHTML : escapeHtml(oldLine ? oldLine : '')) + (isMod ? '' : '') + '</code></div>' +
+    '<div class="diff-line ' + oldClass + '"><i>' + (row.kind === 'added' ? ' ' : marker) + '</i><code>' + (isMod ? oldHTML : escapeHtml(oldLine ? oldLine : '')) + '</code></div>' +
     '<div class="diff-line ' + newClass + '"><i>' + (row.kind === 'deleted' ? ' ' : marker) + '</i><code>' + (isMod ? newHTML : escapeHtml(newLine ? newLine : '')) + '</code></div>' +
     (row.kind === 'same' ? '' : '<div class="diff-explanation">' + escapeHtml(row.explanation || '') + (row.path ? ' <code>' + escapeHtml(row.path) + '</code>' : '') + '</div>') +
   '</div>';
