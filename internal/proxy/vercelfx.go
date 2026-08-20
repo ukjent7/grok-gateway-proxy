@@ -488,6 +488,18 @@ func (p *v3SSEParser) next() (v3Event, error) {
 	}
 }
 
+// fxOutputItem is one entry of the Responses output array. fxResponseState
+// keeps items in arrival order, so the slice index doubles as both the
+// streamed output_index and the item's position in the final output array —
+// keeping the two in lockstep for strict clients (async-openai).
+type fxOutputItem struct {
+	kind      string // "reasoning", "function_call" or "message"
+	id        string // rs_ / fc_ / msg_ prefixed item id
+	toolID    string // v3 tool id (function_call only)
+	name      string
+	arguments string
+}
+
 // fxResponseState accumulates a v3 stream into a Responses response.
 type fxResponseState struct {
 	model          string
@@ -495,124 +507,183 @@ type fxResponseState struct {
 	createdAt      int64
 	textParts      []string
 	reasoningParts []string
-	// toolCalls keyed by v3 tool id
-	toolCalls map[string]map[string]any
-	// toolOrder preserves tool-call arrival order
-	toolOrder []string
-	usage     map[string]any
-	finish    string
-	done      bool
+	// items holds every output item in arrival order.
+	items []fxOutputItem
+	// toolIndex maps v3 tool id to the item's position in items.
+	toolIndex map[string]int
+	// reasoningIdx and messageIdx point into items (-1 until first seen).
+	reasoningIdx int
+	messageIdx   int
+	usage        map[string]any
+	finish       string
+	done         bool
 }
 
 func newFXResponseState(model string) *fxResponseState {
 	return &fxResponseState{
-		model:      model,
-		responseID: "resp_" + fxHex(8),
-		createdAt:  time.Now().Unix(),
-		toolCalls:  map[string]map[string]any{},
+		model:        model,
+		responseID:   "resp_" + fxHex(8),
+		createdAt:    time.Now().Unix(),
+		toolIndex:    map[string]int{},
+		reasoningIdx: -1,
+		messageIdx:   -1,
 	}
 }
 
-// apply processes one v3 event into the shared accumulator.
-func (s *fxResponseState) apply(ev v3Event) {
+// observe folds one v3 event into the accumulator and reports what changed so
+// the SSE reader can emit the matching Responses events. index is the item's
+// position in s.items (and therefore its output_index); delta is the text or
+// argument delta to forward ("" when the event adds nothing new); created
+// reports whether the event opened a new output item.
+func (s *fxResponseState) observe(ev v3Event) (kind, itemID string, index int, delta string, created bool) {
 	switch ev.typeName() {
 	case "text-delta":
-		s.textParts = append(s.textParts, ev.text())
+		idx, created := s.observeText(ev.text())
+		return "message", s.items[idx].id, idx, ev.text(), created
 	case "reasoning-delta":
-		s.reasoningParts = append(s.reasoningParts, ev.text())
-	case "tool-input-start":
+		idx, created := s.observeReasoning(ev.text())
+		return "reasoning", s.items[idx].id, idx, ev.text(), created
+	case "tool-input-start", "tool-call":
 		id := toolEventID(ev)
 		if id == "" {
 			id = "call_" + fxHex(8)
 		}
 		name := asString(ev["toolName"])
-		if call, exists := s.toolCalls[id]; exists {
-			if name != "" {
-				call["name"] = name
-			}
-			break
+		idx, created := s.observeToolStart(id, name)
+		if ev.typeName() == "tool-call" {
+			// A terminal tool-call carries the complete input; forward only the
+			// part not already streamed by tool-input-delta (may be empty).
+			delta = s.observeToolSnapshot(id, name, ev.arguments())
 		}
-		s.toolCalls[id] = map[string]any{
-			"id":        id,
-			"name":      name,
-			"arguments": "",
-		}
-		s.toolOrder = append(s.toolOrder, id)
+		return "function_call", s.items[idx].id, idx, delta, created
 	case "tool-input-delta":
 		id := toolEventID(ev)
-		if call, ok := s.toolCalls[id]; ok {
-			call["arguments"] = asString(call["arguments"]) + ev.text()
+		idx, ok := s.toolIndex[id]
+		if !ok {
+			return "", "", -1, "", false
 		}
-	case "tool-call":
-		id := toolEventID(ev)
-		if id == "" {
-			id = "call_" + fxHex(8)
-		}
-		name := asString(ev["toolName"])
-		if call, exists := s.toolCalls[id]; exists {
-			if name != "" {
-				call["name"] = name
-			}
-			// tool-call is a complete snapshot in implementations that also
-			// emit tool-input-delta. Do not append it a second time.
-			if incoming := ev.arguments(); incoming != "" {
-				call["arguments"] = incoming
-			}
-			break
-		}
-		s.toolCalls[id] = map[string]any{
-			"id":        id,
-			"name":      name,
-			"arguments": ev.arguments(),
-		}
-		s.toolOrder = append(s.toolOrder, id)
+		s.items[idx].arguments += ev.text()
+		return "function_call", s.items[idx].id, idx, ev.text(), false
 	case "finish":
-		if fr, ok := ev["finishReason"].(map[string]any); ok {
-			s.finish = asString(fr["unified"])
-			if s.finish == "" {
-				s.finish = asString(fr["raw"])
-			}
-		}
-		if u, ok := ev["usage"].(map[string]any); ok {
-			s.usage = u
-		}
-		s.done = true
+		s.observeFinish(ev)
 	}
+	return "", "", -1, "", false
 }
 
-// buildOutput assembles the Responses output item list from accumulated parts.
-func (s *fxResponseState) buildOutput() []any {
-	output := []any{}
-	if len(s.reasoningParts) > 0 {
-		output = append(output, map[string]any{
-			"id":     "rs_" + fxHex(8),
+func (s *fxResponseState) observeText(delta string) (int, bool) {
+	created := s.messageIdx == -1
+	if created {
+		s.messageIdx = len(s.items)
+		s.items = append(s.items, fxOutputItem{kind: "message", id: "msg_" + fxHex(8)})
+	}
+	s.textParts = append(s.textParts, delta)
+	return s.messageIdx, created
+}
+
+func (s *fxResponseState) observeReasoning(delta string) (int, bool) {
+	created := s.reasoningIdx == -1
+	if created {
+		s.reasoningIdx = len(s.items)
+		s.items = append(s.items, fxOutputItem{kind: "reasoning", id: "rs_" + fxHex(8)})
+	}
+	s.reasoningParts = append(s.reasoningParts, delta)
+	return s.reasoningIdx, created
+}
+
+// observeToolStart registers a tool call (or refreshes its name) and returns
+// the item's position in s.items.
+func (s *fxResponseState) observeToolStart(id, name string) (int, bool) {
+	if idx, ok := s.toolIndex[id]; ok {
+		if name != "" {
+			s.items[idx].name = name
+		}
+		return idx, false
+	}
+	idx := len(s.items)
+	s.toolIndex[id] = idx
+	s.items = append(s.items, fxOutputItem{kind: "function_call", id: "fc_" + fxHex(8), toolID: id, name: name})
+	return idx, true
+}
+
+// observeToolSnapshot applies the complete arguments snapshot from a terminal
+// tool-call event and returns only the suffix not yet delivered by
+// tool-input-delta events, so streamed deltas and the final item always agree.
+func (s *fxResponseState) observeToolSnapshot(id, name, snapshot string) string {
+	idx, ok := s.toolIndex[id]
+	if !ok {
+		return ""
+	}
+	if name != "" {
+		s.items[idx].name = name
+	}
+	delta := mergeToolArgumentSnapshot(s.items[idx].arguments, snapshot)
+	s.items[idx].arguments += delta
+	return delta
+}
+
+func (s *fxResponseState) observeFinish(ev v3Event) {
+	if fr, ok := ev["finishReason"].(map[string]any); ok {
+		s.finish = asString(fr["unified"])
+		if s.finish == "" {
+			s.finish = asString(fr["raw"])
+		}
+	}
+	if u, ok := ev["usage"].(map[string]any); ok {
+		s.usage = u
+	}
+	s.done = true
+}
+
+// renderItem renders the output item at position i for output_item.done and
+// the final response.
+func (s *fxResponseState) renderItem(i int) map[string]any {
+	item := s.items[i]
+	switch item.kind {
+	case "reasoning":
+		return map[string]any{
+			"id":     item.id,
 			"type":   "reasoning",
 			"status": "completed",
 			"summary": []any{
 				map[string]any{"type": "summary_text", "text": strings.Join(s.reasoningParts, "")},
 			},
-		})
-	}
-	for _, id := range s.toolOrder {
-		call := s.toolCalls[id]
-		output = append(output, map[string]any{
-			"id":        "fc_" + fxHex(8),
+		}
+	case "function_call":
+		return map[string]any{
+			"id":        item.id,
 			"type":      "function_call",
 			"status":    "completed",
-			"call_id":   id,
-			"name":      asString(call["name"]),
-			"arguments": asString(call["arguments"]),
-		})
+			"call_id":   item.toolID,
+			"name":      item.name,
+			"arguments": item.arguments,
+		}
+	default:
+		return map[string]any{
+			"id":     item.id,
+			"type":   "message",
+			"status": "completed",
+			"role":   "assistant",
+			"content": []any{
+				map[string]any{"type": "output_text", "text": strings.Join(s.textParts, ""), "annotations": []any{}},
+			},
+		}
 	}
-	text := strings.Join(s.textParts, "")
-	if text != "" || len(output) == 0 {
+}
+
+// buildOutput assembles the Responses output item list in arrival order.
+func (s *fxResponseState) buildOutput() []any {
+	output := make([]any, 0, len(s.items))
+	for i := range s.items {
+		output = append(output, s.renderItem(i))
+	}
+	if len(output) == 0 {
 		output = append(output, map[string]any{
 			"id":     "msg_" + fxHex(8),
 			"type":   "message",
 			"status": "completed",
 			"role":   "assistant",
 			"content": []any{
-				map[string]any{"type": "output_text", "text": text, "annotations": []any{}},
+				map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
 			},
 		})
 	}
@@ -814,28 +885,21 @@ func vercelFXSSEToResponses(model string, reader io.Reader) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		state.apply(ev)
+		state.observe(ev)
 	}
 	return json.Marshal(state.buildResponse())
 }
 
 // vercelFXSSEReader converts a v3 SSE stream into Responses protocol SSE on
-// the fly (streaming client request).
+// the fly (streaming client request). The streamed output_index values come
+// from the shared fxResponseState, so they always match the positions of the
+// same items in the final response.output array.
 type vercelFXSSEReader struct {
 	parser  *v3SSEParser
 	state   *fxResponseState
 	pending *bytes.Buffer
-	// message/item stream state
-	started        bool
-	messageID      string
-	messageStarted bool
-	// output_index for the message item
-	messageOutputIndex int
-	// nextOutputIndex is assigned when each Responses output item is first
-	// emitted. It must not be derived from tool count because text and tool
-	// events can arrive in either order.
-	nextOutputIndex int
-	done            bool
+	started bool
+	done    bool
 	// sequence is the strictly increasing sequence_number each SSE event
 	// carries, as required by strict Responses clients (async-openai).
 	sequence int64
@@ -874,7 +938,10 @@ func (r *vercelFXSSEReader) Read(p []byte) (int, error) {
 	}
 }
 
-// emit writes the Responses SSE events for one v3 event.
+// emit writes the Responses SSE events for one v3 event. It delegates all
+// state mutation to fxResponseState.observe so that the streamed output_index
+// values come from the same arrival-ordered item list that buildOutput uses for
+// the final response — guaranteeing the two stay in lockstep.
 func (r *vercelFXSSEReader) emit(ev v3Event) {
 	if !r.started {
 		r.started = true
@@ -906,18 +973,15 @@ func (r *vercelFXSSEReader) emit(ev v3Event) {
 			},
 		})
 	}
-	switch ev.typeName() {
-	case "text-delta":
-		if !r.messageStarted {
-			r.messageStarted = true
-			r.messageID = "msg_" + fxHex(8)
-			r.messageOutputIndex = r.nextOutputIndex
-			r.nextOutputIndex++
+	kind, itemID, index, delta, created := r.state.observe(ev)
+	switch kind {
+	case "message":
+		if created {
 			r.writeEvent(map[string]any{
 				"type":         "response.output_item.added",
-				"output_index": r.messageOutputIndex,
+				"output_index": index,
 				"item": map[string]any{
-					"id":      r.messageID,
+					"id":      itemID,
 					"type":    "message",
 					"status":  "in_progress",
 					"role":    "assistant",
@@ -926,99 +990,64 @@ func (r *vercelFXSSEReader) emit(ev v3Event) {
 			})
 			r.writeEvent(map[string]any{
 				"type":          "response.content_part.added",
-				"item_id":       r.messageID,
-				"output_index":  r.messageOutputIndex,
+				"item_id":       itemID,
+				"output_index":  index,
 				"content_index": 0,
 				"part":          map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
 			})
 		}
-		delta := ev.text()
-		r.state.textParts = append(r.state.textParts, delta)
 		r.writeEvent(map[string]any{
 			"type":          "response.output_text.delta",
-			"item_id":       r.messageID,
-			"output_index":  r.messageOutputIndex,
+			"item_id":       itemID,
+			"output_index":  index,
 			"content_index": 0,
 			"delta":         delta,
 		})
-	case "reasoning-delta":
-		r.state.reasoningParts = append(r.state.reasoningParts, ev.text())
-	case "tool-input-start", "tool-call":
-		r.emitToolStart(ev)
-		if args := ev.arguments(); args != "" {
-			r.emitToolDelta(ev)
+	case "reasoning":
+		if created {
+			r.writeEvent(map[string]any{
+				"type":         "response.output_item.added",
+				"output_index": index,
+				"item": map[string]any{
+					"id":      itemID,
+					"type":    "reasoning",
+					"status":  "in_progress",
+					"summary": []any{},
+				},
+			})
 		}
-	case "tool-input-delta":
-		r.emitToolDelta(ev)
-	case "finish":
-		r.state.apply(ev)
-	}
-}
-
-func (r *vercelFXSSEReader) emitToolStart(ev v3Event) {
-	id := toolEventID(ev)
-	if id == "" {
-		id = "call_" + fxHex(8)
-	}
-	name := asString(ev["toolName"])
-	call, exists := r.state.toolCalls[id]
-	if exists {
-		if name != "" {
-			call["name"] = name
+		r.writeEvent(map[string]any{
+			"type":          "response.reasoning_text.delta",
+			"item_id":       itemID,
+			"output_index":  index,
+			"content_index": 0,
+			"delta":         delta,
+		})
+	case "function_call":
+		if created {
+			item := r.state.items[index]
+			r.writeEvent(map[string]any{
+				"type":         "response.output_item.added",
+				"output_index": index,
+				"item": map[string]any{
+					"id":        itemID,
+					"type":      "function_call",
+					"status":    "in_progress",
+					"call_id":   item.toolID,
+					"name":      item.name,
+					"arguments": "",
+				},
+			})
 		}
-		// A final tool-call event may follow tool-input-start; it is not a
-		// second output item.
-		return
+		if delta != "" {
+			r.writeEvent(map[string]any{
+				"type":         "response.function_call_arguments.delta",
+				"item_id":      itemID,
+				"output_index": index,
+				"delta":        delta,
+			})
+		}
 	}
-	call = map[string]any{
-		"id":           id,
-		"name":         name,
-		"arguments":    "",
-		"fc_id":        "fc_" + fxHex(8),
-		"output_index": r.nextOutputIndex,
-	}
-	r.nextOutputIndex++
-	r.state.toolCalls[id] = call
-	r.state.toolOrder = append(r.state.toolOrder, id)
-	outputIndex := int(asInt64(call["output_index"]))
-	r.writeEvent(map[string]any{
-		"type":         "response.output_item.added",
-		"output_index": outputIndex,
-		"item": map[string]any{
-			"id":        asString(call["fc_id"]),
-			"type":      "function_call",
-			"status":    "in_progress",
-			"call_id":   id,
-			"name":      asString(call["name"]),
-			"arguments": "",
-		},
-	})
-}
-
-func (r *vercelFXSSEReader) emitToolDelta(ev v3Event) {
-	id := asString(ev["id"])
-	if id == "" {
-		id = asString(ev["toolCallId"])
-	}
-	call, ok := r.state.toolCalls[id]
-	if !ok {
-		return
-	}
-	delta := ev.arguments()
-	if ev.typeName() == "tool-call" {
-		delta = mergeToolArgumentSnapshot(asString(call["arguments"]), delta)
-	}
-	if delta == "" {
-		return
-	}
-	call["arguments"] = asString(call["arguments"]) + delta
-	outputIndex := int(asInt64(call["output_index"]))
-	r.writeEvent(map[string]any{
-		"type":         "response.function_call_arguments.delta",
-		"item_id":      asString(call["fc_id"]),
-		"output_index": outputIndex,
-		"delta":        delta,
-	})
 }
 
 // finalize emits the terminal Responses events (done + completed) after the
@@ -1028,55 +1057,45 @@ func (r *vercelFXSSEReader) finalize() {
 		return
 	}
 	r.done = true
-	for _, id := range r.state.toolOrder {
-		call := r.state.toolCalls[id]
-		outputIndex := int(asInt64(call["output_index"]))
-		fcID := asString(call["fc_id"])
-		r.writeEvent(map[string]any{
-			"type":         "response.function_call_arguments.done",
-			"item_id":      fcID,
-			"output_index": outputIndex,
-			"arguments":    asString(call["arguments"]),
-		})
-		r.writeEvent(map[string]any{
-			"type":         "response.output_item.done",
-			"output_index": outputIndex,
-			"item": map[string]any{
-				"id":        fcID,
-				"type":      "function_call",
-				"status":    "completed",
-				"call_id":   id,
-				"name":      asString(call["name"]),
-				"arguments": asString(call["arguments"]),
-			},
-		})
-	}
-	if r.messageStarted {
-		text := strings.Join(r.state.textParts, "")
-		r.writeEvent(map[string]any{
-			"type":          "response.output_text.done",
-			"item_id":       r.messageID,
-			"output_index":  r.messageOutputIndex,
-			"content_index": 0,
-			"text":          text,
-		})
-		r.writeEvent(map[string]any{
-			"type":          "response.content_part.done",
-			"item_id":       r.messageID,
-			"output_index":  r.messageOutputIndex,
-			"content_index": 0,
-			"part":          map[string]any{"type": "output_text", "text": text, "annotations": []any{}},
-		})
+	for i := range r.state.items {
+		item := r.state.items[i]
+		switch item.kind {
+		case "function_call":
+			r.writeEvent(map[string]any{
+				"type":         "response.function_call_arguments.done",
+				"item_id":      item.id,
+				"output_index": i,
+				"arguments":    item.arguments,
+			})
+		case "message":
+			text := strings.Join(r.state.textParts, "")
+			r.writeEvent(map[string]any{
+				"type":          "response.output_text.done",
+				"item_id":       item.id,
+				"output_index":  i,
+				"content_index": 0,
+				"text":          text,
+			})
+			r.writeEvent(map[string]any{
+				"type":          "response.content_part.done",
+				"item_id":       item.id,
+				"output_index":  i,
+				"content_index": 0,
+				"part":          map[string]any{"type": "output_text", "text": text, "annotations": []any{}},
+			})
+		case "reasoning":
+			r.writeEvent(map[string]any{
+				"type":          "response.reasoning_text.done",
+				"item_id":       item.id,
+				"output_index":  i,
+				"content_index": 0,
+				"text":          strings.Join(r.state.reasoningParts, ""),
+			})
+		}
 		r.writeEvent(map[string]any{
 			"type":         "response.output_item.done",
-			"output_index": r.messageOutputIndex,
-			"item": map[string]any{
-				"id":      r.messageID,
-				"type":    "message",
-				"status":  "completed",
-				"role":    "assistant",
-				"content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}},
-			},
+			"output_index": i,
+			"item":         r.state.renderItem(i),
 		})
 	}
 	r.writeEvent(map[string]any{

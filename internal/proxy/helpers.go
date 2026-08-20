@@ -42,7 +42,7 @@ func NewProxy(cfg *config.Config, st *store.Store, logger *slog.Logger) *Proxy {
 		Config:       cfg,
 		Store:        st,
 		Logger:       logger,
-		Client:       NewUpstreamClient(cfg.ProxyURL),
+		Client:       NewUpstreamClient(cfg.ProxyURL()),
 		DirectClient: NewUpstreamClient(""),
 	}
 }

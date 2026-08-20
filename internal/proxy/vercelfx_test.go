@@ -129,21 +129,28 @@ func TestVercelFXSSEToResponsesJSON(t *testing.T) {
 		t.Fatalf("model mismatch: %s", out)
 	}
 	output := resp["output"].([]any)
+	// Output items follow arrival order: the first text delta arrived before
+	// the reasoning delta, so the message precedes the reasoning item. This
+	// keeps the assembled array aligned with the streamed output_index values.
 	if len(output) != 2 {
-		t.Fatalf("expected reasoning+message output, got %d: %s", len(output), out)
+		t.Fatalf("expected message+reasoning output, got %d: %s", len(output), out)
 	}
-	reasoning := output[0].(map[string]any)
-	if reasoning["type"] != "reasoning" {
-		t.Fatalf("expected reasoning item first: %s", out)
-	}
-	message := output[1].(map[string]any)
+	message := output[0].(map[string]any)
 	if message["type"] != "message" {
-		t.Fatalf("expected message item: %s", out)
+		t.Fatalf("expected message item first (arrival order): %s", out)
 	}
 	content := message["content"].([]any)
 	text := content[0].(map[string]any)["text"]
 	if text != "Hello world" {
 		t.Fatalf("text not assembled: %q", text)
+	}
+	reasoning := output[1].(map[string]any)
+	if reasoning["type"] != "reasoning" {
+		t.Fatalf("expected reasoning item second (arrival order): %s", out)
+	}
+	summary := reasoning["summary"].([]any)
+	if got := summary[0].(map[string]any)["text"]; got != "think" {
+		t.Fatalf("reasoning summary not assembled: %q", got)
 	}
 	usage := resp["usage"].(map[string]any)
 	if usage["input_tokens"] != float64(12) || usage["output_tokens"] != float64(3) {
