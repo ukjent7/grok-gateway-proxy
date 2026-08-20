@@ -186,7 +186,7 @@ func hasPathPrefix(path, prefix string) bool {
 func (a *App) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	proxy.WriteJSON(w, http.StatusOK, map[string]any{
 		"listen_addr": a.config.ListenAddr,
-		"proxy_url":   a.config.ProxyURL,
+		"proxy_url":   a.config.ProxyURL(),
 		"version":     a.version,
 		"gateways":    a.config.Snapshot(),
 	})
@@ -233,9 +233,9 @@ func (a *App) patchProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if a.proxy != nil {
-		a.proxy.SetProxyURL(a.config.ProxyURL)
+		a.proxy.SetProxyURL(a.config.ProxyURL())
 	}
-	proxy.WriteJSON(w, http.StatusOK, map[string]any{"proxy_url": a.config.ProxyURL})
+	proxy.WriteJSON(w, http.StatusOK, map[string]any{"proxy_url": a.config.ProxyURL()})
 }
 
 // patchGatewayFromPath extracts the gateway id from the route pattern and

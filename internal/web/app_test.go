@@ -217,14 +217,14 @@ func TestProxyConfigAPIUpdatesGlobalProxyURL(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
 	}
-	if cfg.ProxyURL != "https://proxy.example.test:8443" {
-		t.Fatalf("proxy URL was not updated: %q", cfg.ProxyURL)
+	if cfg.ProxyURL() != "https://proxy.example.test:8443" {
+		t.Fatalf("proxy URL was not updated: %q", cfg.ProxyURL())
 	}
 	var response map[string]any
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if response["proxy_url"] != cfg.ProxyURL {
+	if response["proxy_url"] != cfg.ProxyURL() {
 		t.Fatalf("unexpected proxy response: %+v", response)
 	}
 
@@ -234,7 +234,7 @@ func TestProxyConfigAPIUpdatesGlobalProxyURL(t *testing.T) {
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for SOCKS URL, got %d: %s", recorder.Code, recorder.Body.String())
 	}
-	if cfg.ProxyURL != "https://proxy.example.test:8443" {
-		t.Fatalf("invalid proxy URL changed config: %q", cfg.ProxyURL)
+	if cfg.ProxyURL() != "https://proxy.example.test:8443" {
+		t.Fatalf("invalid proxy URL changed config: %q", cfg.ProxyURL())
 	}
 }
