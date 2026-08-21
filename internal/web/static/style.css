@@ -1,9 +1,9 @@
 /* =========================================================
    Grok Gateway Proxy Console · Modern Enterprise Design System
    · Dual Themes (Dark Obsidian & Light Modern Slate)
-   · Glassmorphism 2.0 Multi-layered Surfaces & Hairline Borders
-   · Space Grotesk / Inter / JetBrains Mono Tabular Data
-   · Reactive Micro-animations, Radial Gauges & Bezier Sparklines
+   · Glassmorphism 2.0 Surfaces & Precise Hairline Borders
+   · Symmetrical Grid Layouts (3x2 Stats, 3x1 Gateways)
+   · Tabular Numbers & Clean Anti-aliasing
    ========================================================= */
 
 /* ---------------- 1. Design Tokens ---------------- */
@@ -13,23 +13,23 @@
   --bg-surface-1: rgba(255, 255, 255, 0.03);
   --bg-surface-2: rgba(255, 255, 255, 0.055);
   --bg-surface-3: rgba(255, 255, 255, 0.09);
-  --bg-surface-hover: rgba(255, 255, 255, 0.08);
-  --bg-card: rgba(13, 17, 25, 0.75);
+  --bg-surface-hover: rgba(255, 255, 255, 0.075);
+  --bg-card: rgba(13, 17, 25, 0.82);
   --bg-card-solid: #0d121d;
-  --bg-elevated: #121824;
+  --bg-elevated: #111724;
 
   /* Borders */
-  --border-subtle: rgba(255, 255, 255, 0.06);
-  --border-medium: rgba(255, 255, 255, 0.12);
-  --border-strong: rgba(255, 255, 255, 0.2);
+  --border-subtle: rgba(255, 255, 255, 0.07);
+  --border-medium: rgba(255, 255, 255, 0.13);
+  --border-strong: rgba(255, 255, 255, 0.22);
 
-  /* Typography */
+  /* Typography Colors */
   --text-primary: #f8fafc;
   --text-secondary: #94a3b8;
   --text-muted: #64748b;
   --text-faint: #334155;
 
-  /* Core Accent Colors */
+  /* Accent Colors */
   --teal: #06b6d4;
   --teal-glow: rgba(6, 182, 212, 0.25);
   --teal-bg: rgba(6, 182, 212, 0.1);
@@ -53,12 +53,12 @@
   --rose-bg: rgba(244, 63, 94, 0.1);
   --rose-glow: rgba(244, 63, 94, 0.25);
 
-  /* Gateway Specific Colors */
+  /* Gateway Specific Brand Colors */
   --gw-oc: #06b6d4;
   --gw-st: #3b82f6;
   --gw-ve: #a855f7;
 
-  /* Typography Stacks */
+  /* Typography */
   --font-display: 'Space Grotesk', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
   --font-ui: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -88,13 +88,13 @@
   --bg-surface-2: rgba(0, 0, 0, 0.045);
   --bg-surface-3: rgba(0, 0, 0, 0.07);
   --bg-surface-hover: rgba(0, 0, 0, 0.055);
-  --bg-card: rgba(255, 255, 255, 0.88);
+  --bg-card: rgba(255, 255, 255, 0.92);
   --bg-card-solid: #ffffff;
   --bg-elevated: #ffffff;
 
-  --border-subtle: rgba(0, 0, 0, 0.07);
-  --border-medium: rgba(0, 0, 0, 0.12);
-  --border-strong: rgba(0, 0, 0, 0.2);
+  --border-subtle: rgba(0, 0, 0, 0.08);
+  --border-medium: rgba(0, 0, 0, 0.14);
+  --border-strong: rgba(0, 0, 0, 0.22);
 
   --text-primary: #0f172a;
   --text-secondary: #475569;
@@ -125,9 +125,14 @@
   --shadow-lg: 0 16px 40px rgba(0, 0, 0, 0.12);
 }
 
-/* ---------------- 2. Base & Reset ---------------- */
+/* ---------------- 2. Global Resets & Hidden Rule ---------------- */
 *, *::before, *::after {
   box-sizing: border-box;
+}
+
+/* Critical: Ensure [hidden] always hides elements */
+[hidden] {
+  display: none !important;
 }
 
 html, body {
@@ -241,7 +246,7 @@ kbd {
   -webkit-mask-image: radial-gradient(ellipse 80% 60% at 50% 25%, #000 30%, transparent 80%);
 }
 
-/* ---------------- 4. App Shell Grid ---------------- */
+/* ---------------- 4. App Shell Layout ---------------- */
 .app {
   display: grid;
   grid-template-columns: 250px 1fr;
@@ -326,7 +331,6 @@ kbd {
   font-size: 11px;
 }
 
-/* Navigation Items */
 .rail-nav {
   display: flex;
   flex-direction: column;
@@ -540,6 +544,7 @@ kbd {
   border: 1px solid var(--border-subtle);
   font-size: 11.5px;
   color: var(--text-secondary);
+  white-space: nowrap;
 }
 
 .addr-chip code {
@@ -582,6 +587,7 @@ kbd {
   font-size: 12.5px;
   box-shadow: 0 2px 10px var(--teal-glow);
   transition: all var(--t-fast);
+  white-space: nowrap;
 }
 
 .btn-primary:hover:not(:disabled) {
@@ -613,6 +619,7 @@ kbd {
   font-size: 12.5px;
   font-weight: 500;
   transition: all var(--t-fast);
+  white-space: nowrap;
 }
 
 .btn-ghost:hover:not(:disabled) {
@@ -639,6 +646,7 @@ kbd {
   font-size: 12.5px;
   font-weight: 600;
   transition: all var(--t-fast);
+  white-space: nowrap;
 }
 
 .btn-danger:hover:not(:disabled) {
@@ -655,6 +663,7 @@ kbd {
   border-radius: var(--r-m);
   color: var(--text-secondary);
   transition: all var(--t-fast);
+  flex-shrink: 0;
 }
 
 .btn-icon:hover {
@@ -667,6 +676,7 @@ kbd {
   font-size: 11.5px;
   font-weight: 500;
   transition: color var(--t-fast);
+  white-space: nowrap;
 }
 .btn-link:hover {
   text-decoration: underline;
@@ -674,7 +684,7 @@ kbd {
 
 .input-modern, .textarea-modern {
   width: 100%;
-  padding: 8px 12px;
+  padding: 9px 12px;
   border-radius: var(--r-m);
   background: var(--bg-surface-1);
   border: 1px solid var(--border-subtle);
@@ -764,6 +774,7 @@ kbd {
   font-weight: 500;
   color: var(--text-secondary);
   transition: all var(--t-fast);
+  white-space: nowrap;
 }
 
 .range-picker button:hover {
@@ -777,18 +788,30 @@ kbd {
   box-shadow: var(--shadow-sm);
 }
 
-/* ---------------- 9. Stat Cards & Gauges ---------------- */
+/* ---------------- 9. Symmetrical Stat Cards Grid (3 Columns × 2 Rows) ---------------- */
 .stat-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: 14px;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+}
+
+@media (max-width: 1100px) {
+  .stat-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 640px) {
+  .stat-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .stat-card {
   position: relative;
   display: flex;
   flex-direction: column;
-  padding: 16px 18px 14px;
+  padding: 18px 20px 16px;
   border-radius: var(--r-l);
   background: var(--bg-card);
   backdrop-filter: blur(16px);
@@ -807,11 +830,11 @@ kbd {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 8px;
+  margin-bottom: 10px;
 }
 
 .stat-label {
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--text-secondary);
 }
@@ -820,8 +843,8 @@ kbd {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 26px;
-  height: 26px;
+  width: 28px;
+  height: 28px;
   border-radius: var(--r-s);
   background: var(--bg-surface-2);
   color: var(--text-muted);
@@ -850,7 +873,7 @@ kbd {
 }
 
 .stat-spark {
-  margin-top: 10px;
+  margin-top: 12px;
   width: 100%;
   height: 32px;
   overflow: visible;
@@ -865,7 +888,7 @@ kbd {
   font-weight: 600;
 }
 
-/* Radial Gauge */
+/* Radial SVG Gauge */
 .stat-gauge {
   width: 44px;
   height: 44px;
@@ -889,7 +912,7 @@ kbd {
   transition: stroke-dashoffset 0.6s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-/* ---------------- 10. Panels ---------------- */
+/* ---------------- 10. Panels & Gateway Matrix ---------------- */
 .panel {
   display: flex;
   flex-direction: column;
@@ -923,16 +946,22 @@ kbd {
 
 .panel-row {
   display: grid;
-  grid-template-columns: 1.2fr 1fr;
+  grid-template-columns: 1.25fr 1fr;
   gap: 16px;
 }
 
-/* Gateway Cache Rate Matrix */
+/* Gateway Cache Rate Matrix (3 Columns) */
 .gateway-cache-rates {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  grid-template-columns: repeat(3, 1fr);
   gap: 14px;
   padding: 16px 20px;
+}
+
+@media (max-width: 900px) {
+  .gateway-cache-rates {
+    grid-template-columns: 1fr;
+  }
 }
 
 .gateway-cache-rate {
@@ -960,6 +989,7 @@ kbd {
 .gateway-title-group strong {
   font-size: 13px;
   color: var(--text-primary);
+  white-space: nowrap;
 }
 
 .gateway-title-group code {
@@ -1028,6 +1058,7 @@ kbd {
   display: flex;
   align-items: center;
   gap: 8px;
+  white-space: nowrap;
 }
 
 .gw-pulse-name {
@@ -1045,6 +1076,7 @@ kbd {
   align-items: center;
   gap: 8px;
   font-size: 11.5px;
+  white-space: nowrap;
 }
 
 .pulse-stat-badge {
@@ -1091,17 +1123,9 @@ kbd {
   transform: scaleY(1.15);
 }
 
-.tick.ok {
-  background: var(--teal);
-}
-
-.tick.ok.slow {
-  background: var(--amber);
-}
-
-.tick.err {
-  background: var(--rose);
-}
+.tick.ok { background: var(--teal); }
+.tick.ok.slow { background: var(--amber); }
+.tick.err { background: var(--rose); }
 
 .tick.tick-empty {
   opacity: 0.3;
@@ -1166,6 +1190,7 @@ kbd {
   display: flex;
   align-items: center;
   gap: 8px;
+  white-space: nowrap;
 }
 
 .rli-latency {
@@ -1220,6 +1245,7 @@ kbd {
   cursor: pointer;
   outline: none;
   transition: all var(--t-fast);
+  white-space: nowrap;
 }
 
 .select-wrap select:focus {
@@ -1266,6 +1292,7 @@ kbd {
   border-radius: var(--r-m);
   background: var(--bg-card-solid);
   border: 1px solid var(--border-subtle);
+  white-space: nowrap;
 }
 
 .datetime-wrap input {
@@ -1297,6 +1324,7 @@ kbd {
   background: var(--bg-surface-1);
   border: 1px solid var(--border-subtle);
   transition: all var(--t-fast);
+  white-space: nowrap;
 }
 
 .quick-filter-pill:hover {
@@ -1381,6 +1409,7 @@ kbd {
   font-family: var(--font-mono);
   font-size: 11px;
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .status-badge.is-success {
@@ -1404,6 +1433,7 @@ kbd {
   font-family: var(--font-mono);
   font-size: 11.5px;
   font-weight: 500;
+  white-space: nowrap;
 }
 
 .latency-fast { color: var(--emerald); }
@@ -1418,6 +1448,7 @@ kbd {
   border-radius: 4px;
   font-size: 10.5px;
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .stream-pill.is-stream {
@@ -1433,6 +1464,7 @@ kbd {
 .cache-rate-badge {
   font-family: var(--font-mono);
   font-size: 11px;
+  white-space: nowrap;
 }
 
 .cache-high { color: var(--teal); font-weight: 600; }
@@ -1506,7 +1538,7 @@ kbd {
   color: var(--text-muted);
 }
 
-/* ---------------- 12. Gateway Configuration View ---------------- */
+/* ---------------- 12. Gateway Configuration View (Redesigned Cards) ---------------- */
 .global-proxy-panel {
   padding: 18px 22px;
   margin-bottom: 4px;
@@ -1525,6 +1557,7 @@ kbd {
   gap: 6px;
   font-size: 11.5px;
   color: var(--teal);
+  white-space: nowrap;
 }
 
 .proxy-status-direct {
@@ -1533,12 +1566,13 @@ kbd {
   gap: 6px;
   font-size: 11.5px;
   color: var(--text-muted);
+  white-space: nowrap;
 }
 
 .gw-config-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
-  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  gap: 18px;
 }
 
 .gw-card {
@@ -1557,41 +1591,67 @@ kbd {
   opacity: 0.65;
 }
 
+/* Structured Multi-level Card Header */
 .gw-card-head {
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
+  flex-direction: column;
+  gap: 10px;
   padding: 16px 20px;
   border-bottom: 1px solid var(--border-subtle);
   background: var(--bg-surface-1);
 }
 
-.gw-card-title {
+.gw-card-head-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.gw-card-title-group {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
 }
 
-.gw-card-title strong {
-  font-size: 14.5px;
+.gw-card-title-group strong {
+  font-size: 15px;
+  font-weight: 700;
   color: var(--text-primary);
+  white-space: nowrap;
 }
 
 .gw-card-prefix {
-  font-size: 11px;
+  font-size: 11.5px;
   color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.gw-card-head-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.gw-card-meta-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .gw-card-protocol-tag {
-  font-size: 11px;
-  color: var(--text-muted);
-  margin-top: 3px;
-}
-
-.gw-card-top-actions {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 10px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 11px;
+  background: var(--bg-surface-2);
+  color: var(--text-secondary);
+  white-space: nowrap;
 }
 
 .gw-card-body {
@@ -1617,6 +1677,7 @@ kbd {
   font-size: 12px;
   font-weight: 600;
   color: var(--text-secondary);
+  white-space: nowrap;
 }
 
 .field-hint {
@@ -1629,17 +1690,11 @@ kbd {
   color: var(--rose);
 }
 
-.field-grid-2 {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-}
-
 .gw-card-toggles {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding: 12px;
+  padding: 12px 14px;
   border-radius: var(--r-m);
   background: var(--bg-surface-1);
   border: 1px solid var(--border-subtle);
@@ -1661,6 +1716,7 @@ kbd {
   font-size: 12.5px;
   font-weight: 500;
   color: var(--text-primary);
+  white-space: nowrap;
 }
 
 /* Modern Switch Toggle */
@@ -1744,6 +1800,7 @@ kbd {
 .preset-pill-label {
   font-size: 11px;
   color: var(--text-muted);
+  white-space: nowrap;
 }
 
 .btn-preset {
@@ -1754,6 +1811,7 @@ kbd {
   font-size: 10.5px;
   color: var(--text-secondary);
   transition: all var(--t-fast);
+  white-space: nowrap;
 }
 
 .btn-preset:hover {
@@ -1795,13 +1853,19 @@ kbd {
   background: var(--bg-surface-1);
 }
 
+/* Dirty State Indicator (Hidden by default, shown with .is-dirty) */
 .gw-dirty-indicator {
-  display: flex;
+  display: none;
   align-items: center;
   gap: 6px;
   font-size: 11.5px;
   color: var(--amber);
   font-weight: 500;
+  white-space: nowrap;
+}
+
+.gw-dirty-indicator.is-dirty {
+  display: inline-flex;
 }
 
 /* ---------------- 13. Integration Setup View ---------------- */
@@ -1896,6 +1960,7 @@ kbd {
   font-weight: 500;
   color: var(--text-muted);
   transition: all var(--t-fast);
+  white-space: nowrap;
 }
 
 .setup-tab:hover {
@@ -2144,6 +2209,7 @@ kbd {
   padding: 2px 8px;
   border-radius: 4px;
   font-size: 11px;
+  white-space: nowrap;
 }
 
 .diff-summary-badge.diff-added { background: var(--emerald-bg); color: var(--emerald); }
@@ -2580,6 +2646,7 @@ kbd {
   border-radius: 50%;
   background: var(--text-muted);
   margin-left: 4px;
+  flex-shrink: 0;
 }
 
 .health-dot.is-ok {
@@ -2593,8 +2660,8 @@ kbd {
 }
 
 .gw-dot {
-  width: 7px;
-  height: 7px;
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
   flex-shrink: 0;
 }
@@ -2613,6 +2680,7 @@ kbd {
   font-weight: 600;
   background: var(--bg-surface-2);
   color: var(--text-secondary);
+  white-space: nowrap;
 }
 
 .gw-badge.is-on {
