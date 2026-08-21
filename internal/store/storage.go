@@ -437,13 +437,6 @@ func (s *Store) Insert(ctx context.Context, log RequestLog) error {
 	return err
 }
 
-func emptyBlob(value []byte) []byte {
-	if value == nil {
-		return []byte{}
-	}
-	return value
-}
-
 // gzipString compresses a header JSON string. Returns empty bytes for empty
 // input so no compression overhead is added for missing fields.
 func gzipString(s string) ([]byte, error) {

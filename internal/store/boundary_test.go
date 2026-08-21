@@ -122,8 +122,7 @@ func TestStoreConcurrentReadWrite(t *testing.T) {
 	}
 }
 
-// Inserting a log with an empty body must not fail: emptyBlob converts nil
-// to an empty byte slice.
+// Inserting a log with an empty body must not fail.
 func TestStoreInsertEmptyBody(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
 	if err != nil {
