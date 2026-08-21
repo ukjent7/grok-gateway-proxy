@@ -71,14 +71,14 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 }
 
 type Config struct {
-	ListenAddr        string                   `json:"listen_addr"`
-	proxyURL          string                   `json:"-"`
-	UpstreamTimeout   time.Duration            `json:"-"`
-	LogRetention      time.Duration            `json:"-"`
-	BodyCaptureLimitKB int                     `json:"-"`
-	ConfigPath        string                   `json:"-"`
-	Gateways          map[string]GatewayConfig `json:"gateways"`
-	mu                sync.RWMutex
+	ListenAddr         string                   `json:"listen_addr"`
+	proxyURL           string                   `json:"-"`
+	UpstreamTimeout    time.Duration            `json:"-"`
+	LogRetention       time.Duration            `json:"-"`
+	BodyCaptureLimitKB int                      `json:"-"`
+	ConfigPath         string                   `json:"-"`
+	Gateways           map[string]GatewayConfig `json:"gateways"`
+	mu                 sync.RWMutex
 }
 
 // DefaultGateways holds the fixed identity (prefix/protocol/name/base URL) for
@@ -124,12 +124,12 @@ func BuildDefaultGateways() map[string]GatewayConfig {
 
 func DefaultConfig(path string) *Config {
 	return &Config{
-		ListenAddr:          "127.0.0.1:8787",
-		UpstreamTimeout:     DefaultUpstreamTimeout,
-		LogRetention:        7 * 24 * time.Hour,
-		BodyCaptureLimitKB:  DefaultBodyCaptureLimitKB,
-		ConfigPath:          path,
-		Gateways:            BuildDefaultGateways(),
+		ListenAddr:         "127.0.0.1:8787",
+		UpstreamTimeout:    DefaultUpstreamTimeout,
+		LogRetention:       7 * 24 * time.Hour,
+		BodyCaptureLimitKB: DefaultBodyCaptureLimitKB,
+		ConfigPath:         path,
+		Gateways:           BuildDefaultGateways(),
 	}
 }
 
