@@ -1,5 +1,9 @@
 'use strict';
 
+/* ============================================================
+   Grok Gateway Console · 全局响应式状态管理
+   ============================================================ */
+
 import { api } from './api.js';
 import { $ } from './utils.js';
 
@@ -11,14 +15,18 @@ export const state = {
   metrics: null,
   logs: [],
   logsTotal: null,
+  logsOffset: 0,
   recentLogs: [],
   sparkSeries: [],
-  logsOffset: 0,
   range: '1h',
   activeView: 'overview',
+  theme: localStorage.getItem('grok_theme') || 'dark',
+  autoRefresh: Number(localStorage.getItem('grok_auto_refresh') || 15),
+  autoRefreshTimer: null,
   drawerLog: null,
   drawerTab: 'request-compare',
-  pollTimer: null,
+  drawerDiffMode: localStorage.getItem('grok_diff_mode') || 'split',
+  drawerLogId: null,
   cmdkSelected: 0,
   cmdkItems: [],
   pulseSig: {},
@@ -28,8 +36,6 @@ export const state = {
   health: { upstreams: {} }
 };
 
-// 网关显示顺序：以 /api/config 返回的键序为准（后端按 id 排序），
-// 配置尚未加载时使用默认顺序。
 export function gatewayIds() {
   const ids = Object.keys(state.gateways);
   return ids.length ? ids : ['oc', 'st', 've'];
@@ -41,12 +47,17 @@ export async function loadConfig() {
   state.listenAddr = data.listen_addr || '';
   state.proxyURL = data.proxy_url || '';
   state.version = data.version || '';
-  $('#listenAddr').textContent = state.listenAddr || '—';
+
+  const listenEl = $('#listenAddr');
+  if (listenEl) listenEl.textContent = state.listenAddr || '—';
+
   const verEl = $('#railVersion');
-  if (verEl) verEl.textContent = 'v' + (state.version || '?') + ' · 本地模式 · Grok Build 就绪';
+  if (verEl) {
+    verEl.textContent = 'v' + (state.version || '1.0.0') + ' · 本地模式 · Grok Build 就绪';
+  }
+
   const sel = $('#filterGateway');
   if (sel) {
-    // 重建选项前记住当前选择，避免刷新时把用户已选的网关筛选清掉。
     const prev = sel.value;
     sel.innerHTML = '<option value="">全部网关</option>';
     gatewayIds().forEach(id => {
@@ -54,9 +65,11 @@ export async function loadConfig() {
       if (!gw) return;
       const opt = document.createElement('option');
       opt.value = id;
-      opt.textContent = gw.name + ' (' + gw.prefix + ')';
+      opt.textContent = gw.name + ' (' + (gw.prefix || id) + ')';
       sel.appendChild(opt);
     });
-    if (prev && [...sel.options].some(o => o.value === prev)) sel.value = prev;
+    if (prev && [...sel.options].some(o => o.value === prev)) {
+      sel.value = prev;
+    }
   }
 }
