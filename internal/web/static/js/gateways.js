@@ -2,10 +2,10 @@
 
 /* ============================================================
    Grok Gateway Console · 网关配置卡片模块
-   - 全局代理配置与校验
-   - 动态网关卡片与实时状态
+   - 全局代理配置与实时状态
+   - 结构化网关卡片设计 (无文本换行溢出)
    - 在线连通性测试 (Test Connection)
-   - 字段修改跟踪与内联校验
+   - 精确脏值状态追踪 (Dirty State Tracking)
    ============================================================ */
 
 import { state, gatewayIds, loadConfig } from './state.js';
@@ -96,52 +96,59 @@ export function renderGatewayCards() {
     const headers = (gw.forward_headers || []).join('\n');
 
     card.innerHTML = `
+      <!-- 卡片头部：分层结构，彻底杜绝文字挤压换行 -->
       <div class="gw-card-head">
-        <div class="gw-card-title-group">
-          <div class="gw-card-title">
+        <div class="gw-card-head-top">
+          <div class="gw-card-title-group">
             <span class="gw-dot gw-dot-${escapeHtml(id)}"></span>
             <strong>${escapeHtml(gw.name)}</strong>
             <code class="gw-card-prefix">${escapeHtml(gw.prefix || '')}</code>
-            ${healthDotHTML(id)}
-            ${gw.enabled ? '<span class="gw-badge is-on">已启用</span>' : '<span class="gw-badge is-off">已停用</span>'}
           </div>
-          <div class="gw-card-protocol-tag">
-            ${gw.protocol === 'chat_completions' ? 'Chat Completions 协议' : 'Responses 协议'}
-          </div>
-        </div>
-        <div class="gw-card-top-actions">
-          <button type="button" class="btn-ghost small test-conn-btn" data-gw="${escapeHtml(id)}" title="测试与该网关的连通性">
-            <svg viewBox="0 0 16 16" width="12" height="12" fill="none"><path d="M1 8h3l2-4 4 8 2-4h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            测试连通性
-          </button>
-          <label class="toggle toggle-large" title="启用 / 停用网关">
+          <label class="toggle toggle-large" title="启用 / 停用此网关">
             <input type="checkbox" class="f-enabled" ${gw.enabled ? 'checked' : ''}>
             <span class="toggle-track"></span>
           </label>
         </div>
+
+        <div class="gw-card-head-meta">
+          <div class="gw-card-meta-left">
+            <span class="gw-card-protocol-tag">
+              ${gw.protocol === 'chat_completions' ? 'Chat Completions 协议' : 'Responses 协议'}
+            </span>
+            ${gw.enabled
+              ? '<span class="gw-badge is-on">已启用</span>'
+              : '<span class="gw-badge is-off">已停用</span>'}
+            ${healthDotHTML(id)}
+          </div>
+          <button type="button" class="btn-ghost small test-conn-btn" data-gw="${escapeHtml(id)}" title="向网关 /models 发起探测">
+            <svg viewBox="0 0 16 16" width="12" height="12" fill="none"><path d="M1 8h3l2-4 4 8 2-4h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            测试连通性
+          </button>
+        </div>
       </div>
 
+      <!-- 连通性测试结果提示条 -->
       <div class="test-conn-result" id="testResult-${escapeHtml(id)}" hidden></div>
 
+      <!-- 表单主体 -->
       <div class="gw-card-body">
-        <div class="field-grid-2">
-          <div class="field">
-            <label class="field-label">网关名称</label>
-            <input type="text" class="f-name input-modern" value="${escapeAttr(gw.name)}" placeholder="网关显示名称">
-            <span class="field-error" hidden></span>
-          </div>
-          <div class="field">
-            <label class="field-label">上游基地址 (Base URL)</label>
-            <input type="text" class="f-baseurl input-modern" value="${escapeAttr(gw.base_url)}" placeholder="https://api.openai.com/v1">
-            <span class="field-error" hidden></span>
-          </div>
+        <div class="field">
+          <label class="field-label">网关显示名称</label>
+          <input type="text" class="f-name input-modern" value="${escapeAttr(gw.name)}" placeholder="网关显示名称">
+          <span class="field-error" hidden></span>
+        </div>
+
+        <div class="field">
+          <label class="field-label">上游基地址 (Base URL)</label>
+          <input type="text" class="f-baseurl input-modern" value="${escapeAttr(gw.base_url)}" placeholder="https://api.openai.com/v1">
+          <span class="field-error" hidden></span>
         </div>
 
         <div class="gw-card-toggles">
           <div class="toggle-row">
             <div class="toggle-info">
               <span class="switch-label">使用全局代理</span>
-              <span class="field-hint">使用上方配置的 HTTP/HTTPS 代理转发请求</span>
+              <span class="field-hint">使用上方配置的 HTTP / HTTPS 代理转发请求</span>
             </div>
             <label class="toggle">
               <input type="checkbox" class="f-proxy" ${gw.use_proxy !== false ? 'checked' : ''}>
@@ -151,8 +158,8 @@ export function renderGatewayCards() {
 
           <div class="toggle-row">
             <div class="toggle-info">
-              <span class="switch-label">User-Agent 覆盖</span>
-              <span class="field-hint">向上游发起请求时伪装或重写 User-Agent 头</span>
+              <span class="switch-label">User-Agent 标头覆盖</span>
+              <span class="field-hint">向上游发起请求时伪装或重写 User-Agent</span>
             </div>
             <label class="toggle">
               <input type="checkbox" class="f-ua-enabled" ${gw.user_agent_override_enabled ? 'checked' : ''}>
@@ -170,7 +177,7 @@ export function renderGatewayCards() {
           <div class="gw-special-panel">
             <div class="toggle-row">
               <div class="toggle-info">
-                <span class="switch-label font-bold">FX 免费池协议伪装 (Vercel)</span>
+                <span class="switch-label font-bold" style="color:var(--violet)">FX 免费池协议伪装 (Vercel)</span>
                 <span class="field-hint">自动把 Responses 协议转为官方 fx 客户端 v3 协议发往 /v3/ai/language-model，重写 Referer/X-Title 并注入环境指纹</span>
               </div>
               <label class="toggle">
@@ -200,8 +207,9 @@ export function renderGatewayCards() {
         </div>
       </div>
 
+      <!-- 卡片脚栏 -->
       <div class="gw-card-foot">
-        <div class="gw-dirty-indicator" hidden>
+        <div class="gw-dirty-indicator">
           <span class="dot dot-warn"></span>
           <span>有未保存的修改</span>
         </div>
@@ -213,33 +221,72 @@ export function renderGatewayCards() {
     `;
 
     container.appendChild(card);
-
-    // Event listeners
-    bindGatewayCardEvents(id, card);
+    bindGatewayCardEvents(id, card, gw);
   });
 
   applyHealthUI();
 }
 
-function bindGatewayCardEvents(id, card) {
+function bindGatewayCardEvents(id, card, initialGw) {
   const urlInput = card.querySelector('.f-baseurl');
   const nameInput = card.querySelector('.f-name');
+  const enabledToggle = card.querySelector('.f-enabled');
+  const proxyToggle = card.querySelector('.f-proxy');
   const uaToggle = card.querySelector('.f-ua-enabled');
+  const uaInput = card.querySelector('.f-ua');
   const uaWrap = card.querySelector('.f-ua-wrap');
   const fxToggle = card.querySelector('.f-fx');
+  const fxUA = card.querySelector('.f-fx-ua');
   const fxWrap = card.querySelector('.f-fx-ua-wrap');
+  const headersTextarea = card.querySelector('.f-headers');
   const dirtyIndicator = card.querySelector('.gw-dirty-indicator');
   const saveBtn = card.querySelector('.save-gw-btn');
   const testBtn = card.querySelector('.test-conn-btn');
   const testResult = card.querySelector(`#testResult-${id}`);
 
-  const markDirty = () => {
-    if (dirtyIndicator) dirtyIndicator.hidden = false;
+  // Snapshot of saved state
+  const baseline = {
+    name: initialGw.name || '',
+    base_url: initialGw.base_url || '',
+    enabled: !!initialGw.enabled,
+    use_proxy: initialGw.use_proxy !== false,
+    user_agent_override_enabled: !!initialGw.user_agent_override_enabled,
+    user_agent_override: initialGw.user_agent_override || '',
+    fx_disguise_enabled: !!initialGw.fx_disguise_enabled,
+    fx_disguise_user_agent: initialGw.fx_disguise_user_agent || 'fx/0.0.3',
+    forward_headers: (initialGw.forward_headers || []).join('\n')
+  };
+
+  const checkDirty = () => {
+    const curName = nameInput ? nameInput.value.trim() : '';
+    const curUrl = urlInput ? urlInput.value.trim() : '';
+    const curEnabled = enabledToggle ? enabledToggle.checked : false;
+    const curProxy = proxyToggle ? proxyToggle.checked : true;
+    const curUaEnabled = uaToggle ? uaToggle.checked : false;
+    const curUa = uaInput ? uaInput.value.trim() : '';
+    const curFxEnabled = fxToggle ? fxToggle.checked : false;
+    const curFxUA = fxUA ? fxUA.value.trim() : 'fx/0.0.3';
+    const curHeaders = headersTextarea ? headersTextarea.value.trim() : '';
+
+    const isModified =
+      curName !== baseline.name ||
+      curUrl !== baseline.base_url ||
+      curEnabled !== baseline.enabled ||
+      curProxy !== baseline.use_proxy ||
+      curUaEnabled !== baseline.user_agent_override_enabled ||
+      curUa !== baseline.user_agent_override ||
+      (fxToggle && curFxEnabled !== baseline.fx_disguise_enabled) ||
+      (fxUA && curFxUA !== baseline.fx_disguise_user_agent) ||
+      curHeaders !== baseline.forward_headers;
+
+    if (dirtyIndicator) {
+      dirtyIndicator.classList.toggle('is-dirty', isModified);
+    }
   };
 
   card.querySelectorAll('input, textarea').forEach(el => {
-    el.addEventListener('input', markDirty);
-    el.addEventListener('change', markDirty);
+    el.addEventListener('input', checkDirty);
+    el.addEventListener('change', checkDirty);
   });
 
   if (uaToggle && uaWrap) {
@@ -258,13 +305,12 @@ function bindGatewayCardEvents(id, card) {
   card.querySelectorAll('.btn-preset').forEach(btn => {
     btn.addEventListener('click', () => {
       const header = btn.dataset.header;
-      const textarea = card.querySelector('.f-headers');
-      if (!textarea) return;
-      const current = textarea.value.split('\n').map(s => s.trim()).filter(Boolean);
+      if (!headersTextarea) return;
+      const current = headersTextarea.value.split('\n').map(s => s.trim()).filter(Boolean);
       if (!current.includes(header)) {
         current.push(header);
-        textarea.value = current.join('\n');
-        markDirty();
+        headersTextarea.value = current.join('\n');
+        checkDirty();
         showToast(`已添加标头 ${header}`, 'info', 1200);
       }
     });
@@ -308,7 +354,7 @@ function bindGatewayCardEvents(id, card) {
           testResult.className = 'test-conn-result is-ok';
           testResult.innerHTML = `
             <span class="dot dot-live"></span>
-            <span>连接正常 · 状态码 ${h.status || 200} · 探测耗时 ${latency}ms</span>
+            <span>连接正常 · 状态码 ${h.status || 200} · 耗时 ${latency}ms</span>
           `;
         } else {
           testResult.className = 'test-conn-result is-err';
@@ -331,70 +377,58 @@ function bindGatewayCardEvents(id, card) {
     });
   }
 
-  // Save
-  saveBtn.addEventListener('click', () => saveGateway(id, card));
-}
+  // Save Gateway Action
+  saveBtn.addEventListener('click', async () => {
+    const payload = {
+      name: nameInput.value.trim(),
+      base_url: urlInput.value.trim(),
+      enabled: enabledToggle.checked,
+      user_agent_override_enabled: uaToggle.checked,
+      user_agent_override: uaInput.value.trim(),
+      use_proxy: proxyToggle.checked,
+      forward_headers: headersTextarea.value.split('\n').map(s => s.trim()).filter(Boolean)
+    };
 
-async function saveGateway(id, card) {
-  const btn = card.querySelector('.save-gw-btn');
-  const originalHTML = btn.innerHTML;
+    if (fxToggle) payload.fx_disguise_enabled = fxToggle.checked;
+    if (fxUA) payload.fx_disguise_user_agent = fxUA.value.trim();
 
-  const payload = {
-    name: card.querySelector('.f-name').value.trim(),
-    base_url: card.querySelector('.f-baseurl').value.trim(),
-    enabled: card.querySelector('.f-enabled').checked,
-    user_agent_override_enabled: card.querySelector('.f-ua-enabled').checked,
-    user_agent_override: card.querySelector('.f-ua').value.trim(),
-    use_proxy: card.querySelector('.f-proxy').checked,
-    forward_headers: card.querySelector('.f-headers').value.split('\n').map(s => s.trim()).filter(Boolean)
-  };
+    let ok = true;
+    if (!payload.base_url.startsWith('https://')) {
+      ok = false;
+      urlErr.textContent = 'Base URL 必须以 https:// 开头';
+      urlErr.hidden = false;
+      urlInput.classList.add('is-invalid');
+    }
+    if (!payload.name) {
+      ok = false;
+      nameErr.textContent = '网关名称不能为空';
+      nameErr.hidden = false;
+      nameInput.classList.add('is-invalid');
+    }
 
-  const fxToggle = card.querySelector('.f-fx');
-  const fxUA = card.querySelector('.f-fx-ua');
-  if (fxToggle) payload.fx_disguise_enabled = fxToggle.checked;
-  if (fxUA) payload.fx_disguise_user_agent = fxUA.value.trim();
+    if (!ok) {
+      showToast('请修正表单中的错误项', 'error');
+      return;
+    }
 
-  let ok = true;
-  const urlInput = card.querySelector('.f-baseurl');
-  const nameInput = card.querySelector('.f-name');
-  const urlErr = urlInput.closest('.field').querySelector('.field-error');
-  const nameErr = nameInput.closest('.field').querySelector('.field-error');
+    const origBtnHTML = saveBtn.innerHTML;
+    saveBtn.disabled = true;
+    saveBtn.innerHTML = '<span class="btn-spinner"></span> 保存中…';
 
-  if (!payload.base_url.startsWith('https://')) {
-    ok = false;
-    urlErr.textContent = 'Base URL 必须以 https:// 开头';
-    urlErr.hidden = false;
-    urlInput.classList.add('is-invalid');
-  }
-  if (!payload.name) {
-    ok = false;
-    nameErr.textContent = '网关名称不能为空';
-    nameErr.hidden = false;
-    nameInput.classList.add('is-invalid');
-  }
-
-  if (!ok) {
-    showToast('请修正表单中的错误项', 'error');
-    return;
-  }
-
-  btn.disabled = true;
-  btn.innerHTML = '<span class="btn-spinner"></span> 保存中…';
-
-  try {
-    const res = await api('/gateways/' + id, {
-      method: 'PATCH',
-      body: JSON.stringify(payload)
-    });
-    if (res.gateway) state.gateways[id] = res.gateway;
-    showToast(`网关 ${payload.name} 配置已更新`, 'success');
-    renderGatewayCards();
-  } catch (e) {
-    showToast('保存失败: ' + e.message, 'error');
-  } finally {
-    btn.disabled = false;
-    btn.innerHTML = originalHTML;
-  }
+    try {
+      const res = await api('/gateways/' + id, {
+        method: 'PATCH',
+        body: JSON.stringify(payload)
+      });
+      if (res.gateway) state.gateways[id] = res.gateway;
+      showToast(`网关 ${payload.name} 配置已成功保存`, 'success');
+      renderGatewayCards();
+    } catch (e) {
+      showToast('保存失败: ' + e.message, 'error');
+      saveBtn.disabled = false;
+      saveBtn.innerHTML = origBtnHTML;
+    }
+  });
 }
 
 export function initGateways() {
