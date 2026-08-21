@@ -556,3 +556,147 @@ func containsAll(value string, parts ...string) bool {
 	}
 	return true
 }
+
+// Inserted bodies and headers must survive a compress → store → retrieve →
+// decompress round-trip. This validates the transparent gzip layer: the Go
+// code sees plain bytes, while the database stores compressed bytes.
+func TestStoreCompressionRoundTrip(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	largeBody := strings.Repeat(`{"role":"user","content":"This is a test payload that compresses well because it repeats. "}`, 100)
+	log := RequestLog{
+		ID:                      "compress-rt",
+		StartedAt:               time.Now().UTC(),
+		GatewayID:               "oc",
+		RequestHeaders:          `{"Authorization":["Bearer secret"],"Content-Type":["application/json"]}`,
+		UpstreamHeaders:         `{"Content-Type":["application/json"]}`,
+		UpstreamResponseHeaders: `{"X-Request-Id":["abc-123"]}`,
+		ResponseHeaders:         `{"Content-Type":["text/event-stream"]}`,
+		RequestBody:             []byte(largeBody),
+		UpstreamBody:            []byte(`{"transformed":true}`),
+		UpstreamResponseBody:    []byte("data: {\"chunk\":1}\ndata: [DONE]\n"),
+		ResponseBody:            []byte(`{"id":"resp-1","status":"completed"}`),
+	}
+	if err := store.Insert(context.Background(), log); err != nil {
+		t.Fatalf("insert failed: %v", err)
+	}
+
+	got, err := store.Get(context.Background(), "compress-rt")
+	if err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if string(got.RequestBody) != largeBody {
+		t.Fatalf("request_body round-trip mismatch: got %d bytes, want %d", len(got.RequestBody), len(largeBody))
+	}
+	if got.RequestHeaders != log.RequestHeaders {
+		t.Fatalf("request_headers mismatch: got %q want %q", got.RequestHeaders, log.RequestHeaders)
+	}
+	if string(got.ResponseBody) != string(log.ResponseBody) {
+		t.Fatalf("response_body round-trip mismatch")
+	}
+}
+
+// The compressed bytes stored in the database must be smaller than the raw
+// input for repetitive JSON payloads — this is the whole point of compression.
+func TestStoreCompressedDataIsSmaller(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "proxy.db")
+	store, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	payload := strings.Repeat(`{"role":"assistant","content":"Hello world! "}`, 200)
+	if err := store.Insert(context.Background(), RequestLog{
+		ID:          "size-check",
+		StartedAt:   time.Now().UTC(),
+		GatewayID:   "oc",
+		RequestBody: []byte(payload),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stored []byte
+	if err := store.db.QueryRow(`SELECT request_body FROM request_logs WHERE id = 'size-check'`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) >= len(payload) {
+		t.Fatalf("compressed data (%d bytes) should be smaller than raw (%d bytes)", len(stored), len(payload))
+	}
+}
+
+// Rows written by an older build (raw bytes, no compression magic) must be
+// readable after the store is opened — the Get path transparently passes
+// through data that lacks the gzip magic prefix.
+func TestStoreReadsUncompressedLegacyRows(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "proxy.db")
+	store, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a row with raw (uncompressed) body data, simulating a pre-compression build.
+	legacy, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawBody := `{"model":"legacy","messages":[{"role":"user","content":"hello"}]}`
+	_, err = legacy.Exec(`INSERT INTO request_logs (id, started_at, gateway_id, gateway_name, prefix, ingress_protocol, upstream_protocol, model, request_path, upstream_url, method, status_code, success, stream, duration_ms, request_headers, request_body, upstream_headers, upstream_body, response_headers, response_body, error, input_tokens, cache_read_tokens, cache_write_tokens, prompt_tokens, output_tokens, reasoning_tokens, cache_supported, usage_present, cache_source) VALUES (?, ?, 'oc', 'OpenCode Zen', '/oc', 'responses', 'responses', 'legacy', '/responses', 'https://example.test/v1/responses', 'POST', 200, 1, 1, 10, '{}', ?, '{}', X'7b7d', '{}', X'7b7d', '', 0, 0, 0, 0, 0, 0, 0, 0, '')`,
+		"legacy-raw", time.Now().UTC().Format(time.RFC3339Nano), rawBody)
+	if err != nil {
+		legacy.Close()
+		t.Fatal(err)
+	}
+	legacy.Close()
+
+	// Reopen: migration should compress the old row, then Get should decompress it.
+	store, err = OpenStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	got, err := store.Get(context.Background(), "legacy-raw")
+	if err != nil {
+		t.Fatalf("get legacy row: %v", err)
+	}
+	if string(got.RequestBody) != rawBody {
+		t.Fatalf("legacy body mismatch: got %q want %q", string(got.RequestBody), rawBody)
+	}
+}
+
+// VACUUM must execute without error on a valid database.
+func TestStoreVacuumIsNoError(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if err := store.Insert(context.Background(), RequestLog{
+		ID:        "vacuum-test",
+		StartedAt: time.Now().UTC(),
+		GatewayID: "oc",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Vacuum(context.Background()); err != nil {
+		t.Fatalf("unexpected VACUUM error: %v", err)
+	}
+
+	// Data must be intact after VACUUM.
+	count, err := store.Count(context.Background(), LogFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 row after VACUUM, got %d", count)
+	}
+}

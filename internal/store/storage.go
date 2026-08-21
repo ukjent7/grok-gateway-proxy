@@ -1,10 +1,13 @@
 package store
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -14,6 +17,51 @@ import (
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver
 )
+
+// compressedColumns are the text/blob columns that benefit from gzip
+// compression. Bodies are the dominant space consumers (JSON/SSE text
+// compresses 5-10x); headers are smaller but also highly compressible.
+var compressedColumns = []string{
+	"request_body", "upstream_body", "upstream_response_body", "response_body",
+	"request_headers", "upstream_headers", "upstream_response_headers", "response_headers",
+}
+
+// gzipBytes compresses data with gzip. Empty input returns empty output so
+// existing empty-body handling stays unchanged. A magic prefix distinguishes
+// compressed from uncompressed data, so rows written by older builds (raw
+// bytes) are correctly detected during migration.
+const compressedMagic = "\x1f\x8bGZ" // gzip header (0x1f 0x8b) + "GZ" tag
+
+func gzipBytes(data []byte) ([]byte, error) {
+	if len(data) == 0 {
+		return []byte{}, nil
+	}
+	var buf bytes.Buffer
+	buf.WriteString(compressedMagic)
+	gw := gzip.NewWriter(&buf)
+	if _, err := gw.Write(data); err != nil {
+		return nil, err
+	}
+	if err := gw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// gunzipBytes decompresses data produced by gzipBytes. If data does not start
+// with the compression magic, it is returned as-is (backward compatibility with
+// rows written before compression was introduced).
+func gunzipBytes(data []byte) ([]byte, error) {
+	if len(data) == 0 || !bytes.HasPrefix(data, []byte(compressedMagic)) {
+		return data, nil
+	}
+	gr, err := gzip.NewReader(bytes.NewReader(data[len(compressedMagic):]))
+	if err != nil {
+		return nil, fmt.Errorf("decompress: %w", err)
+	}
+	defer gr.Close()
+	return io.ReadAll(gr)
+}
 
 type Store struct {
 	db *sql.DB
@@ -106,7 +154,7 @@ CREATE INDEX IF NOT EXISTS idx_request_logs_model ON request_logs(model);
 	return s.migrateDataIfNeeded()
 }
 
-const currentSchemaVersion = 2
+const currentSchemaVersion = 3
 
 // migrateDataIfNeeded runs one-time data migrations for existing databases:
 // backfilling columns added after the initial schema, and scrubbing
@@ -147,6 +195,13 @@ WHERE client_response_status_code = 0 OR upstream_response_status_code = 0
 	if err := s.reconcileFXUsageLogs(); err != nil {
 		return err
 	}
+	// Compress existing rows that were written before transparent gzip
+	// compression was introduced (schema_version < 3).
+	if version < 3 {
+		if err := s.compressExistingRows(); err != nil {
+			return err
+		}
+	}
 	_, err = s.db.Exec(
 		`INSERT INTO proxy_meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
 		strconv.Itoa(currentSchemaVersion),
@@ -177,6 +232,9 @@ WHERE gateway_id = 've'
 		if err := rows.Scan(&id, &body); err != nil {
 			return err
 		}
+		// Decompress in case a partial compression migration left some rows
+		// compressed while version was not yet stamped.
+		body = decompressBody(body)
 		usage := extractFXUsage(body)
 		if usage.UsagePresent {
 			updates = append(updates, usageUpdate{id: id, usage: usage})
@@ -264,17 +322,27 @@ func (s *Store) scrubStoredHeaderCredentials() error {
 		}
 		type pendingUpdate struct {
 			id    string
-			value string
+			value []byte
 		}
 		var updates []pendingUpdate
 		for rows.Next() {
-			var id, raw string
+			var id string
+			var raw []byte
 			if err := rows.Scan(&id, &raw); err != nil {
 				rows.Close()
 				return err
 			}
-			if redacted := redact.RedactStoredHeaders(raw); redacted != raw {
-				updates = append(updates, pendingUpdate{id: id, value: redacted})
+			// Decompress in case a partial compression migration left rows
+			// compressed while version was not yet stamped.
+			text := gunzipString(raw)
+			if redacted := redact.RedactStoredHeaders(text); redacted != text {
+				// Re-compress the redacted value before storing.
+				compressed, err := gzipString(redacted)
+				if err != nil {
+					rows.Close()
+					return err
+				}
+				updates = append(updates, pendingUpdate{id: id, value: compressed})
 			}
 		}
 		if err := rows.Err(); err != nil {
@@ -318,22 +386,54 @@ func buildRequestLogInsertSQL() string {
 }
 
 func (s *Store) Insert(ctx context.Context, log RequestLog) error {
+	compressedReqHeaders, err := gzipString(log.RequestHeaders)
+	if err != nil {
+		return fmt.Errorf("compress request_headers: %w", err)
+	}
+	compressedUpHeaders, err := gzipString(log.UpstreamHeaders)
+	if err != nil {
+		return fmt.Errorf("compress upstream_headers: %w", err)
+	}
+	compressedUpRespHeaders, err := gzipString(log.UpstreamResponseHeaders)
+	if err != nil {
+		return fmt.Errorf("compress upstream_response_headers: %w", err)
+	}
+	compressedRespHeaders, err := gzipString(log.ResponseHeaders)
+	if err != nil {
+		return fmt.Errorf("compress response_headers: %w", err)
+	}
+	compressedReqBody, err := gzipBytes(log.RequestBody)
+	if err != nil {
+		return fmt.Errorf("compress request_body: %w", err)
+	}
+	compressedUpBody, err := gzipBytes(log.UpstreamBody)
+	if err != nil {
+		return fmt.Errorf("compress upstream_body: %w", err)
+	}
+	compressedUpRespBody, err := gzipBytes(log.UpstreamResponseBody)
+	if err != nil {
+		return fmt.Errorf("compress upstream_response_body: %w", err)
+	}
+	compressedRespBody, err := gzipBytes(log.ResponseBody)
+	if err != nil {
+		return fmt.Errorf("compress response_body: %w", err)
+	}
 	args := []any{log.ID, log.StartedAt.UTC().Format(time.RFC3339Nano), log.GatewayID,
 		log.GatewayName, log.Prefix, log.IngressProtocol, log.UpstreamProtocol,
 		log.Model, log.RequestPath, log.RequestURL, log.UpstreamURL, log.Method, log.StatusCode,
 		log.ClientResponseStatusCode, log.UpstreamResponseStatusCode, boolInt(log.Success),
-		boolInt(log.Stream), log.DurationMS, log.RequestHeaders,
-		emptyBlob(log.RequestBody), log.UpstreamHeaders,
-		emptyBlob(log.UpstreamBody), log.UpstreamResponseHeaders,
-		emptyBlob(log.UpstreamResponseBody), log.ResponseHeaders,
-		emptyBlob(log.ResponseBody), boolInt(log.ResponseTruncated), log.Error, log.Usage.InputTokens, log.Usage.CacheReadTokens,
+		boolInt(log.Stream), log.DurationMS, compressedReqHeaders,
+		compressedReqBody, compressedUpHeaders,
+		compressedUpBody, compressedUpRespHeaders,
+		compressedUpRespBody, compressedRespHeaders,
+		compressedRespBody, boolInt(log.ResponseTruncated), log.Error, log.Usage.InputTokens, log.Usage.CacheReadTokens,
 		log.Usage.CacheWriteTokens, log.Usage.PromptTokens, log.Usage.OutputTokens,
 		log.Usage.ReasoningTokens, boolInt(log.Usage.CacheSupported),
 		boolInt(log.Usage.UsagePresent), log.Usage.CacheSource}
 	if len(args) != len(requestLogInsertColumns) {
 		return fmt.Errorf("request log insert has %d values for %d columns", len(args), len(requestLogInsertColumns))
 	}
-	_, err := s.db.ExecContext(ctx, requestLogInsertSQL, args...)
+	_, err = s.db.ExecContext(ctx, requestLogInsertSQL, args...)
 	return err
 }
 
@@ -342,6 +442,41 @@ func emptyBlob(value []byte) []byte {
 		return []byte{}
 	}
 	return value
+}
+
+// gzipString compresses a header JSON string. Returns empty bytes for empty
+// input so no compression overhead is added for missing fields.
+func gzipString(s string) ([]byte, error) {
+	if s == "" {
+		return []byte{}, nil
+	}
+	return gzipBytes([]byte(s))
+}
+
+// gunzipString decompresses a header column. Returns "" for empty input;
+// passes through raw data that doesn't have the compression magic.
+func gunzipString(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	decompressed, err := gunzipBytes(data)
+	if err != nil {
+		return string(data) // fallback to raw
+	}
+	return string(decompressed)
+}
+
+// decompressBody decompresses a body column, returning the original bytes.
+// Empty and non-compressed data pass through unchanged.
+func decompressBody(data []byte) []byte {
+	if len(data) == 0 {
+		return []byte{}
+	}
+	decompressed, err := gunzipBytes(data)
+	if err != nil {
+		return data // fallback to raw
+	}
+	return decompressed
 }
 
 func (s *Store) List(ctx context.Context, filter LogFilter) ([]RequestLog, error) {
@@ -525,6 +660,83 @@ func (s *Store) CheckpointWAL(ctx context.Context) error {
 	return err
 }
 
+// Vacuum rebuilds the database file, reclaiming space left behind by deleted
+// rows. This is the only way to actually shrink the .db file after large
+// DELETEs — SQLite's free-list keeps the pages internally but never returns
+// them to the filesystem. Runs in a transaction so it is atomic.
+func (s *Store) Vacuum(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, "VACUUM")
+	return err
+}
+
+// compressExistingRows compresses all body and header columns for rows that
+// were written before transparent compression (schema_version < 3). Rows are
+// processed in batches to avoid holding the full table in memory. A row is
+// only updated if at least one column actually changed size, so re-running
+// this is a no-op on already-compressed data.
+func (s *Store) compressExistingRows() error {
+	for _, column := range compressedColumns {
+		if err := s.compressColumn(column); err != nil {
+			return fmt.Errorf("compress column %s: %w", column, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) compressColumn(column string) error {
+	// Check whether this column exists (legacy *_actual columns may not).
+	exists, err := s.columnExists(column)
+	if err != nil || !exists {
+		return err
+	}
+	rows, err := s.db.Query(fmt.Sprintf(`SELECT id, %s FROM request_logs WHERE length(%s) > 0`, column, column))
+	if err != nil {
+		return err
+	}
+	type pendingUpdate struct {
+		id  string
+		val []byte
+	}
+	var updates []pendingUpdate
+	for rows.Next() {
+		var id string
+		var raw []byte
+		if err := rows.Scan(&id, &raw); err != nil {
+			rows.Close()
+			return err
+		}
+		// Skip already-compressed rows (the magic prefix).
+		if bytes.HasPrefix(raw, []byte(compressedMagic)) {
+			continue
+		}
+		compressed, err := gzipBytes(raw)
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		// Only update if compression actually saved space.
+		if len(compressed) < len(raw) {
+			updates = append(updates, pendingUpdate{id: id, val: compressed})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, update := range updates {
+		if _, err := s.db.Exec(
+			fmt.Sprintf(`UPDATE request_logs SET %s = ? WHERE id = ?`, column),
+			update.val, update.id,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) Delete(ctx context.Context, before *time.Time) (int64, error) {
 	var result sql.Result
 	var err error
@@ -628,15 +840,17 @@ func scanFull(row scanner) (RequestLog, error) {
 	var started string
 	var success, stream, cacheSupported, usagePresent, responseTruncated int
 	var ingress, upstream string
+	var reqBody, upBody, upRespBody, respBody []byte
+	var reqHeaders, upHeaders, upRespHeaders, respHeaders []byte
 	if err := row.Scan(&log.ID, &started, &log.GatewayID, &log.GatewayName,
 		&log.Prefix, &ingress, &upstream, &log.Model, &log.RequestPath,
 		&log.RequestURL, &log.UpstreamURL, &log.Method, &log.StatusCode,
 		&log.ClientResponseStatusCode, &log.UpstreamResponseStatusCode, &success, &stream,
-		&log.DurationMS, &log.RequestHeaders, &log.RequestBody,
-		&log.UpstreamHeaders, &log.UpstreamBody,
-		&log.UpstreamResponseHeaders,
-		&log.UpstreamResponseBody, &log.ResponseHeaders,
-		&log.ResponseBody, &responseTruncated, &log.Error, &log.Usage.InputTokens,
+		&log.DurationMS, &reqHeaders, &reqBody,
+		&upHeaders, &upBody,
+		&upRespHeaders,
+		&upRespBody, &respHeaders,
+		&respBody, &responseTruncated, &log.Error, &log.Usage.InputTokens,
 		&log.Usage.CacheReadTokens, &log.Usage.CacheWriteTokens,
 		&log.Usage.PromptTokens, &log.Usage.OutputTokens,
 		&log.Usage.ReasoningTokens, &cacheSupported, &usagePresent,
@@ -654,6 +868,14 @@ func scanFull(row scanner) (RequestLog, error) {
 	log.Usage.CacheSupported = cacheSupported != 0
 	log.Usage.UsagePresent = usagePresent != 0
 	log.ResponseTruncated = responseTruncated != 0
+	log.RequestHeaders = gunzipString(reqHeaders)
+	log.UpstreamHeaders = gunzipString(upHeaders)
+	log.UpstreamResponseHeaders = gunzipString(upRespHeaders)
+	log.ResponseHeaders = gunzipString(respHeaders)
+	log.RequestBody = decompressBody(reqBody)
+	log.UpstreamBody = decompressBody(upBody)
+	log.UpstreamResponseBody = decompressBody(upRespBody)
+	log.ResponseBody = decompressBody(respBody)
 	return log, nil
 }
 
