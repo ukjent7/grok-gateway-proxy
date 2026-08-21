@@ -25,11 +25,9 @@ const (
 	// larger than this are rejected with 413 before any upstream call.
 	maxRequestBodySize int64 = 64 << 20
 
-	// maxResponseBodySize bounds the audit-captured response body. Responses
-	// larger than this are still forwarded to the client in full, but only the
-	// first maxResponseBodySize bytes are buffered for the log, and the log is
-	// flagged with response_truncated.
-	maxResponseBodySize int64 = 64 << 20
+	// defaultResponseBodySize is the fallback when no configurable limit is
+	// set. Individual deployments can override via config.BodyCaptureLimitKB.
+	defaultResponseBodySize int64 = 256 << 10
 
 	// maxUpstreamTimeout caps the per-request timeout that a client may
 	// request via the X-Proxy-Timeout header.
@@ -43,7 +41,7 @@ type Proxy struct {
 	Client           *http.Client // global configured-proxy client; also test fallback
 	DirectClient     *http.Client
 	clientMu         sync.RWMutex
-	ResponseBodySize int64 // 0 = use maxResponseBodySize
+	ResponseBodySize int64 // override body capture limit (0 = use config or default)
 }
 
 // statusError carries an HTTP status code alongside the error message.
@@ -459,7 +457,10 @@ func (p *Proxy) responseBodyLimit() int64 {
 	if p.ResponseBodySize > 0 {
 		return p.ResponseBodySize
 	}
-	return maxResponseBodySize
+	if p.Config != nil && p.Config.BodyCaptureLimitKB > 0 {
+		return int64(p.Config.BodyCaptureLimitKB) << 10
+	}
+	return defaultResponseBodySize
 }
 
 func (p *Proxy) gatewayForPath(path string) (config.GatewayConfig, string, bool) {
