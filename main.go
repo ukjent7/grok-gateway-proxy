@@ -30,7 +30,7 @@ func main() {
 	dataDir := flag.String("data-dir", "", "配置文件与日志数据库所在目录（默认 ./data，可用 GROK_PROXY_DATA_DIR 覆盖）")
 	shutdownTimeout := flag.Duration("shutdown-timeout", 30*time.Second, "优雅关闭等待在途请求的最长时间")
 	logLevel := flag.String("log-level", "info", "日志级别：debug / info / warn / error")
-	logRetentionDays := flag.Int("log-retention-days", 30, "日志保留天数（0 表示永久保留）；显式指定时优先于配置文件，未指定则读配置 log_retention_days（默认 30），GROK_PROXY_LOG_RETENTION_DAYS 可覆盖")
+	logRetentionDays := flag.Int("log-retention-days", 7, "日志保留天数（0 表示永久保留）；显式指定时优先于配置文件，未指定则读配置 log_retention_days（默认 7），GROK_PROXY_LOG_RETENTION_DAYS 可覆盖")
 	flag.Parse()
 
 	if env := os.Getenv("GROK_PROXY_LISTEN"); env != "" && *listen == "" {
@@ -104,11 +104,21 @@ func main() {
 	// 与 -wal 文件无限增长。
 	go func() {
 		maintain := func() {
+			pruned := int64(0)
 			if cfg.LogRetention > 0 {
-				if pruned, err := st.PruneOlderThan(ctx, cfg.LogRetention); err != nil {
+				var err error
+				pruned, err = st.PruneOlderThan(ctx, cfg.LogRetention)
+				if err != nil {
 					logger.Warn("log pruning failed", "error", err)
 				} else if pruned > 0 {
 					logger.Info("pruned old logs", "count", pruned)
+				}
+			}
+			// VACUUM reclaims physical space from deleted rows. Only run when
+			// rows were actually pruned to avoid the overhead on idle hours.
+			if pruned > 0 {
+				if err := st.Vacuum(ctx); err != nil {
+					logger.Warn("VACUUM failed", "error", err)
 				}
 			}
 			if err := st.CheckpointWAL(ctx); err != nil {
