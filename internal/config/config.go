@@ -21,6 +21,12 @@ const (
 
 const DefaultUpstreamTimeout = 5 * time.Minute
 
+// DefaultBodyCaptureLimitKB bounds the per-column body capture size for audit
+// logging. Bodies larger than this are still forwarded to the client in full;
+// only the stored copy is truncated. 256KB covers most LLM payloads while
+// preventing a single large response from consuming disproportionate space.
+const DefaultBodyCaptureLimitKB = 256
+
 type GatewayConfig struct {
 	ID                       string   `json:"id"`
 	Prefix                   string   `json:"prefix"`
@@ -65,13 +71,14 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 }
 
 type Config struct {
-	ListenAddr      string                   `json:"listen_addr"`
-	proxyURL        string                   `json:"-"`
-	UpstreamTimeout time.Duration            `json:"-"`
-	LogRetention    time.Duration            `json:"-"`
-	ConfigPath      string                   `json:"-"`
-	Gateways        map[string]GatewayConfig `json:"gateways"`
-	mu              sync.RWMutex
+	ListenAddr        string                   `json:"listen_addr"`
+	proxyURL          string                   `json:"-"`
+	UpstreamTimeout   time.Duration            `json:"-"`
+	LogRetention      time.Duration            `json:"-"`
+	BodyCaptureLimitKB int                     `json:"-"`
+	ConfigPath        string                   `json:"-"`
+	Gateways          map[string]GatewayConfig `json:"gateways"`
+	mu                sync.RWMutex
 }
 
 // DefaultGateways holds the fixed identity (prefix/protocol/name/base URL) for
@@ -117,11 +124,12 @@ func BuildDefaultGateways() map[string]GatewayConfig {
 
 func DefaultConfig(path string) *Config {
 	return &Config{
-		ListenAddr:      "127.0.0.1:8787",
-		UpstreamTimeout: DefaultUpstreamTimeout,
-		LogRetention:    30 * 24 * time.Hour,
-		ConfigPath:      path,
-		Gateways:        BuildDefaultGateways(),
+		ListenAddr:          "127.0.0.1:8787",
+		UpstreamTimeout:     DefaultUpstreamTimeout,
+		LogRetention:        7 * 24 * time.Hour,
+		BodyCaptureLimitKB:  DefaultBodyCaptureLimitKB,
+		ConfigPath:          path,
+		Gateways:            BuildDefaultGateways(),
 	}
 }
 
@@ -130,7 +138,7 @@ func DefaultConfig(path string) *Config {
 // GROK_PROXY_LOG_RETENTION_DAYS env var; it is nil when neither was provided.
 //
 // Precedence (highest to lowest): explicit flag/env > config file value >
-// built-in default (30 days). Passing nil means "no explicit value", so the
+// built-in default (7 days). Passing nil means "no explicit value", so the
 // file value (or the default) applies. A nil value is preserved on the next
 // Save so an explicit runtime value is only made permanent if you also Save.
 func LoadConfig(path string, logRetentionDays *int) (*Config, error) {
@@ -149,11 +157,12 @@ func LoadConfig(path string, logRetentionDays *int) (*Config, error) {
 		return nil, err
 	}
 	var disk struct {
-		ListenAddr       string                   `json:"listen_addr"`
-		ProxyURL         string                   `json:"proxy_url"`
-		UpstreamTimeoutS int                      `json:"upstream_timeout_seconds"`
-		LogRetentionDays *int                     `json:"log_retention_days"`
-		Gateways         map[string]GatewayConfig `json:"gateways"`
+		ListenAddr         string                   `json:"listen_addr"`
+		ProxyURL           string                   `json:"proxy_url"`
+		UpstreamTimeoutS   int                      `json:"upstream_timeout_seconds"`
+		LogRetentionDays   *int                     `json:"log_retention_days"`
+		BodyCaptureLimitKB *int                     `json:"body_capture_limit_kb"`
+		Gateways           map[string]GatewayConfig `json:"gateways"`
 	}
 	if err := json.Unmarshal(b, &disk); err != nil {
 		return nil, fmt.Errorf("decode config: %w", err)
@@ -174,6 +183,11 @@ func LoadConfig(path string, logRetentionDays *int) (*Config, error) {
 	if logRetentionDays != nil {
 		if err := cfg.setLogRetention(*logRetentionDays); err != nil {
 			return nil, fmt.Errorf("invalid log retention: %w", err)
+		}
+	}
+	if disk.BodyCaptureLimitKB != nil {
+		if err := cfg.setBodyCaptureLimit(*disk.BodyCaptureLimitKB); err != nil {
+			return nil, fmt.Errorf("invalid config: %w", err)
 		}
 	}
 	for id, gateway := range disk.Gateways {
@@ -212,6 +226,17 @@ func (c *Config) setLogRetention(days int) error {
 	return nil
 }
 
+// setBodyCaptureLimit validates and applies the per-column body capture limit
+// in KB. Zero means "capture everything" (backward-compatible); negative
+// values are rejected.
+func (c *Config) setBodyCaptureLimit(kb int) error {
+	if kb < 0 {
+		return errors.New("body_capture_limit_kb must be >= 0")
+	}
+	c.BodyCaptureLimitKB = kb
+	return nil
+}
+
 func (c *Config) Save() error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -229,12 +254,14 @@ func (c *Config) saveLocked() error {
 		ProxyURL               string                   `json:"proxy_url,omitempty"`
 		UpstreamTimeoutSeconds int                      `json:"upstream_timeout_seconds,omitempty"`
 		LogRetentionDays       int                      `json:"log_retention_days"`
+		BodyCaptureLimitKB     int                      `json:"body_capture_limit_kb"`
 		Gateways               map[string]GatewayConfig `json:"gateways"`
 	}{
 		ListenAddr:             c.ListenAddr,
 		ProxyURL:               c.proxyURL,
 		UpstreamTimeoutSeconds: int(c.UpstreamTimeout / time.Second),
 		LogRetentionDays:       int(c.LogRetention / (24 * time.Hour)),
+		BodyCaptureLimitKB:     c.BodyCaptureLimitKB,
 		Gateways:               c.Gateways,
 	}, "", "  ")
 	if err != nil {

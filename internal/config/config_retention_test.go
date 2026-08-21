@@ -30,7 +30,7 @@ func TestLoadConfigRetentionPrecedence(t *testing.T) {
 			name:     "no file, no explicit value falls back to default",
 			file:     "",
 			explicit: nil,
-			wantDays: 30,
+			wantDays: 7,
 		},
 		{
 			name:     "no file, explicit value applies",
@@ -97,5 +97,41 @@ func TestLoadConfigRetentionPrecedence(t *testing.T) {
 				t.Fatalf("LogRetention = %v, want %v", cfg.LogRetention, want)
 			}
 		})
+	}
+}
+
+func TestLoadConfigBodyCaptureLimit(t *testing.T) {
+	tests := []struct {
+		name string
+		file string
+		want int
+	}{
+		{name: "default when no file", file: "", want: DefaultBodyCaptureLimitKB},
+		{name: "default when file omits field", file: `{"log_retention_days": 7}`, want: DefaultBodyCaptureLimitKB},
+		{name: "file value applied", file: `{"body_capture_limit_kb": 512}`, want: 512},
+		{name: "zero means capture everything", file: `{"body_capture_limit_kb": 0}`, want: 0},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			if tc.file != "" {
+				path = writeConfigFile(t, tc.file)
+			}
+			cfg, err := LoadConfig(path, nil)
+			if err != nil {
+				t.Fatalf("LoadConfig: %v", err)
+			}
+			if cfg.BodyCaptureLimitKB != tc.want {
+				t.Fatalf("BodyCaptureLimitKB = %d, want %d", cfg.BodyCaptureLimitKB, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadConfigRejectsNegativeBodyCaptureLimit(t *testing.T) {
+	path := writeConfigFile(t, `{"body_capture_limit_kb": -1}`)
+	if _, err := LoadConfig(path, nil); err == nil {
+		t.Fatal("expected error for negative body_capture_limit_kb")
 	}
 }
