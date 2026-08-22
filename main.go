@@ -105,9 +105,10 @@ func main() {
 	go func() {
 		maintain := func() {
 			pruned := int64(0)
-			if cfg.LogRetention > 0 {
+			retention := cfg.GetLogRetention()
+			if retention > 0 {
 				var err error
-				pruned, err = st.PruneOlderThan(ctx, cfg.LogRetention)
+				pruned, err = st.PruneOlderThan(ctx, retention)
 				if err != nil {
 					logger.Warn("log pruning failed", "error", err)
 				} else if pruned > 0 {
@@ -191,16 +192,19 @@ func defaultDataDir() string {
 }
 
 // isLoopbackAddr 判断监听地址是否仅回环（127.0.0.0/8、::1 或 localhost）。
-// 无法解析时保守返回 true（不告警），避免误报。
+// 空 host（例如 :8787）表示监听全部网络接口（0.0.0.0 / ::），非回环地址。
 func isLoopbackAddr(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr
 	}
 	host = strings.TrimSpace(host)
-	if host == "localhost" {
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
 		return true
 	}
 	ip := net.ParseIP(host)
-	return ip == nil || ip.IsLoopback()
+	return ip != nil && ip.IsLoopback()
 }
