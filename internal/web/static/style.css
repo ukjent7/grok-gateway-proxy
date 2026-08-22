@@ -1376,6 +1376,11 @@ kbd {
   background-color: var(--bg-surface-hover);
 }
 
+.log-table tbody tr.is-active-row {
+  background-color: var(--bg-surface-2);
+  outline: 2px solid var(--teal-line);
+}
+
 .cell-time {
   white-space: nowrap;
 }
