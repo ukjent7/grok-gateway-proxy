@@ -11,7 +11,7 @@
 import { state } from './state.js';
 import { api } from './api.js';
 import {
-  $, $all, fmtNum, fmtPct, fmtTime, fmtTimeRelative, fmtMs,
+  $, $all, fmtNum, fmtPct, fmtTime, fmtTimeShort, fmtTimeRelative, fmtMs,
   escapeHtml, copyText, downloadFile
 } from './utils.js';
 import { openDrawer } from './drawer.js';

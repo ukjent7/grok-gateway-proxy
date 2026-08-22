@@ -11,7 +11,7 @@
 import { state, gatewayIds } from './state.js';
 import { api } from './api.js';
 import {
-  $, $all, fmtNum, fmtPct, fmtMs, fmtTimeShort, fmtTimeRelative,
+  $, $all, fmtNum, fmtPct, fmtMs, fmtTime, fmtTimeShort, fmtTimeRelative,
   escapeHtml, rangeToFrom, rangeLabel
 } from './utils.js';
 import { loadGatewayPulses } from './pulse.js';
