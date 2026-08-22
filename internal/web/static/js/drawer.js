@@ -43,6 +43,8 @@ export async function openDrawer(id) {
 
   updateNavButtons(id);
 
+  $all('.log-table tbody tr').forEach(tr => tr.classList.toggle('is-active-row', tr.dataset.id === id));
+
   try {
     const log = await api('/logs/' + id);
     state.drawerLog = log;
@@ -273,6 +275,8 @@ function renderComparison(tab, log) {
 }
 
 export function closeDrawer() {
+  state.drawerLogId = null;
+  $all('.log-table tbody tr.is-active-row').forEach(tr => tr.classList.remove('is-active-row'));
   const backdrop = $('#drawerBackdrop');
   const drawer = $('#logDrawer');
   if (backdrop) backdrop.classList.remove('is-open');

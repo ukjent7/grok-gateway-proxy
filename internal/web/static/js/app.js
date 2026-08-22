@@ -108,7 +108,7 @@ function restartAutoRefresh() {
   state.autoRefreshTimer = setInterval(() => {
     if (document.hidden) return;
     if (state.activeView === 'overview') loadOverview();
-    if (state.activeView === 'logs' && state.logsOffset <= 50) loadLogs(true);
+    if (state.activeView === 'logs') loadLogs({ silent: true });
     pollHealth();
   }, intervalSec * 1000);
 }

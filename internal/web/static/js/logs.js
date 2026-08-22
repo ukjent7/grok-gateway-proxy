@@ -243,44 +243,76 @@ function appendLogRows(items) {
   }
 }
 
-export async function loadLogs(reset = false) {
-  if (reset) {
-    state.logsOffset = 0;
-    state.logs = [];
+let logsSig = '';
+
+export async function loadLogs(options = false) {
+  let reset = false;
+  let silent = false;
+  if (typeof options === 'boolean') {
+    reset = options;
+  } else if (options && typeof options === 'object') {
+    reset = !!options.reset;
+    silent = !!options.silent;
   }
 
-  const seq = ++logsSeq;
   const f = currentFilters();
   const tbody = $('#logTableBody');
   if (!tbody) return;
 
-  if (reset) tbody.innerHTML = renderSkeletons(8);
+  const refreshBtn = $('#logsRefreshBtn svg');
+
+  if (reset) {
+    state.logsOffset = 0;
+    // Only show skeletons if table has no rows or this is an explicit non-silent reset
+    if (!silent && !state.logs.length) {
+      tbody.innerHTML = renderSkeletons(8);
+    }
+  }
+
+  if (refreshBtn && !silent) {
+    refreshBtn.classList.add('is-spinning');
+  }
+
+  const seq = ++logsSeq;
+  const targetOffset = reset ? 0 : state.logsOffset;
+  const queryLimit = reset && silent && state.logs.length ? String(Math.max(Number(f.limit), state.logs.length)) : f.limit;
 
   try {
     const [data, countData] = await Promise.all([
-      api('/logs?' + filterQuery({ limit: f.limit, offset: String(state.logsOffset) })),
+      api('/logs?' + filterQuery({ limit: queryLimit, offset: String(targetOffset) })),
       api('/logs/count?' + filterQuery())
     ]);
 
     if (seq !== logsSeq) return;
 
     const items = data.items || [];
-    if (reset) {
-      state.logs = items;
-    } else {
-      state.logs = state.logs.concat(items);
-    }
     state.logsTotal = (countData && typeof countData.count === 'number') ? countData.count : null;
 
-    if (reset) {
+    if (reset || silent) {
+      const newSig = items.map(l => l.id + ':' + (l.status_code || 0) + ':' + (l.duration_ms || 0)).join(',');
+      if (silent && newSig === logsSig && state.logs.length === items.length) {
+        // Data has not changed; do NOT touch the DOM or scroll position!
+        renderLogsCount();
+        return;
+      }
+      logsSig = newSig;
+      state.logs = items;
+      state.logsOffset = items.length;
+
+      // Preserve window scroll position across renders
+      const prevScroll = window.scrollY;
       renderLogTable();
+      if (silent && prevScroll > 0) {
+        window.scrollTo({ top: prevScroll, behavior: 'instant' });
+      }
     } else if (items.length) {
+      state.logs = state.logs.concat(items);
+      state.logsOffset += items.length;
       appendLogRows(items);
     }
 
-    state.logsOffset += items.length;
     if (state.logs.length > 2000) {
-      state.logs = state.logs.slice(-1000);
+      state.logs = state.logs.slice(0, 2000);
     }
 
     const loadMoreBtn = $('#logsLoadMoreBtn');
@@ -294,16 +326,22 @@ export async function loadLogs(reset = false) {
     renderLogsCount();
   } catch (e) {
     if (seq !== logsSeq) return;
-    tbody.innerHTML = `
-      <tr class="empty-row">
-        <td colspan="9">
-          <div class="empty-message-wrap">
-            <span class="text-danger">加载失败：${escapeHtml(e.message)}</span>
-            <button type="button" class="btn-ghost small" onclick="window.grokConsole.loadLogs(true)">重试</button>
-          </div>
-        </td>
-      </tr>
-    `;
+    if (!silent) {
+      tbody.innerHTML = `
+        <tr class="empty-row">
+          <td colspan="9">
+            <div class="empty-message-wrap">
+              <span class="text-danger">加载失败：${escapeHtml(e.message)}</span>
+              <button type="button" class="btn-ghost small" onclick="window.grokConsole.loadLogs(true)">重试</button>
+            </div>
+          </td>
+        </tr>
+      `;
+    }
+  } finally {
+    if (refreshBtn && !silent) {
+      setTimeout(() => refreshBtn.classList.remove('is-spinning'), 400);
+    }
   }
 }
 
@@ -344,6 +382,10 @@ function renderLogTable() {
   }
 
   tbody.innerHTML = state.logs.map(logRowHTML).join('');
+  if (state.drawerLogId) {
+    const activeTr = tbody.querySelector(`tr[data-id="${state.drawerLogId}"]`);
+    if (activeTr) activeTr.classList.add('is-active-row');
+  }
   bindRowClicks(tbody);
 }
 
