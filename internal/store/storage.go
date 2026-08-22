@@ -716,10 +716,10 @@ func (s *Store) PruneOlderThan(ctx context.Context, retention time.Duration) (in
 	return s.Delete(ctx, &cutoff)
 }
 
-// CheckpointWAL forces a WAL checkpoint to keep the -wal file from growing
-// unbounded. Safe to call periodically.
+// CheckpointWAL forces a WAL checkpoint and truncates the -wal file to keep
+// database files from growing unbounded. Safe to call periodically.
 func (s *Store) CheckpointWAL(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, "PRAGMA wal_checkpoint(PASSIVE)")
+	_, err := s.db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
 	return err
 }
 
