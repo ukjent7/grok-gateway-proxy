@@ -317,3 +317,62 @@ func TestStoreReopenPreservesData(t *testing.T) {
 		t.Fatalf("usage was not preserved: %+v", got.Usage)
 	}
 }
+
+// Subsecond timestamps across second boundaries must sort in strict chronological
+// order and must be correctly included by exact-second From/To filter boundaries.
+func TestStoreSubsecondTimeFilteringAndOrdering(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	base := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+	times := []struct {
+		id string
+		t  time.Time
+	}{
+		{"t0_exact", base},
+		{"t1_subsecond_100ms", base.Add(100 * time.Millisecond)},
+		{"t2_subsecond_500ms", base.Add(500 * time.Millisecond)},
+		{"t3_subsecond_999ms", base.Add(999 * time.Millisecond)},
+		{"t4_next_sec", base.Add(1 * time.Second)},
+		{"t5_next_sec_100ms", base.Add(1100 * time.Millisecond)},
+	}
+
+	for _, item := range times {
+		if err := store.Insert(context.Background(), RequestLog{
+			ID:        item.id,
+			StartedAt: item.t,
+			GatewayID: "oc",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 1. Verify descending order (latest first)
+	logs, err := store.List(context.Background(), LogFilter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != len(times) {
+		t.Fatalf("expected %d logs, got %d", len(times), len(logs))
+	}
+	expectedOrder := []string{"t5_next_sec_100ms", "t4_next_sec", "t3_subsecond_999ms", "t2_subsecond_500ms", "t1_subsecond_100ms", "t0_exact"}
+	for i, wantID := range expectedOrder {
+		if logs[i].ID != wantID {
+			t.Fatalf("at index %d: expected %s, got %s", i, wantID, logs[i].ID)
+		}
+	}
+
+	// 2. Verify exact second boundary filtering includes subsecond records
+	from := base
+	to := base.Add(1 * time.Second)
+	filtered, err := store.List(context.Background(), LogFilter{From: &from, To: &to, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filtered) != 5 { // t0, t1, t2, t3, t4
+		t.Fatalf("expected 5 logs between %v and %v, got %d", from, to, len(filtered))
+	}
+}

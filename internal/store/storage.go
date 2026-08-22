@@ -18,6 +18,34 @@ import (
 	_ "modernc.org/sqlite" // pure-Go SQLite driver
 )
 
+// dbTimeFormat guarantees fixed-width (30 chars) UTC timestamps with 9-digit
+// nanosecond precision, making them lexicographically monotonic for SQLite
+// string comparisons (<, <=, >, >=) and ORDER BY.
+const dbTimeFormat = "2006-01-02T15:04:05.000000000Z"
+
+func formatTimestamp(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(dbTimeFormat)
+}
+
+func parseTimestamp(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	if t, err := time.Parse(dbTimeFormat, s); err == nil {
+		return t
+	}
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t
+	}
+	return time.Time{}
+}
+
 // compressedColumns are the text/blob columns that benefit from gzip
 // compression. Bodies are the dominant space consumers (JSON/SSE text
 // compresses 5-10x); headers are smaller but also highly compressible.
@@ -154,7 +182,7 @@ CREATE INDEX IF NOT EXISTS idx_request_logs_model ON request_logs(model);
 	return s.migrateDataIfNeeded()
 }
 
-const currentSchemaVersion = 3
+const currentSchemaVersion = 4
 
 // migrateDataIfNeeded runs one-time data migrations for existing databases:
 // backfilling columns added after the initial schema, and scrubbing
@@ -202,11 +230,53 @@ WHERE client_response_status_code = 0 OR upstream_response_status_code = 0
 			return err
 		}
 	}
+	// Normalize timestamps to fixed-width 30-char format for lexicographical
+	// monotonic comparison and sorting in SQLite (schema_version < 4).
+	if version < 4 {
+		if err := s.normalizeTimestamps(); err != nil {
+			return err
+		}
+	}
 	_, err = s.db.Exec(
 		`INSERT INTO proxy_meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
 		strconv.Itoa(currentSchemaVersion),
 	)
 	return err
+}
+
+func (s *Store) normalizeTimestamps() error {
+	rows, err := s.db.Query(`SELECT id, started_at FROM request_logs WHERE length(started_at) < 30`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type pendingTimeUpdate struct {
+		id        string
+		startedAt string
+	}
+	var updates []pendingTimeUpdate
+	for rows.Next() {
+		var id, raw string
+		if err := rows.Scan(&id, &raw); err != nil {
+			return err
+		}
+		t := parseTimestamp(raw)
+		if !t.IsZero() {
+			updates = append(updates, pendingTimeUpdate{id: id, startedAt: formatTimestamp(t)})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, update := range updates {
+		if _, err := s.db.Exec(`UPDATE request_logs SET started_at = ? WHERE id = ?`, update.startedAt, update.id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) reconcileFXUsageLogs() error {
@@ -418,7 +488,7 @@ func (s *Store) Insert(ctx context.Context, log RequestLog) error {
 	if err != nil {
 		return fmt.Errorf("compress response_body: %w", err)
 	}
-	args := []any{log.ID, log.StartedAt.UTC().Format(time.RFC3339Nano), log.GatewayID,
+	args := []any{log.ID, formatTimestamp(log.StartedAt), log.GatewayID,
 		log.GatewayName, log.Prefix, log.IngressProtocol, log.UpstreamProtocol,
 		log.Model, log.RequestPath, log.RequestURL, log.UpstreamURL, log.Method, log.StatusCode,
 		log.ClientResponseStatusCode, log.UpstreamResponseStatusCode, boolInt(log.Success),
@@ -736,7 +806,7 @@ func (s *Store) Delete(ctx context.Context, before *time.Time) (int64, error) {
 	if before == nil {
 		result, err = s.db.ExecContext(ctx, `DELETE FROM request_logs`)
 	} else {
-		result, err = s.db.ExecContext(ctx, `DELETE FROM request_logs WHERE started_at < ?`, before.UTC().Format(time.RFC3339Nano))
+		result, err = s.db.ExecContext(ctx, `DELETE FROM request_logs WHERE started_at < ?`, formatTimestamp(*before))
 	}
 	if err != nil {
 		return 0, err
@@ -792,11 +862,11 @@ func buildLogFilter(filter LogFilter) (string, []any) {
 	}
 	if filter.From != nil {
 		conditions = append(conditions, "started_at >= ?")
-		args = append(args, filter.From.UTC().Format(time.RFC3339Nano))
+		args = append(args, formatTimestamp(*filter.From))
 	}
 	if filter.To != nil {
 		conditions = append(conditions, "started_at <= ?")
-		args = append(args, filter.To.UTC().Format(time.RFC3339Nano))
+		args = append(args, formatTimestamp(*filter.To))
 	}
 	return " WHERE " + strings.Join(conditions, " AND "), args
 }
@@ -818,7 +888,7 @@ func scanSummary(row scanner) (RequestLog, error) {
 		&log.Usage.CacheSource); err != nil {
 		return RequestLog{}, err
 	}
-	log.StartedAt, _ = time.Parse(time.RFC3339Nano, started)
+	log.StartedAt = parseTimestamp(started)
 	log.IngressProtocol = config.Protocol(ingress)
 	log.UpstreamProtocol = config.Protocol(upstream)
 	log.Success = success != 0
@@ -853,7 +923,7 @@ func scanFull(row scanner) (RequestLog, error) {
 		}
 		return RequestLog{}, err
 	}
-	log.StartedAt, _ = time.Parse(time.RFC3339Nano, started)
+	log.StartedAt = parseTimestamp(started)
 	log.IngressProtocol = config.Protocol(ingress)
 	log.UpstreamProtocol = config.Protocol(upstream)
 	log.Success = success != 0
