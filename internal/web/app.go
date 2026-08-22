@@ -293,6 +293,14 @@ func (a *App) deleteLogs(w http.ResponseWriter, r *http.Request) {
 		proxy.WriteError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if count > 0 && a.store != nil {
+		if err := a.store.Vacuum(r.Context()); err != nil && a.logger != nil {
+			a.logger.Warn("VACUUM failed after delete logs", "error", err)
+		}
+		if err := a.store.CheckpointWAL(r.Context()); err != nil && a.logger != nil {
+			a.logger.Warn("WAL checkpoint failed after delete logs", "error", err)
+		}
+	}
 	proxy.WriteJSON(w, http.StatusOK, map[string]any{"deleted": count})
 }
 

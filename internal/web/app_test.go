@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -8,9 +9,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"grok-gateway-proxy/internal/config"
 	"grok-gateway-proxy/internal/proxy"
+	"grok-gateway-proxy/internal/store"
 )
 
 func TestStaticAssetsAreNotMatchedAsGatewayPaths(t *testing.T) {
@@ -317,5 +320,45 @@ func TestEmbeddedJavaScriptImportsAndReferences(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestDeleteLogsReclaimsSpace(t *testing.T) {
+	st, err := store.OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if err := st.Insert(context.Background(), store.RequestLog{
+		ID:        "req-to-delete",
+		StartedAt: time.Now().UTC(),
+		GatewayID: "oc",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
+	app := NewApp(cfg, st, slog.Default(), "1.0.0")
+	req := httptest.NewRequest(http.MethodDelete, "http://127.0.0.1:8787/api/logs", nil)
+	recorder := httptest.NewRecorder()
+	app.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if deleted, ok := body["deleted"].(float64); !ok || deleted != 1 {
+		t.Fatalf("expected deleted 1, got %+v", body)
+	}
+	count, err := st.Count(context.Background(), store.LogFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("expected 0 logs remaining, got %d", count)
 	}
 }
