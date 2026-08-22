@@ -263,6 +263,7 @@ export async function loadLogs(options = false) {
 
   if (reset) {
     state.logsOffset = 0;
+    logsSig = '';
     // Only show skeletons if table has no rows or this is an explicit non-silent reset
     if (!silent && !state.logs.length) {
       tbody.innerHTML = renderSkeletons(8);
@@ -274,8 +275,11 @@ export async function loadLogs(options = false) {
   }
 
   const seq = ++logsSeq;
-  const targetOffset = reset ? 0 : state.logsOffset;
-  const queryLimit = reset && silent && state.logs.length ? String(Math.max(Number(f.limit), state.logs.length)) : f.limit;
+  const isRefresh = reset || silent;
+  const targetOffset = isRefresh ? 0 : state.logsOffset;
+  const queryLimit = silent && state.logs.length
+    ? String(Math.max(Number(f.limit) || 50, state.logs.length))
+    : (f.limit || '50');
 
   try {
     const [data, countData] = await Promise.all([
@@ -288,7 +292,7 @@ export async function loadLogs(options = false) {
     const items = data.items || [];
     state.logsTotal = (countData && typeof countData.count === 'number') ? countData.count : null;
 
-    if (reset || silent) {
+    if (isRefresh) {
       const newSig = items.map(l => l.id + ':' + (l.status_code || 0) + ':' + (l.duration_ms || 0)).join(',');
       if (silent && newSig === logsSig && state.logs.length === items.length) {
         // Data has not changed; do NOT touch the DOM or scroll position!
@@ -308,6 +312,7 @@ export async function loadLogs(options = false) {
     } else if (items.length) {
       state.logs = state.logs.concat(items);
       state.logsOffset += items.length;
+      logsSig = state.logs.map(l => l.id + ':' + (l.status_code || 0) + ':' + (l.duration_ms || 0)).join(',');
       appendLogRows(items);
     }
 
