@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"strings"
 
@@ -20,16 +22,20 @@ func ExtractUsage(body []byte, protocol config.Protocol) store.UsageMetrics {
 		return extractUsageFromRoot(root, protocol)
 	}
 	var last store.UsageMetrics
-	for _, line := range strings.Split(string(body), "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data:") {
+	scanner := bufio.NewScanner(bytes.NewReader(body))
+	const maxLine = 1024 * 1024
+	buf := make([]byte, 64*1024)
+	scanner.Buffer(buf, maxLine)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if !bytes.HasPrefix(line, []byte("data:")) {
 			continue
 		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "" || data == "[DONE]" {
+		data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
 			continue
 		}
-		if json.Unmarshal([]byte(data), &root) == nil {
+		if json.Unmarshal(data, &root) == nil {
 			if metrics := extractUsageFromRoot(root, protocol); metrics.UsagePresent {
 				last = metrics
 			}

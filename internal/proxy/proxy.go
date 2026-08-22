@@ -109,7 +109,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	logEntry.RequestBody = append([]byte(nil), requestBody...)
+	logEntry.RequestBody = capBody(requestBody, bodyLimit)
 	logEntry.Model = ParseModel(requestBody)
 	logEntry.Stream = requestStream(requestBody)
 
@@ -238,7 +238,7 @@ func (p *Proxy) buildUpstreamRequest(ctx context.Context, r *http.Request, gatew
 		}
 	}
 	logEntry.UpstreamURL = upstreamURL
-	logEntry.UpstreamBody = append([]byte(nil), upstreamBody...)
+	logEntry.UpstreamBody = capBody(upstreamBody, p.responseBodyLimit())
 
 	// The caller supplies the context that bounds the whole exchange: a
 	// deadline-bounded one for non-streaming requests, the raw request
@@ -441,9 +441,9 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 // upstreamTimeout returns the effective per-request timeout: the configured
 // default, optionally overridden (and capped) by an X-Proxy-Timeout header.
 func (p *Proxy) upstreamTimeout(r *http.Request) time.Duration {
-	t := p.Config.UpstreamTimeout
-	if t <= 0 {
-		t = config.DefaultUpstreamTimeout
+	t := config.DefaultUpstreamTimeout
+	if p.Config != nil {
+		t = p.Config.GetUpstreamTimeout()
 	}
 	if v := r.Header.Get("X-Proxy-Timeout"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 && d <= maxUpstreamTimeout {
@@ -457,10 +457,20 @@ func (p *Proxy) responseBodyLimit() int64 {
 	if p.ResponseBodySize > 0 {
 		return p.ResponseBodySize
 	}
-	if p.Config != nil && p.Config.BodyCaptureLimitKB > 0 {
-		return int64(p.Config.BodyCaptureLimitKB) << 10
+	if p.Config != nil {
+		limitKB := p.Config.GetBodyCaptureLimitKB()
+		if limitKB > 0 {
+			return int64(limitKB) << 10
+		}
 	}
 	return defaultResponseBodySize
+}
+
+func capBody(data []byte, limit int64) []byte {
+	if limit > 0 && int64(len(data)) > limit {
+		return append([]byte(nil), data[:limit]...)
+	}
+	return append([]byte(nil), data...)
 }
 
 func (p *Proxy) gatewayForPath(path string) (config.GatewayConfig, string, bool) {

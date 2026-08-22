@@ -283,45 +283,6 @@ func TestResponsesToolResultUsesFallbackToolName(t *testing.T) {
 	}
 }
 
-func TestVercelFXDoesNotDuplicateTerminalToolCall(t *testing.T) {
-	t.Skip("covered by TestVercelFXTerminalToolCallSnapshot in vercelfx_regression_test.go")
-	stream := "data: {\"type\":\"tool-input-start\",\"id\":\"call-1\",\"toolName\":\"calc\"}\\n\\n" +
-		"data: {\"type\":\"tool-input-delta\",\"id\":\"call-1\",\"delta\":\"{\\\\\"x\\\\\":1}\"}\\n\\n" +
-		"data: {\"type\":\"tool-call\",\"toolCallId\":\"call-1\",\"toolName\":\"calc\",\"input\":{\"x\":1}}\\n\\n" +
-		"data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"tool-calls\"}}\\n\\n"
-	out, err := vercelFXSSEToResponses("zai/glm-5.2", strings.NewReader(stream))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var response map[string]any
-	if err := json.Unmarshal(out, &response); err != nil {
-		t.Fatal(err)
-	}
-	output := response["output"].([]any)
-	if len(output) != 1 {
-		t.Fatalf("expected one function call, got %d: %s", len(output), out)
-	}
-	call := output[0].(map[string]any)
-	if call["type"] != "function_call" || call["arguments"] != `{"x":1}` {
-		t.Fatalf("terminal tool snapshot was duplicated or malformed: %+v", call)
-	}
-}
-
-func TestExtractFXUsagePreservesCacheUnsupportedState(t *testing.T) {
-	t.Skip("covered by TestExtractFXUsageCacheMissIsCacheSupported and TestExtractFXUsageNoCacheFieldsIsUnsupported")
-	withoutCache := []byte(`data: {"type":"finish","usage":{"inputTokens":{"total":100},"outputTokens":{"total":5}}}\n\ndata: [DONE]\n\n`)
-	usage := extractFXUsage(withoutCache)
-	if !usage.UsagePresent || usage.CacheSupported || usage.InputTokens != 100 || usage.PromptTokens != 100 {
-		t.Fatalf("unexpected unsupported-cache usage: %+v", usage)
-	}
-
-	withCache := []byte(`data: {"type":"finish","usage":{"inputTokens":{"total":100,"cacheRead":60},"outputTokens":{"total":5}}}\n\ndata: [DONE]\n\n`)
-	usage = extractFXUsage(withCache)
-	if !usage.CacheSupported || usage.CacheReadTokens != 60 || usage.InputTokens != 40 || usage.PromptTokens != 100 {
-		t.Fatalf("unexpected cached usage: %+v", usage)
-	}
-}
-
 func TestProxyVercelFXDisguiseEndToEnd(t *testing.T) {
 	var gotPath, gotUA, gotReferer, gotTitle string
 	var gotBody map[string]any
