@@ -238,3 +238,84 @@ func TestProxyConfigAPIUpdatesGlobalProxyURL(t *testing.T) {
 		t.Fatalf("invalid proxy URL changed config: %q", cfg.ProxyURL())
 	}
 }
+
+// TestEmbeddedJavaScriptImportsAndReferences verifies that all embedded ES modules
+// have matching export/import bindings and no referenced utils functions are omitted.
+func TestEmbeddedJavaScriptImportsAndReferences(t *testing.T) {
+	entries, err := staticFiles.ReadDir("static/js")
+	if err != nil {
+		t.Fatalf("read static/js directory: %v", err)
+	}
+
+	jsFiles := make(map[string]string)
+	exports := make(map[string]map[string]bool)
+
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".js") {
+			continue
+		}
+		contentBytes, err := staticFiles.ReadFile("static/js/" + entry.Name())
+		if err != nil {
+			t.Fatalf("read %s: %v", entry.Name(), err)
+		}
+		content := string(contentBytes)
+		jsFiles[entry.Name()] = content
+		exports[entry.Name()] = make(map[string]bool)
+
+		// Parse export function, export const, export async function, export { ... }
+		lines := strings.Split(content, "\n")
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "export function") || strings.HasPrefix(trimmed, "export async function") {
+				parts := strings.Fields(trimmed)
+				for i, p := range parts {
+					if strings.HasPrefix(p, "function") && i+1 < len(parts) {
+						name := strings.Split(parts[i+1], "(")[0]
+						exports[entry.Name()][strings.TrimSpace(name)] = true
+					}
+				}
+			} else if strings.HasPrefix(trimmed, "export const") || strings.HasPrefix(trimmed, "export let") {
+				parts := strings.Fields(trimmed)
+				if len(parts) >= 3 {
+					name := strings.TrimRight(parts[2], "=;, ")
+					exports[entry.Name()][name] = true
+				}
+			}
+		}
+	}
+
+	for fileName, content := range jsFiles {
+		// Verify import { a, b } from './mod.js'
+		for _, line := range strings.Split(content, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if !strings.HasPrefix(trimmed, "import") || !strings.Contains(trimmed, "from") {
+				continue
+			}
+			start := strings.Index(trimmed, "{")
+			end := strings.Index(trimmed, "}")
+			modStart := strings.Index(trimmed, "from")
+			if start == -1 || end == -1 || modStart == -1 || end <= start {
+				continue
+			}
+			rawSymbols := trimmed[start+1 : end]
+			rawMod := strings.Trim(strings.TrimSpace(trimmed[modStart+4:]), "';\"")
+			modName := strings.TrimPrefix(rawMod, "./")
+
+			modExports, exists := exports[modName]
+			if !exists {
+				continue
+			}
+
+			symbols := strings.Split(rawSymbols, ",")
+			for _, sym := range symbols {
+				sym = strings.TrimSpace(sym)
+				if sym == "" {
+					continue
+				}
+				if !modExports[sym] {
+					t.Errorf("%s: imports %q from %q, but %q is not exported by %s", fileName, sym, modName, sym, modName)
+				}
+			}
+		}
+	}
+}
