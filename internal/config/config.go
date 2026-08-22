@@ -469,3 +469,27 @@ func (c *Config) ProxyURL() string {
 	defer c.mu.RUnlock()
 	return c.proxyURL
 }
+
+func (c *Config) GetUpstreamTimeout() time.Duration {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.UpstreamTimeout <= 0 {
+		return DefaultUpstreamTimeout
+	}
+	return c.UpstreamTimeout
+}
+
+func (c *Config) GetLogRetention() time.Duration {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.LogRetention
+}
+
+func (c *Config) GetBodyCaptureLimitKB() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.BodyCaptureLimitKB < 0 {
+		return DefaultBodyCaptureLimitKB
+	}
+	return c.BodyCaptureLimitKB
+}
