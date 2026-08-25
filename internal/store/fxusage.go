@@ -4,12 +4,18 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+
+	"grok-gateway-proxy/internal/numutil"
 )
 
-// extractFXUsage reads the original v3 usage object rather than the normalized
+// ExtractFXUsage reads the original v3 usage object rather than the normalized
 // Responses usage object. The latter must always contain cached_tokens: 0 for
 // strict clients, which would incorrectly mark an upstream response as
 // cache-supported when the gateway did not report cache information.
+func ExtractFXUsage(body []byte) UsageMetrics {
+	return extractFXUsage(body)
+}
+
 func extractFXUsage(body []byte) UsageMetrics {
 	var root map[string]any
 	if json.Unmarshal(body, &root) == nil {
@@ -117,38 +123,17 @@ func extractFXUsageMap(usage map[string]any) UsageMetrics {
 	return result
 }
 
-// --- local copies of numeric helpers (kept private to avoid proxy dep) ---
+// Helpers delegate to the shared numutil package so the extraction logic
+// stays single-sourced across proxy and store.
 
 func fxFirstNumber(m map[string]any, keys ...string) int64 {
-	n, _ := fxFirstNumberOK(m, keys...)
-	return n
+	return numutil.FirstNumber(m, keys...)
 }
 
 func fxFirstNumberOK(m map[string]any, keys ...string) (int64, bool) {
-	for _, key := range keys {
-		value, ok := m[key]
-		if !ok {
-			continue
-		}
-		switch n := value.(type) {
-		case float64:
-			return int64(n), true
-		case json.Number:
-			if parsed, err := n.Int64(); err == nil {
-				return parsed, true
-			}
-		case int64:
-			return n, true
-		case int:
-			return int64(n), true
-		}
-	}
-	return 0, false
+	return numutil.FirstNumberOK(m, keys...)
 }
 
 func fxMaxInt64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
+	return numutil.MaxInt64(a, b)
 }
