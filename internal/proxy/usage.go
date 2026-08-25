@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"grok-gateway-proxy/internal/config"
+	"grok-gateway-proxy/internal/numutil"
 	"grok-gateway-proxy/internal/store"
 )
 
@@ -145,30 +146,11 @@ func extractResponsesUsage(usage map[string]any, result store.UsageMetrics) stor
 }
 
 func firstNumber(m map[string]any, keys ...string) int64 {
-	n, _ := firstNumberOK(m, keys...)
-	return n
+	return numutil.FirstNumber(m, keys...)
 }
 
 func firstNumberOK(m map[string]any, keys ...string) (int64, bool) {
-	for _, key := range keys {
-		value, ok := m[key]
-		if !ok {
-			continue
-		}
-		switch n := value.(type) {
-		case float64:
-			return int64(n), true
-		case json.Number:
-			if parsed, err := n.Int64(); err == nil {
-				return parsed, true
-			}
-		case int64:
-			return n, true
-		case int:
-			return int64(n), true
-		}
-	}
-	return 0, false
+	return numutil.FirstNumberOK(m, keys...)
 }
 
 func firstNestedNumber(m map[string]any, parent, key string) int64 {
@@ -180,10 +162,7 @@ func firstNestedNumber(m map[string]any, parent, key string) int64 {
 }
 
 func maxInt64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
+	return numutil.MaxInt64(a, b)
 }
 
 func ParseModel(body []byte) string {

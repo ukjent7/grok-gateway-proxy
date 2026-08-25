@@ -210,32 +210,13 @@ func (p *Proxy) resolveGateway(r *http.Request, body []byte) (config.GatewayConf
 // buildUpstreamRequest assembles the upstream HTTP request: URL, headers,
 // body transformation, and records them in the log entry.
 func (p *Proxy) buildUpstreamRequest(ctx context.Context, r *http.Request, gateway config.GatewayConfig, subpath string, adapter GatewayAdapter, requestBody []byte, logEntry *store.RequestLog) (*http.Request, error) {
-	fxMode := gateway.ID == "ve" && gateway.FXDisguiseEnabled
-	var upstreamURL string
-	var upstreamBody []byte
-	var err error
-	if fxMode {
-		// FX disguise mode: switch to the v3 language-model endpoint and
-		// convert the Responses body into the v3 payload with the promo
-		// headers injected.
-		upstreamURL = vercelFXUpstreamURL(gateway.BaseURL)
-		ua := gateway.FXDisguiseUserAgent
-		if ua == "" {
-			ua = "fx/0.0.3"
-		}
-		upstreamBody, err = convertResponsesToV3(requestBody, ua)
-		if err != nil {
-			return nil, &statusError{status: http.StatusBadRequest, message: err.Error()}
-		}
-	} else {
-		upstreamURL, err = joinUpstreamURL(gateway.BaseURL, subpath, r.URL.RawQuery)
-		if err != nil {
-			return nil, &statusError{status: http.StatusBadGateway, message: err.Error()}
-		}
-		upstreamBody, err = transformRequestBody(adapter, logEntry.Model, requestBody)
-		if err != nil {
-			return nil, &statusError{status: http.StatusBadRequest, message: err.Error()}
-		}
+	upstreamURL, err := gatewayUpstreamURL(adapter, gateway, subpath, r.URL.RawQuery)
+	if err != nil {
+		return nil, &statusError{status: http.StatusBadGateway, message: err.Error()}
+	}
+	upstreamBody, err := gatewayTransformRequest(adapter, gateway, logEntry.Model, requestBody)
+	if err != nil {
+		return nil, &statusError{status: http.StatusBadRequest, message: err.Error()}
 	}
 	logEntry.UpstreamURL = upstreamURL
 	logEntry.UpstreamBody = capBody(upstreamBody, p.responseBodyLimit())
@@ -256,17 +237,11 @@ func (p *Proxy) buildUpstreamRequest(ctx context.Context, r *http.Request, gatew
 	copyForwardHeaders(upstreamRequest.Header, r.Header, allowlist)
 	upstreamRequest.Header.Set("Content-Type", "application/json")
 	upstreamRequest.Header.Del("Content-Length")
-	if fxMode {
-		sessionID := fxSessionID(r, requestBody)
-		ua := gateway.FXDisguiseUserAgent
-		if ua == "" {
-			ua = "fx/0.0.3"
-		}
-		for name, value := range fxDisguiseHeaders(ua, logEntry.Model, sessionID) {
-			upstreamRequest.Header.Set(name, value)
-		}
-	} else if gateway.UserAgentOverrideEnabled {
+	if gateway.UserAgentOverrideEnabled {
 		upstreamRequest.Header.Set("User-Agent", gateway.UserAgentOverride)
+	}
+	for name, value := range gatewayExtraHeaders(adapter, gateway, r, requestBody, logEntry.Model) {
+		upstreamRequest.Header.Set(name, value)
 	}
 	logEntry.UpstreamHeaders = headersJSON(upstreamRequest.Header)
 	return upstreamRequest, nil
@@ -306,8 +281,6 @@ func (p *Proxy) ClientFor(gateway config.GatewayConfig) *http.Client {
 // forwardUpstreamResponse performs the upstream HTTP call and writes the
 // response back to the client, filling in the response-side audit fields.
 func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.RequestLog, adapter GatewayAdapter, gateway config.GatewayConfig, client *http.Client, upstreamRequest *http.Request, stream bool, bodyLimit int64) error {
-	protocol := gateway.Protocol
-	fxMode := gateway.ID == "ve" && gateway.FXDisguiseEnabled
 	upstreamResponse, err := client.Do(upstreamRequest)
 	if err != nil {
 		// Transport-level failure (DNS, connect, timeout) before any upstream
@@ -349,48 +322,19 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 
 	// Success path: stream or buffer based on content-type.
 	copyResponseHeaders(w.Header(), upstreamResponse.Header)
-	if fxMode && !stream {
-		// The v3 endpoint always streams SSE; a non-streaming client expects a
-		// JSON Responses object instead.
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if ct := gatewayResponseContentType(adapter, gateway, upstreamResponse.Header, stream); ct != "" {
+		w.Header().Set("Content-Type", ct)
 	}
 	writeResponseStatusAndHeaders(w, upstreamResponse)
 
-	eventStream := isEventStream(upstreamResponse.Header)
+	eventStream := gatewayIsEventStream(adapter, gateway, upstreamResponse.Header, stream)
 	var responseBody []byte
 	var copyErr error
 
-	if fxMode {
-		// FX disguise mode: the upstream speaks the v3 language-model SSE
-		// protocol. Convert it back to the Responses protocol the client
-		// expects (SSE for streaming, assembled JSON otherwise).
+	if eventStream {
 		rawResponse := newCappedBuffer(bodyLimit)
 		responseReader := io.TeeReader(upstreamResponse.Body, rawResponse)
-		if stream {
-			responseReader = newVercelFXSSEReader(responseReader, logEntry.Model)
-			responseBody, copyErr = copyAndCapture(w, responseReader, true, bodyLimit)
-		} else {
-			raw, readErr := io.ReadAll(responseReader)
-			if readErr != nil {
-				copyErr = readErr
-			} else {
-				var transformErr error
-				responseBody, transformErr = vercelFXSSEToResponses(logEntry.Model, bytes.NewReader(raw))
-				if transformErr != nil {
-					copyErr = transformErr
-					responseBody = raw
-				}
-			}
-			if _, writeErr := w.Write(responseBody); copyErr == nil && writeErr != nil {
-				copyErr = writeErr
-			}
-		}
-		logEntry.UpstreamResponseBody = append([]byte(nil), rawResponse.Bytes()...)
-		logEntry.ResponseTruncated = rawResponse.truncated
-	} else if eventStream {
-		rawResponse := newCappedBuffer(bodyLimit)
-		responseReader := io.TeeReader(upstreamResponse.Body, rawResponse)
-		responseReader = transformSSE(adapter, logEntry.Model, responseReader)
+		responseReader = gatewayTransformSSE(adapter, gateway, logEntry.Model, responseReader)
 		responseBody, copyErr = copyAndCapture(w, responseReader, true, bodyLimit)
 		logEntry.UpstreamResponseBody = append([]byte(nil), rawResponse.Bytes()...)
 		logEntry.ResponseTruncated = rawResponse.truncated
@@ -407,7 +351,7 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 		logEntry.ResponseTruncated = rawCapture.truncated
 
 		var transformErr error
-		responseBody, transformErr = transformResponseBody(adapter, logEntry.Model, rawResponse)
+		responseBody, transformErr = gatewayTransformResponse(adapter, gateway, logEntry.Model, rawResponse)
 		if transformErr != nil {
 			copyErr = transformErr
 			responseBody = rawResponse
@@ -422,15 +366,7 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 	}
 	logEntry.Success = upstreamResponse.StatusCode >= 200 && upstreamResponse.StatusCode < 300
 	if logEntry.Success {
-		if fxMode {
-			// Keep cache support semantics from the original v3 usage. The
-			// Responses envelope intentionally contains cached_tokens: 0 even
-			// when the upstream omitted cache fields for strict clients, so
-			// extracting from responseBody would falsely report 0% cache hits.
-			logEntry.Usage = extractFXUsage(logEntry.UpstreamResponseBody)
-		} else {
-			logEntry.Usage = ExtractUsage(responseBody, protocol)
-		}
+		logEntry.Usage = gatewayExtractUsage(adapter, gateway, logEntry.UpstreamResponseBody, responseBody)
 	}
 	if logEntry.StatusCode >= 400 && logEntry.Error == "" {
 		logEntry.Error = fmt.Sprintf("upstream returned HTTP %d", logEntry.StatusCode)
@@ -728,34 +664,4 @@ func newRequestID() string {
 		return fmt.Sprintf("req-%d", time.Now().UnixNano())
 	}
 	return "req-" + hex.EncodeToString(b[:])
-}
-
-// fxSessionID derives a stable session identifier for Vercel AI Gateway FX
-// mode. Vercel uses X-Session-Id / X-Session-Affinity for cache affinity: it
-// routes the request to a backend node that holds the cached prompt prefix. A
-// random per-request ID defeats this, so the prompt is re-tokenized on every
-// call and cache hits collapse.
-//
-// The real fx client generates one session ID per conversation at startup and
-// reuses it for every turn. The proxy is stateless, so it derives a stable ID
-// from the request body's prompt_cache_key (set by the client to the
-// conversation ID and kept constant across turns). When that field is absent,
-// it falls back to x-session-id / x-session-affinity / x-client-request-id —
-// standard gateway headers the original fx client also honors — and only
-// generates a random ID as a last resort.
-func fxSessionID(r *http.Request, requestBody []byte) string {
-	var root struct {
-		PromptCacheKey string `json:"prompt_cache_key"`
-	}
-	if json.Unmarshal(requestBody, &root) == nil {
-		if key := strings.TrimSpace(root.PromptCacheKey); key != "" {
-			return key
-		}
-	}
-	for _, h := range []string{"x-session-id", "x-session-affinity", "x-client-request-id"} {
-		if v := r.Header.Get(h); v != "" {
-			return v
-		}
-	}
-	return "pi-" + fxHex(8)
 }
