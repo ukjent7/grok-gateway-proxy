@@ -29,13 +29,13 @@ import (
 //     content verbatim or the API returns 400), while `summary` and
 //     `encrypted_content`, which DeepSeek does not support, are stripped.
 //   - `reasoning.effort` passes through untouched.
-type DeepSeekResponsesAdapter struct{}
+type DeepSeekResponsesAdapter struct{ baseResponsesAdapter }
 
-func (DeepSeekResponsesAdapter) ID() string                { return "DeepSeekResponsesAdapter" }
-func (DeepSeekResponsesAdapter) Protocol() config.Protocol { return config.ProtocolResponses }
-func (DeepSeekResponsesAdapter) EndpointPath() string      { return "/responses" }
+func (DeepSeekResponsesAdapter) ID() string { return "DeepSeekResponsesAdapter" }
+func (a DeepSeekResponsesAdapter) Protocol() config.Protocol { return a.baseResponsesAdapter.Protocol() }
+func (a DeepSeekResponsesAdapter) EndpointPath() string      { return a.baseResponsesAdapter.EndpointPath() }
 func (a DeepSeekResponsesAdapter) AcceptsPath(path string) bool {
-	return path == a.EndpointPath()
+	return a.baseResponsesAdapter.AcceptsPath(path)
 }
 func (a DeepSeekResponsesAdapter) RejectMessage(path string) string {
 	return fmt.Sprintf("%s accepts only %s, got %s", a.ID(), a.EndpointPath(), path)

@@ -13,13 +13,13 @@ import (
 // Build's parser understands; conformant bodies pass through byte-for-byte.
 // The gateway ships with an empty Base URL: point it at any Responses
 // endpoint in the console.
-type StandardResponsesAdapter struct{}
+type StandardResponsesAdapter struct{ baseResponsesAdapter }
 
-func (StandardResponsesAdapter) ID() string                { return "StandardResponsesAdapter" }
-func (StandardResponsesAdapter) Protocol() config.Protocol { return config.ProtocolResponses }
-func (StandardResponsesAdapter) EndpointPath() string      { return "/responses" }
+func (StandardResponsesAdapter) ID() string { return "StandardResponsesAdapter" }
+func (a StandardResponsesAdapter) Protocol() config.Protocol { return a.baseResponsesAdapter.Protocol() }
+func (a StandardResponsesAdapter) EndpointPath() string      { return a.baseResponsesAdapter.EndpointPath() }
 func (a StandardResponsesAdapter) AcceptsPath(path string) bool {
-	return path == a.EndpointPath()
+	return a.baseResponsesAdapter.AcceptsPath(path)
 }
 func (a StandardResponsesAdapter) RejectMessage(path string) string {
 	return fmt.Sprintf("%s accepts only %s, got %s", a.ID(), a.EndpointPath(), path)

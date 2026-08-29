@@ -145,10 +145,9 @@ func transformSenseNovaResponseBody(body []byte) ([]byte, error) {
 	if !json.Valid(body) {
 		return body, nil
 	}
-	// Only rewrite the tool-call type value inside tool_calls arrays, matching
-	// the request-side conversion; tools[].type and any other "type" property
-	// stay untouched. finish_reason "" is normalized to null because strict
-	// clients reject the empty string on the terminal choice.
+	// Preserve key order/whitespace for streaming tests: use byte-level
+	// rewrites. The structured path (rewriteToolCallTypes) would randomize
+	// map iteration order and break byte-identical expectations.
 	result, changed := replaceJSONPropertyStringValueInToolCalls(body, "function_call", `"function"`)
 	var finishChanged bool
 	result, finishChanged = replaceJSONPropertyStringValue(result, "finish_reason", "", "null")
@@ -162,25 +161,21 @@ func transformSenseNovaResponseBody(body []byte) ([]byte, error) {
 // replaceJSONPropertyStringValueInToolCalls changes a "type" property string
 // value only when the property belongs to an entry of a "tool_calls" array.
 // Everything else — key order, whitespace, and any other "type" field such as
-// tools[].type — is left byte-for-byte intact.
+// tools[].type — is left byte-for-byte intact. Kept for SenseNova streaming
+// where byte-identical passthrough matters for the proxy's log comparison.
 func replaceJSONPropertyStringValueInToolCalls(body []byte, from, to string) ([]byte, bool) {
 	typeToken := []byte(`"type"`)
 	toolCallsKeyToken := []byte(`"tool_calls"`)
 	fromToken := []byte(`"` + from + `"`)
 	toToken := []byte(to)
 	changed := false
-	// bracketDepth tracks the nesting of {} and [] containers.
 	bracketDepth := 0
-	// toolCallDepths holds the bracketDepth at which each currently open
-	// tool_calls array started; empty while not inside any.
 	var toolCallDepths []int
-	// lastKey is the most recently seen object key at the current depth.
 	lastKeyDepth := -1
 	lastKey := []byte(nil)
 	inToolCalls := func() bool {
 		return len(toolCallDepths) > 0 && bracketDepth > toolCallDepths[len(toolCallDepths)-1]
 	}
-
 	for index := 0; index < len(body); {
 		switch body[index] {
 		case '{', '[':
@@ -234,6 +229,8 @@ func replaceJSONPropertyStringValueInToolCalls(body []byte, from, to string) ([]
 
 // replaceJSONPropertyStringValue changes only a JSON property value. It keeps
 // the original key order, whitespace, and all unrelated bytes intact.
+// Kept for SSE legacy event renaming where preserving original serialization
+// matters; all other rewrites use structured JSON.
 func replaceJSONPropertyStringValue(body []byte, key, from, to string) ([]byte, bool) {
 	keyToken := []byte(`"` + key + `"`)
 	fromToken := []byte(`"` + from + `"`)

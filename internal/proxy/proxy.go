@@ -52,14 +52,6 @@ type statusError struct {
 
 func (e *statusError) Error() string { return e.message }
 
-type blockedModelError struct {
-	model string
-}
-
-func (e *blockedModelError) Error() string {
-	return fmt.Sprintf("model %q is blocked by the proxy", e.model)
-}
-
 func statusOf(err error) int {
 	var se *statusError
 	if ok := errors.As(err, &se); ok {
@@ -71,65 +63,22 @@ func statusOf(err error) int {
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	bodyLimit := p.responseBodyLimit()
-	capturedResponse := newResponseCapture(w, bodyLimit)
-	w = capturedResponse
+	capture := newResponseCapture(w, bodyLimit)
+	w = capture
 
-	logEntry := store.RequestLog{
-		ID:             newRequestID(),
-		StartedAt:      started,
-		Method:         r.Method,
-		RequestPath:    r.URL.Path,
-		RequestURL:     r.URL.RequestURI(),
-		RequestHeaders: headersJSON(r.Header),
-	}
-	// Expose the request id to the client for log correlation without
-	// altering the request or response body.
+	logEntry := p.newAuditLog(r, started)
 	w.Header().Set("X-Request-Id", logEntry.ID)
-	defer func() {
-		logEntry.ClientResponseStatusCode = capturedResponse.statusCode
-		if logEntry.StatusCode == 0 && capturedResponse.statusCode != 0 {
-			logEntry.StatusCode = capturedResponse.statusCode
-		}
-		if logEntry.StatusCode == 0 {
-			logEntry.StatusCode = http.StatusInternalServerError
-		}
-		logEntry.ResponseHeaders = headersJSON(capturedResponse.headers)
-		logEntry.ResponseBody = append([]byte(nil), capturedResponse.body.Bytes()...)
-		logEntry.ResponseTruncated = logEntry.ResponseTruncated || capturedResponse.body.truncated
-		p.finishLog(r.Context(), &logEntry, started)
-	}()
+	defer p.finalizeLog(r.Context(), &logEntry, capture, started)
 
-	requestBody, readErr := io.ReadAll(io.LimitReader(r.Body, maxRequestBodySize+1))
-	if readErr != nil {
-		WriteError(w, http.StatusBadRequest, readErr)
+	requestBody, ok := p.readRequestBody(w, r, &logEntry, bodyLimit)
+	if !ok {
 		return
 	}
-	if int64(len(requestBody)) > maxRequestBodySize {
-		WriteError(w, http.StatusRequestEntityTooLarge, fmt.Errorf("request body exceeds %d bytes", maxRequestBodySize))
-		return
-	}
-
-	logEntry.RequestBody = capBody(requestBody, bodyLimit)
-	logEntry.Model = ParseModel(requestBody)
-	logEntry.Stream = requestStream(requestBody)
 
 	gateway, subpath, adapter, resolveErr := p.resolveGateway(r, requestBody)
-	if gateway.ID != "" {
-		logEntry.GatewayID = gateway.ID
-		logEntry.GatewayName = gateway.Name
-		logEntry.Prefix = gateway.Prefix
-		logEntry.UpstreamProtocol = gateway.Protocol
-	}
-	if adapter != nil {
-		logEntry.IngressProtocol = protocolForPath(subpath)
-	}
+	p.populateLogGateway(&logEntry, gateway, subpath, adapter)
 	if resolveErr != nil {
-		var blocked *blockedModelError
-		if errors.As(resolveErr, &blocked) {
-			logEntry.Error = blocked.Error()
-			logEntry.StatusCode = http.StatusOK
-			logEntry.Success = true
-			writeBlockedModelResponse(w, logEntry.Model, logEntry.Stream)
+		if p.handleBlockedModel(w, &logEntry, resolveErr) {
 			return
 		}
 		logEntry.Error = resolveErr.Error()
@@ -138,23 +87,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Non-streaming responses are bounded by a total deadline (overridable via
-	// X-Proxy-Timeout). Streaming responses are deliberately NOT given a total
-	// deadline: the client enforces a 300s idle timeout (only while the stream
-	// is silent), so a total cap here would truncate long, still-active streams
-	// mid-response and make the client synthesize a retriable "No
-	// ResponseCompleted" error. For streams we rely on client disconnect
-	// (r.Context() cancel) plus the transport's ResponseHeaderTimeout for the
-	// first byte. cancel is deferred so the deadline (non-stream) stays in
-	// effect for the entire Do and body read in forwardUpstreamResponse, rather
-	// than being cancelled the moment buildUpstreamRequest returns.
-	upstreamCtx := r.Context()
-	var cancel context.CancelFunc
-	if logEntry.Stream {
-		cancel = func() {}
-	} else {
-		upstreamCtx, cancel = context.WithTimeout(r.Context(), p.upstreamTimeout(r))
-	}
+	upstreamCtx, cancel := p.upstreamContext(r, logEntry.Stream)
 	defer cancel()
 
 	upstreamRequest, err := p.buildUpstreamRequest(upstreamCtx, r, gateway, subpath, adapter, requestBody, &logEntry)
@@ -167,15 +100,83 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if err := p.forwardUpstreamResponse(w, &logEntry, adapter, gateway, p.ClientFor(gateway), upstreamRequest, bodyLimit); err != nil {
 		logEntry.Error = err.Error()
-		// If nothing was written to the client yet (a transport-level failure
-		// before any upstream headers arrived), surface a gateway error instead
-		// of leaving the client with an empty default 200. If headers were
-		// already sent mid-stream, keep the upstream status and just log.
-		if capturedResponse.statusCode == 0 {
+		if capture.statusCode == 0 {
 			logEntry.StatusCode = statusOf(err)
 			WriteError(w, logEntry.StatusCode, err)
 		}
 	}
+}
+
+func (p *Proxy) newAuditLog(r *http.Request, started time.Time) store.RequestLog {
+	return store.RequestLog{
+		ID:             newRequestID(),
+		StartedAt:      started,
+		Method:         r.Method,
+		RequestPath:    r.URL.Path,
+		RequestURL:     r.URL.RequestURI(),
+		RequestHeaders: headersJSON(r.Header),
+	}
+}
+
+func (p *Proxy) finalizeLog(ctx context.Context, logEntry *store.RequestLog, capture *responseCapture, started time.Time) {
+	logEntry.ClientResponseStatusCode = capture.statusCode
+	if logEntry.StatusCode == 0 && capture.statusCode != 0 {
+		logEntry.StatusCode = capture.statusCode
+	}
+	if logEntry.StatusCode == 0 {
+		logEntry.StatusCode = http.StatusInternalServerError
+	}
+	logEntry.ResponseHeaders = headersJSON(capture.headers)
+	logEntry.ResponseBody = append([]byte(nil), capture.body.Bytes()...)
+	logEntry.ResponseTruncated = logEntry.ResponseTruncated || capture.body.truncated
+	p.finishLog(ctx, logEntry, started)
+}
+
+func (p *Proxy) readRequestBody(w http.ResponseWriter, r *http.Request, logEntry *store.RequestLog, bodyLimit int64) ([]byte, bool) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodySize+1))
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, err)
+		return nil, false
+	}
+	if int64(len(body)) > maxRequestBodySize {
+		WriteError(w, http.StatusRequestEntityTooLarge, fmt.Errorf("request body exceeds %d bytes", maxRequestBodySize))
+		return nil, false
+	}
+	logEntry.RequestBody = capBody(body, bodyLimit)
+	logEntry.Model = ParseModel(body)
+	logEntry.Stream = requestStream(body)
+	return body, true
+}
+
+func (p *Proxy) populateLogGateway(logEntry *store.RequestLog, gateway config.GatewayConfig, subpath string, adapter GatewayAdapter) {
+	if gateway.ID != "" {
+		logEntry.GatewayID = gateway.ID
+		logEntry.GatewayName = gateway.Name
+		logEntry.Prefix = gateway.Prefix
+		logEntry.UpstreamProtocol = gateway.Protocol
+	}
+	if adapter != nil {
+		logEntry.IngressProtocol = protocolForPath(subpath)
+	}
+}
+
+func (p *Proxy) handleBlockedModel(w http.ResponseWriter, logEntry *store.RequestLog, err error) bool {
+	var blocked *blockedModelError
+	if !errors.As(err, &blocked) {
+		return false
+	}
+	logEntry.Error = blocked.Error()
+	logEntry.StatusCode = http.StatusOK
+	logEntry.Success = true
+	writeBlockedModelResponse(w, logEntry.Model, logEntry.Stream)
+	return true
+}
+
+func (p *Proxy) upstreamContext(r *http.Request, stream bool) (context.Context, context.CancelFunc) {
+	if stream {
+		return r.Context(), func() {}
+	}
+	return context.WithTimeout(r.Context(), p.upstreamTimeout(r))
 }
 
 // resolveGateway maps the inbound path to a gateway + adapter and validates
@@ -440,103 +441,6 @@ func (p *Proxy) finishLog(ctx context.Context, logEntry *store.RequestLog, start
 	}
 }
 
-// --- Response capture ---
-
-// responseCapture wraps the client-facing ResponseWriter to snapshot the
-// status, headers, and (capped) body the client actually receives.
-type responseCapture struct {
-	http.ResponseWriter
-	statusCode int
-	headers    http.Header
-	body       *cappedBuffer
-}
-
-func newResponseCapture(w http.ResponseWriter, limit int64) *responseCapture {
-	return &responseCapture{ResponseWriter: w, body: newCappedBuffer(limit)}
-}
-
-func (w *responseCapture) WriteHeader(statusCode int) {
-	if w.statusCode != 0 {
-		return
-	}
-	w.statusCode = statusCode
-	w.headers = cloneHeaders(w.Header())
-	w.ResponseWriter.WriteHeader(statusCode)
-}
-
-func (w *responseCapture) Write(data []byte) (int, error) {
-	if w.statusCode == 0 {
-		w.WriteHeader(http.StatusOK)
-	}
-	n, err := w.ResponseWriter.Write(data)
-	if n > 0 {
-		_, _ = w.body.Write(data[:n])
-	}
-	return n, err
-}
-
-func (w *responseCapture) Flush() {
-	if w.statusCode == 0 {
-		w.WriteHeader(http.StatusOK)
-	}
-	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
-		flusher.Flush()
-	}
-}
-
-// --- Capped buffer ---
-
-// cappedBuffer is an io.Writer that stops accepting bytes once limit is
-// reached, so a TeeReader can snapshot the upstream stream without unbounded
-// buffering. Writes beyond the limit are reported as written so the
-// TeeReader keeps passing the full stream through.
-type cappedBuffer struct {
-	buf       bytes.Buffer
-	limit     int64
-	truncated bool
-}
-
-func newCappedBuffer(limit int64) *cappedBuffer {
-	c := &cappedBuffer{limit: limit}
-	const preAlloc = 64 * 1024
-	if limit > 0 && limit < preAlloc {
-		c.buf.Grow(int(limit))
-	} else if limit >= preAlloc {
-		c.buf.Grow(preAlloc)
-	}
-	return c
-}
-
-func (c *cappedBuffer) Write(p []byte) (int, error) {
-	if c.truncated {
-		return len(p), nil
-	}
-	remaining := c.limit - int64(c.buf.Len())
-	if remaining <= 0 {
-		c.truncated = true
-		return len(p), nil
-	}
-	if int64(len(p)) > remaining {
-		_, _ = c.buf.Write(p[:remaining])
-		c.truncated = true
-	} else {
-		_, _ = c.buf.Write(p)
-	}
-	return len(p), nil
-}
-
-func (c *cappedBuffer) Bytes() []byte { return c.buf.Bytes() }
-
-// --- Helpers ---
-
-func cloneHeaders(src http.Header) http.Header {
-	dst := make(http.Header, len(src))
-	for name, values := range src {
-		dst[name] = append([]string(nil), values...)
-	}
-	return dst
-}
-
 // writeResponseStatusAndHeaders writes the status code and already-copied
 // response headers, then flushes so headers reach the client immediately.
 // For SSE streams this ensures the client starts receiving as soon as the
@@ -571,53 +475,6 @@ func requestStream(body []byte) bool {
 	return json.Unmarshal(body, &request) == nil && request.Stream
 }
 
-func isBlockedModel(model string) bool {
-	model = strings.ToLower(strings.TrimSpace(model))
-	return model == "grok" || strings.HasPrefix(model, "grok-")
-}
-
-func writeBlockedModelResponse(w http.ResponseWriter, model string, stream bool) {
-	responseID := "resp-blocked-" + strings.TrimPrefix(newRequestID(), "req-")
-	// created_at is a required field on the Responses object; strict clients
-	// (Grok Build's async-openai types) fail to deserialize the synthetic
-	// response without it.
-	response := map[string]any{
-		"id":         responseID,
-		"object":     "response",
-		"created_at": time.Now().Unix(),
-		"status":     "completed",
-		"model":      model,
-		"output":     []any{},
-	}
-
-	if !stream {
-		WriteJSON(w, http.StatusOK, response)
-		return
-	}
-
-	created := map[string]any{
-		"type":            "response.created",
-		"sequence_number": 0,
-		"response":        response,
-	}
-	completed := map[string]any{
-		"type":            "response.completed",
-		"sequence_number": 1,
-		"response":        response,
-	}
-	createdBody, _ := json.Marshal(created)
-	completedBody, _ := json.Marshal(completed)
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
-	_, _ = fmt.Fprintf(w, "event: response.created\ndata: %s\n\n", createdBody)
-	_, _ = fmt.Fprintf(w, "event: response.completed\ndata: %s\n\n", completedBody)
-	_, _ = io.WriteString(w, "data: [DONE]\n\n")
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
-	}
-}
-
 func isEventStream(headers http.Header) bool {
 	return strings.Contains(strings.ToLower(headers.Get("Content-Type")), "text/event-stream")
 }
@@ -630,31 +487,6 @@ func copyResponseHeaders(dst, src http.Header) {
 		}
 		for _, value := range values {
 			dst.Add(name, value)
-		}
-	}
-}
-
-func copyAndCapture(w http.ResponseWriter, reader io.Reader, streaming bool, limit int64) ([]byte, error) {
-	capture := newCappedBuffer(limit)
-	buf := make([]byte, 32*1024)
-	flusher, canFlush := w.(http.Flusher)
-	for {
-		n, err := reader.Read(buf)
-		if n > 0 {
-			chunk := buf[:n]
-			if _, writeErr := w.Write(chunk); writeErr != nil {
-				return capture.Bytes(), writeErr
-			}
-			_, _ = capture.Write(chunk)
-			if streaming && canFlush {
-				flusher.Flush()
-			}
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return capture.Bytes(), nil
-			}
-			return capture.Bytes(), err
 		}
 	}
 }

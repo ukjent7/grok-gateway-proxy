@@ -20,6 +20,16 @@ import (
 // events outside Grok Build's typed event vocabulary (keepalive pings and
 // newer standard event types its parser cannot deserialize — an unparseable
 // frame fails the whole stream client-side).
+//
+// Whitelists in this file are derived from the canonical specs:
+//   - Tool types: openai-4.0.51/src/responses/openai-responses-api.ts#OpenAIResponsesTool
+//                 + async-openai/src/types/responses/{api,response}.rs#Tool
+//   - Include values: openai-4.0.51/src/responses/openai-responses-api.ts#OpenAIResponsesIncludeValue
+//                 = async-openai/src/types/responses/api.rs#IncludeEnum
+//   - Stream events: async-openai/src/types/responses/stream.rs#ResponseStreamEvent
+//                 (grok-build's openai-responses-api.ts#openaiResponsesChunkSchema lags behind;
+//                 unknown events are dropped to avoid client deserialization failure).
+// Keep these in sync via `go:generate` from openapi.yaml or the upstream crates.
 
 // standardResponsesToolTypes is the tool `type` vocabulary of the standard
 // Responses protocol (mirroring the Tool enum Grok Build itself serializes
@@ -42,6 +52,7 @@ var standardResponsesToolTypes = map[string]bool{
 	"namespace":                     true,
 	"tool_search":                   true,
 	"apply_patch":                   true,
+	"programmatic_tool_calling":     true,
 }
 
 // standardResponsesIncludeValues is the standard `include` vocabulary
