@@ -112,12 +112,6 @@ WHERE client_response_status_code = 0 OR upstream_response_status_code = 0
 	if err := s.scrubStoredHeaderCredentials(); err != nil {
 		return err
 	}
-	// Reconcile FX usage written by older builds. Responses conversion adds
-	// cached_tokens: 0 for strict clients, which must not be mistaken for an
-	// upstream cache field in historical metrics.
-	if err := s.reconcileFXUsageLogs(); err != nil {
-		return err
-	}
 	// Compress existing rows that were written before transparent gzip
 	// compression was introduced (schema_version < 3).
 	if version < 3 {
@@ -168,59 +162,6 @@ func (s *Store) normalizeTimestamps() error {
 	}
 	for _, update := range updates {
 		if _, err := s.db.Exec(`UPDATE request_logs SET started_at = ? WHERE id = ?`, update.startedAt, update.id); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *Store) reconcileFXUsageLogs() error {
-	rows, err := s.db.Query(`
-SELECT id, upstream_response_body
-FROM request_logs
-WHERE gateway_id = 've'
-  AND upstream_url LIKE '%/v3/ai/language-model%'
-  AND length(upstream_response_body) > 0`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	type usageUpdate struct {
-		id    string
-		usage UsageMetrics
-	}
-	var updates []usageUpdate
-	for rows.Next() {
-		var id string
-		var body []byte
-		if err := rows.Scan(&id, &body); err != nil {
-			return err
-		}
-		// Decompress in case a partial compression migration left some rows
-		// compressed while version was not yet stamped.
-		body = decompressBody(body)
-		usage := extractFXUsage(body)
-		if usage.UsagePresent {
-			updates = append(updates, usageUpdate{id: id, usage: usage})
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for _, update := range updates {
-		_, err := s.db.Exec(`
-UPDATE request_logs
-SET input_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?,
-    prompt_tokens = ?, output_tokens = ?, reasoning_tokens = ?,
-    cache_supported = ?, usage_present = ?, cache_source = ?
-WHERE id = ?`,
-			update.usage.InputTokens, update.usage.CacheReadTokens,
-			update.usage.CacheWriteTokens, update.usage.PromptTokens,
-			update.usage.OutputTokens, update.usage.ReasoningTokens,
-			boolInt(update.usage.CacheSupported), boolInt(update.usage.UsagePresent),
-			update.usage.CacheSource, update.id)
-		if err != nil {
 			return err
 		}
 	}
