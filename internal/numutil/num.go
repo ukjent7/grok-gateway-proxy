@@ -3,8 +3,6 @@ package numutil
 import "encoding/json"
 
 // FirstNumber returns the first present numeric value for the given keys.
-// It mirrors the helper previously duplicated in proxy/usage.go and
-// store/fxusage.go.
 func FirstNumber(m map[string]any, keys ...string) int64 {
 	n, _ := FirstNumberOK(m, keys...)
 	return n
