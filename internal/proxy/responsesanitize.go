@@ -238,13 +238,17 @@ func isUnknownResponsesEventPayload(payload []byte) bool {
 // are renamed to their standard reasoning_text equivalents, keepalive pings
 // are dropped, and events outside the known vocabulary are dropped.
 func newResponsesSSEFilter(reader io.Reader) io.Reader {
-	return newSSELineTransformer(reader, rewriteLegacyReasoningEventNames, nil, isVercelPing, dropUnknownResponsesEvent)
+	return newSSELineTransformer(reader, rewriteLegacyReasoningEventNames, isVercelPing, dropUnknownResponsesEvent)
 }
 
 // dropUnknownResponsesEvent decides on the renamed payload so the legacy
 // reasoning event names pass the vocabulary check that follows the rename.
 // The rename is idempotent, so applying it here and again at write time is
-// safe.
+// safe. An empty `data:` frame is dropped as well: it cannot be parsed by
+// the client and would fail the whole stream.
 func dropUnknownResponsesEvent(payload []byte) bool {
+	if len(bytes.TrimSpace(payload)) == 0 {
+		return true
+	}
 	return isUnknownResponsesEventPayload(rewriteLegacyReasoningEventNames(payload))
 }

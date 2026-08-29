@@ -337,6 +337,7 @@ func TestStandardLeavesConformantRequestsUnchanged(t *testing.T) {
 func TestStandardFiltersPingsAndUnknownEvents(t *testing.T) {
 	adapter := StandardResponsesAdapter{}
 	input := "event: ping\ndata: {\"type\":\"ping\",\"cost\":\"0\"}\n\n" +
+		"event: ping\ndata:\n\n" +
 		"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0}\n\n" +
 		"event: response.reasoning.delta\ndata: {\"type\":\"response.reasoning.delta\",\"sequence_number\":1,\"delta\":\"think\"}\n\n" +
 		"event: response.apply_patch_call_operation_diff.delta\ndata: {\"type\":\"response.apply_patch_call_operation_diff.delta\",\"delta\":\"diff\"}\n\n" +

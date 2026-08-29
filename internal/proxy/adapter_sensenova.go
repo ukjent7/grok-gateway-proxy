@@ -44,5 +44,5 @@ func (SenseNovaChatAdapter) TransformResponseBody(body []byte) ([]byte, error) {
 }
 
 func (SenseNovaChatAdapter) TransformSSE(reader io.Reader) io.Reader {
-	return newSSELineTransformer(reader, transformSenseNovaSSELine, nil, nil, nil)
+	return newSSELineTransformer(reader, transformSenseNovaSSELine, nil, nil)
 }

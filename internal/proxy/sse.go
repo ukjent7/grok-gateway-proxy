@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
-	"strings"
 )
 
 // sse.go contains the line-level SSE pass-through reader used by the gateway
@@ -14,12 +13,11 @@ import (
 // optional ping-keepalive filter.
 
 // sseLineTransformer buffers the upstream stream line by line, applies an
-// optional per-line transform, and drops keepalive ping events announced
-// either by an `event: ping` line (isPingEvent) or by their `data:` payload
-// (isPingPayload), plus any event whose `data:` payload matches dropPayload
-// (e.g. event types outside the client's vocabulary). When an event is
-// dropped, the blank line terminating it is consumed as well so the stream
-// stays byte-identical apart from the removed event.
+// optional per-line transform, and drops events by their `data:` payload:
+// keepalive pings (isPingPayload) and anything matching dropPayload (e.g.
+// event types outside the client's vocabulary). When an event is dropped,
+// the blank line terminating it is consumed as well so the stream stays
+// byte-identical apart from the removed event.
 type sseLineTransformer struct {
 	reader        *bufio.Reader
 	pending       bytes.Buffer
@@ -28,16 +26,14 @@ type sseLineTransformer struct {
 	done          bool
 	err           error
 	transformLine func([]byte) []byte
-	isPingEvent   func(trimmed []byte) bool
 	isPingPayload func(payload []byte) bool
 	dropPayload   func(payload []byte) bool
 }
 
-func newSSELineTransformer(reader io.Reader, transformLine func([]byte) []byte, isPingEvent, isPingPayload, dropPayload func([]byte) bool) *sseLineTransformer {
+func newSSELineTransformer(reader io.Reader, transformLine func([]byte) []byte, isPingPayload, dropPayload func([]byte) bool) *sseLineTransformer {
 	return &sseLineTransformer{
 		reader:        bufio.NewReaderSize(reader, 64*1024),
 		transformLine: transformLine,
-		isPingEvent:   isPingEvent,
 		isPingPayload: isPingPayload,
 		dropPayload:   dropPayload,
 	}
@@ -68,12 +64,7 @@ func (r *sseLineTransformer) Read(p []byte) (int, error) {
 		switch {
 		case bytes.HasPrefix(trimmed, []byte("event:")):
 			r.flushEventLine()
-			if r.isPingEvent != nil && r.isPingEvent(trimmed) {
-				r.eventLine = nil
-				r.skipBlank = true
-			} else {
-				r.eventLine = append(r.eventLine[:0], r.applyLine(line)...)
-			}
+			r.eventLine = append(r.eventLine[:0], r.applyLine(line)...)
 		case bytes.HasPrefix(trimmed, []byte("data:")):
 			payload := bytes.TrimSpace(trimmed[len("data:"):])
 			if (r.isPingPayload != nil && r.isPingPayload(payload)) || (r.dropPayload != nil && r.dropPayload(payload)) {
@@ -109,12 +100,6 @@ func (r *sseLineTransformer) flushEventLine() {
 		r.pending.Write(r.eventLine)
 		r.eventLine = nil
 	}
-}
-
-// isEventPingLine reports whether an `event:` line announces a ping
-// keepalive that should be dropped.
-func isEventPingLine(trimmed []byte) bool {
-	return strings.TrimSpace(string(trimmed[len("event:"):])) == "ping"
 }
 
 func transformSenseNovaSSELine(line []byte) []byte {
