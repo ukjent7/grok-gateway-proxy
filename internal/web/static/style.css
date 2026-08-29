@@ -54,9 +54,9 @@
   --rose-glow: rgba(244, 63, 94, 0.25);
 
   /* Gateway Specific Brand Colors */
-  --gw-oc: #06b6d4;
+  --gw-ds: #06b6d4;
   --gw-st: #3b82f6;
-  --gw-ve: #a855f7;
+  --gw-std: #a855f7;
 
   /* Typography */
   --font-display: 'Space Grotesk', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
@@ -1783,16 +1783,10 @@ kbd {
   transform: translateX(18px);
 }
 
-.f-ua-wrap.is-collapsed, .f-fx-ua-wrap.is-collapsed {
+.f-ua-wrap.is-collapsed {
   display: none;
 }
 
-.gw-special-panel {
-  padding: 12px 14px;
-  border-radius: var(--r-m);
-  background: var(--violet-bg);
-  border: 1px solid rgba(139, 92, 246, 0.25);
-}
 
 .preset-pills {
   display: flex;
@@ -2671,9 +2665,9 @@ kbd {
   flex-shrink: 0;
 }
 
-.gw-dot-oc { background: var(--gw-oc); box-shadow: 0 0 6px rgba(6,182,212,0.4); }
+.gw-dot-ds { background: var(--gw-ds); box-shadow: 0 0 6px rgba(6,182,212,0.4); }
 .gw-dot-st { background: var(--gw-st); box-shadow: 0 0 6px rgba(59,130,246,0.4); }
-.gw-dot-ve { background: var(--gw-ve); box-shadow: 0 0 6px rgba(168,85,247,0.4); }
+.gw-dot-std { background: var(--gw-std); box-shadow: 0 0 6px rgba(168,85,247,0.4); }
 
 .gw-badge {
   display: inline-flex;
@@ -2698,9 +2692,9 @@ kbd {
   color: var(--text-muted);
 }
 
-.gw-badge-oc { background: rgba(6,182,212,0.12); color: var(--gw-oc); }
+.gw-badge-ds { background: rgba(6,182,212,0.12); color: var(--gw-ds); }
 .gw-badge-st { background: rgba(59,130,246,0.12); color: var(--gw-st); }
-.gw-badge-ve { background: rgba(168,85,247,0.12); color: var(--gw-ve); }
+.gw-badge-std { background: rgba(168,85,247,0.12); color: var(--gw-std); }
 
 .empty-state {
   display: flex;
