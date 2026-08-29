@@ -4,7 +4,7 @@
    Grok Gateway Console · 核心 Diff 比对引擎
    - JSON 结构扁平化与字段路径级 Diff
    - 行内字符级 LCS / 前后缀高亮
-   - 协议转换智能折叠 (V3/FX/SenseNova)
+   - 协议对齐智能折叠 (净化剔除 / SenseNova)
    - 侧边对比 (Split) 与统一对比 (Unified) 渲染
    ============================================================ */
 
@@ -60,11 +60,6 @@ export function hopByHopHeaderNames() {
   ];
 }
 
-export function isExpectedFXChange(row) {
-  const exp = row.explanation || '';
-  return exp.includes('V3') || exp.includes('已转 header') || exp.includes('FX') || exp.includes('prompt 不承载') || exp.includes('已按 V3 重写');
-}
-
 export function explainJSONChange(path, kind, before, after, category) {
   if (category === 'headers') {
     const header = headerNameFromPath(path);
@@ -97,28 +92,18 @@ export function explainJSONChange(path, kind, before, after, category) {
     return '客户端协议兼容：将上游返回的 function_call 转回客户端的标准 function';
   }
 
-  // Vercel FX V3 transformations
-  if (kind === 'deleted' && path.includes('reasoning')) {
-    return '删除 reasoning 历史：V3 prompt 规范不承载历史 reasoning（已保留顶层 reasoning.effort）';
+  // Responses 协议对齐：代理剔除 xAI 私有扩展
+  if (kind === 'deleted' && path === '$.stream_tool_calls') {
+    return '剔除 stream_tool_calls：xAI 私有参数，标准 Responses 协议不含此字段（协议对齐）';
   }
-  if (kind === 'deleted' && (path === '$.store' || path === '$.include' || path.includes('prompt_cache_key'))) {
-    return `字段重写 ${path}：已转为 X-Session-Id 或上游不接收，属预期协议转换`;
+  if (kind === 'deleted' && path.startsWith('$.tools[')) {
+    return `剔除工具条目 ${path}：类型不在标准 Responses 工具词汇表内（协议对齐）`;
   }
-  if (kind === 'deleted' && path.startsWith('$.input[')) {
-    return `字段转换 ${path}：Responses input 已重写为 V3 prompt 格式`;
+  if (kind === 'deleted' && (path === '$.include' || path.startsWith('$.include['))) {
+    return `剔除 include ${path}：上游不支持该扩展（协议对齐）`;
   }
-  if (kind === 'added' && path.startsWith('$.prompt[')) {
-    return `生成字段 ${path}：由 Responses input 转换生成 V3 prompt`;
-  }
-
-  if (path.includes('.tools[') && (path.includes('.parameters') || path.includes('.inputSchema'))) {
-    if (kind === 'deleted' && path.includes('.parameters')) {
-      return `字段重命名 ${path}：V3 将 parameters 转换为 inputSchema`;
-    }
-    if (kind === 'added' && path.includes('.inputSchema')) {
-      return `生成字段 ${path}：由 parameters 重命名为 inputSchema`;
-    }
-    return `tools 结构调整：${path}`;
+  if (kind === 'deleted' && (path.endsWith('.summary') || path.endsWith('.encrypted_content')) && path.includes('.input[')) {
+    return `剔除 ${path}：DeepSeek 不支持 reasoning summary/encrypted_content，明文 content 保留回传（协议对齐）`;
   }
 
   if (kind === 'added') return `新增字段 ${path}`;
@@ -143,7 +128,7 @@ export function buildJSONDiff(before, after, category) {
         path,
         after: afterVal,
         explanation,
-        expected: explanation.includes('V3') || explanation.includes('FX') || explanation.includes('已转')
+        expected: explanation.includes('协议对齐')
       });
     } else if (!hasAfter) {
       const beforeVal = formatDiffValue(beforeMap.get(path));
@@ -153,7 +138,7 @@ export function buildJSONDiff(before, after, category) {
         path,
         before: beforeVal,
         explanation,
-        expected: explanation.includes('V3') || explanation.includes('FX') || explanation.includes('已转') || explanation.includes('prompt 不承载')
+        expected: explanation.includes('协议对齐')
       });
     } else if (JSON.stringify(beforeMap.get(path)) !== JSON.stringify(afterMap.get(path))) {
       const beforeValue = formatDiffValue(beforeMap.get(path));
@@ -170,45 +155,7 @@ export function buildJSONDiff(before, after, category) {
     }
   });
 
-  return mergeRenameRows(rows);
-}
-
-function mergeRenameRows(rows) {
-  const delMap = new Map();
-  const addMap = new Map();
-  rows.forEach(r => {
-    if (r.kind === 'deleted' && r.path.includes('.parameters')) delMap.set(r.path, r);
-    if (r.kind === 'added' && r.path.includes('.inputSchema')) addMap.set(r.path, r);
-  });
-
-  if (!delMap.size || !addMap.size) return rows;
-
-  const toRemove = new Set();
-  const merged = [];
-
-  for (const [delPath, delRow] of delMap) {
-    const addPath = delPath.replace('.parameters', '.inputSchema');
-    const addRow = addMap.get(addPath);
-    if (!addRow) continue;
-
-    const sameValue = delRow.before === addRow.after;
-    merged.push({
-      kind: sameValue ? 'moved' : 'modified',
-      path: `${delPath} → ${addPath}`,
-      before: delRow.before,
-      after: addRow.after,
-      explanation: sameValue
-        ? `V3 重命名：parameters → inputSchema（值保持一致，属预期转换）`
-        : `V3 重命名并修改：parameters → inputSchema`,
-      expected: true
-    });
-    toRemove.add(delPath);
-    toRemove.add(addPath);
-  }
-
-  if (!merged.length) return rows;
-  const filtered = rows.filter(r => !toRemove.has(r.path));
-  return [...filtered, ...merged].sort((a, b) => a.path.localeCompare(b.path));
+  return rows;
 }
 
 export function buildValueDiff(path, before, after) {
@@ -463,7 +410,7 @@ export function renderDiffSection(diff, title, subtitle) {
         ${renderDiffRows(unexpected)}
         ${expected.length ? `
           <details class="diff-expected-details">
-            <summary>展开 ${expected.length} 条预期协议改写 (FX/V3)</summary>
+            <summary>展开 ${expected.length} 条预期协议对齐剔除</summary>
             <div class="diff-rows">${renderDiffRows(expected)}</div>
           </details>
         ` : ''}

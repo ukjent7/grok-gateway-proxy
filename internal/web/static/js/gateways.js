@@ -173,25 +173,6 @@ export function renderGatewayCards() {
           <input type="text" class="f-ua input-modern" value="${escapeAttr(gw.user_agent_override || '')}" placeholder="grok-gateway-proxy/dev">
         </div>
 
-        ${gw.id === 've' ? `
-          <div class="gw-special-panel">
-            <div class="toggle-row">
-              <div class="toggle-info">
-                <span class="switch-label font-bold" style="color:var(--violet)">FX 免费池协议伪装 (Vercel)</span>
-                <span class="field-hint">自动把 Responses 协议转为官方 fx 客户端 v3 协议发往 /v3/ai/language-model，重写 Referer/X-Title 并注入环境指纹</span>
-              </div>
-              <label class="toggle">
-                <input type="checkbox" class="f-fx" ${gw.fx_disguise_enabled ? 'checked' : ''}>
-                <span class="toggle-track"></span>
-              </label>
-            </div>
-            <div class="field f-fx-ua-wrap ${gw.fx_disguise_enabled ? '' : 'is-collapsed'}" style="margin-top: 8px;">
-              <label class="field-label">FX 伪装客户端标识</label>
-              <input type="text" class="f-fx-ua input-modern" value="${escapeAttr(gw.fx_disguise_user_agent || 'fx/0.0.3')}" placeholder="fx/0.0.3">
-            </div>
-          </div>
-        ` : ''}
-
         <div class="field">
           <div class="field-label-row">
             <label class="field-label">请求头白名单 (Forward Headers)</label>
@@ -235,9 +216,6 @@ function bindGatewayCardEvents(id, card, initialGw) {
   const uaToggle = card.querySelector('.f-ua-enabled');
   const uaInput = card.querySelector('.f-ua');
   const uaWrap = card.querySelector('.f-ua-wrap');
-  const fxToggle = card.querySelector('.f-fx');
-  const fxUA = card.querySelector('.f-fx-ua');
-  const fxWrap = card.querySelector('.f-fx-ua-wrap');
   const headersTextarea = card.querySelector('.f-headers');
   const dirtyIndicator = card.querySelector('.gw-dirty-indicator');
   const saveBtn = card.querySelector('.save-gw-btn');
@@ -252,8 +230,6 @@ function bindGatewayCardEvents(id, card, initialGw) {
     use_proxy: initialGw.use_proxy !== false,
     user_agent_override_enabled: !!initialGw.user_agent_override_enabled,
     user_agent_override: initialGw.user_agent_override || '',
-    fx_disguise_enabled: !!initialGw.fx_disguise_enabled,
-    fx_disguise_user_agent: initialGw.fx_disguise_user_agent || 'fx/0.0.3',
     forward_headers: (initialGw.forward_headers || []).join('\n')
   };
 
@@ -264,8 +240,6 @@ function bindGatewayCardEvents(id, card, initialGw) {
     const curProxy = proxyToggle ? proxyToggle.checked : true;
     const curUaEnabled = uaToggle ? uaToggle.checked : false;
     const curUa = uaInput ? uaInput.value.trim() : '';
-    const curFxEnabled = fxToggle ? fxToggle.checked : false;
-    const curFxUA = fxUA ? fxUA.value.trim() : 'fx/0.0.3';
     const curHeaders = headersTextarea ? headersTextarea.value.trim() : '';
 
     const isModified =
@@ -275,8 +249,6 @@ function bindGatewayCardEvents(id, card, initialGw) {
       curProxy !== baseline.use_proxy ||
       curUaEnabled !== baseline.user_agent_override_enabled ||
       curUa !== baseline.user_agent_override ||
-      (fxToggle && curFxEnabled !== baseline.fx_disguise_enabled) ||
-      (fxUA && curFxUA !== baseline.fx_disguise_user_agent) ||
       curHeaders !== baseline.forward_headers;
 
     if (dirtyIndicator) {
@@ -292,12 +264,6 @@ function bindGatewayCardEvents(id, card, initialGw) {
   if (uaToggle && uaWrap) {
     uaToggle.addEventListener('change', () => {
       uaWrap.classList.toggle('is-collapsed', !uaToggle.checked);
-    });
-  }
-
-  if (fxToggle && fxWrap) {
-    fxToggle.addEventListener('change', () => {
-      fxWrap.classList.toggle('is-collapsed', !fxToggle.checked);
     });
   }
 
@@ -388,9 +354,6 @@ function bindGatewayCardEvents(id, card, initialGw) {
       use_proxy: proxyToggle.checked,
       forward_headers: headersTextarea.value.split('\n').map(s => s.trim()).filter(Boolean)
     };
-
-    if (fxToggle) payload.fx_disguise_enabled = fxToggle.checked;
-    if (fxUA) payload.fx_disguise_user_agent = fxUA.value.trim();
 
     let ok = true;
     if (!payload.base_url.startsWith('https://')) {

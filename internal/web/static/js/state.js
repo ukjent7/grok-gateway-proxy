@@ -38,7 +38,7 @@ export const state = {
 
 export function gatewayIds() {
   const ids = Object.keys(state.gateways);
-  return ids.length ? ids : ['oc', 'st', 've'];
+  return ids.length ? ids : ['ds', 'st', 'std'];
 }
 
 export async function loadConfig() {
