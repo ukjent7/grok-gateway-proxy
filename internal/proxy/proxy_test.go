@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -193,7 +193,7 @@ func TestProxyRejectsWrongProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{"/oc/chat/completions", "/st/responses", "/ve/chat/completions", "/oc/models"} {
+	for _, path := range []string{"/ds/chat/completions", "/st/responses", "/std/chat/completions", "/ds/models"} {
 		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787"+path, strings.NewReader(string(body)))
 		recorder := httptest.NewRecorder()
 		p.ServeHTTP(recorder, req)
@@ -228,7 +228,7 @@ func TestProxyRoutesBothNativeResponseAdapters(t *testing.T) {
 	}
 	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client()}
 
-	for _, path := range []string{"/oc/responses", "/ve/responses"} {
+	for _, path := range []string{"/ds/responses", "/std/responses"} {
 		body, _ := json.Marshal(map[string]any{"model": "response-model", "input": "hello"})
 		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787"+path, strings.NewReader(string(body)))
 		recorder := httptest.NewRecorder()
@@ -349,12 +349,12 @@ func TestProxyCapsSSEResponseBodyCapture(t *testing.T) {
 	}
 	defer st.Close()
 	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
-	gateway := cfg.Gateways["ve"]
+	gateway := cfg.Gateways["std"]
 	gateway.BaseURL = upstream.URL
-	cfg.Gateways["ve"] = gateway
+	cfg.Gateways["std"] = gateway
 	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client(), ResponseBodySize: capSize}
 
-	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/ve/responses", strings.NewReader(`{"model":"m","stream":true,"input":"hi"}`))
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/std/responses", strings.NewReader(`{"model":"m","stream":true,"input":"hi"}`))
 	recorder := httptest.NewRecorder()
 	p.ServeHTTP(recorder, req)
 
@@ -499,12 +499,12 @@ func TestProxyStreamingSurvivesUpstreamTimeout(t *testing.T) {
 	defer st.Close()
 	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
 	cfg.UpstreamTimeout = 300 * time.Millisecond
-	gateway := cfg.Gateways["ve"]
+	gateway := cfg.Gateways["std"]
 	gateway.BaseURL = upstream.URL
-	cfg.Gateways["ve"] = gateway
+	cfg.Gateways["std"] = gateway
 	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client()}
 
-	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/ve/responses",
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/std/responses",
 		strings.NewReader(`{"model":"m","stream":true,"input":"hi"}`))
 	recorder := httptest.NewRecorder()
 	p.ServeHTTP(recorder, req)
@@ -526,7 +526,10 @@ func TestProxyStreamingSurvivesUpstreamTimeout(t *testing.T) {
 	}
 }
 
-func TestProxyAppliesMuseProfileOnlyForMuseModel(t *testing.T) {
+// Responses requests must reach the upstream conforming to the standard
+// protocol: xAI-only extensions are stripped while the rest of the body is
+// preserved, and the log keeps both sides for comparison.
+func TestProxySanitizesResponsesRequestToUpstream(t *testing.T) {
 	var upstreamBody map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&upstreamBody); err != nil {
@@ -534,7 +537,7 @@ func TestProxyAppliesMuseProfileOnlyForMuseModel(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"muse-response","output":[]}`))
+		_, _ = w.Write([]byte(`{"id":"sanitized-response","created_at":1,"object":"response","status":"completed","model":"m","output":[]}`))
 	}))
 	defer upstream.Close()
 
@@ -544,23 +547,27 @@ func TestProxyAppliesMuseProfileOnlyForMuseModel(t *testing.T) {
 	}
 	defer st.Close()
 	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
-	gateway := cfg.Gateways["oc"]
+	gateway := cfg.Gateways["std"]
 	gateway.BaseURL = upstream.URL
-	cfg.Gateways["oc"] = gateway
+	cfg.Gateways["std"] = gateway
 	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client()}
 
-	requestBody := []byte(`{"model":"muse-spark-1.2-contributor","stream":true,"stream_tool_calls":true,"input":[]}`)
-	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/oc/responses", strings.NewReader(string(requestBody)))
+	requestBody := []byte(`{"model":"deepseek-v4-flash","stream":true,"stream_tool_calls":true,"tools":[{"type":"x_search"},{"type":"function","name":"lookup","parameters":{}}],"input":[]}`)
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/std/responses", strings.NewReader(string(requestBody)))
 	recorder := httptest.NewRecorder()
 	p.ServeHTTP(recorder, req)
 
-	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "muse-response") {
-		t.Fatalf("unexpected Muse response: %d %s", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "sanitized-response") {
+		t.Fatalf("unexpected response: %d %s", recorder.Code, recorder.Body.String())
 	}
 	if _, exists := upstreamBody["stream_tool_calls"]; exists {
-		t.Fatalf("unsupported Muse parameter reached upstream: %+v", upstreamBody)
+		t.Fatalf("non-standard stream_tool_calls reached upstream: %+v", upstreamBody)
 	}
-	if upstreamBody["model"] != "muse-spark-1.2-contributor" {
+	tools, _ := upstreamBody["tools"].([]any)
+	if len(tools) != 1 || tools[0].(map[string]any)["type"] != "function" {
+		t.Fatalf("non-standard x_search tool reached upstream: %+v", upstreamBody)
+	}
+	if upstreamBody["model"] != "deepseek-v4-flash" {
 		t.Fatalf("upstream model changed unexpectedly: %+v", upstreamBody)
 	}
 
@@ -573,7 +580,7 @@ func TestProxyAppliesMuseProfileOnlyForMuseModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(detail.RequestBody), `"stream_tool_calls":true`) || strings.Contains(string(detail.UpstreamBody), `"stream_tool_calls"`) {
-		t.Fatalf("request comparison did not preserve the Muse rewrite: request=%s upstream=%s", detail.RequestBody, detail.UpstreamBody)
+		t.Fatalf("request comparison did not preserve the sanitization: request=%s upstream=%s", detail.RequestBody, detail.UpstreamBody)
 	}
 }
 
@@ -591,13 +598,13 @@ func TestProxyBlocksGrokModelsWithoutCallingUpstream(t *testing.T) {
 	}
 	defer st.Close()
 	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
-	gateway := cfg.Gateways["oc"]
+	gateway := cfg.Gateways["std"]
 	gateway.BaseURL = upstream.URL
-	cfg.Gateways["oc"] = gateway
+	cfg.Gateways["std"] = gateway
 	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client()}
 
 	requestBody := []byte(`{"model":"grok-4.6","stream":true,"input":"title this"}`)
-	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/oc/responses", strings.NewReader(string(requestBody)))
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/std/responses", strings.NewReader(string(requestBody)))
 	recorder := httptest.NewRecorder()
 	p.ServeHTTP(recorder, req)
 
@@ -610,6 +617,11 @@ func TestProxyBlocksGrokModelsWithoutCallingUpstream(t *testing.T) {
 	if !strings.Contains(recorder.Body.String(), "response.completed") || !strings.Contains(recorder.Body.String(), "data: [DONE]") {
 		t.Fatalf("synthetic Responses stream was incomplete: %s", recorder.Body.String())
 	}
+	// The synthetic response object must deserialize under the strict client
+	// schema: created_at is a required field.
+	if !strings.Contains(recorder.Body.String(), `"created_at":`) {
+		t.Fatalf("synthetic Responses stream is missing created_at: %s", recorder.Body.String())
+	}
 	logs, err := st.List(context.Background(), store.LogFilter{Limit: 1})
 	if err != nil || len(logs) != 1 {
 		t.Fatalf("expected one blocked request log, got %d, err=%v", len(logs), err)
@@ -619,64 +631,22 @@ func TestProxyBlocksGrokModelsWithoutCallingUpstream(t *testing.T) {
 	}
 }
 
-func TestFxSessionIDFromPromptCacheKey(t *testing.T) {
-	body := []byte(`{"model":"zai/glm-5.2","prompt_cache_key":"01a01ba6-5d84-7403-bbc6-c52a282efc6f","input":"hi"}`)
-	req := httptest.NewRequest(http.MethodPost, "/ve/responses", bytes.NewReader(body))
-	if sid := fxSessionID(req, body); sid != "01a01ba6-5d84-7403-bbc6-c52a282efc6f" {
-		t.Fatalf("expected prompt_cache_key as session id, got %q", sid)
-	}
-}
-
-func TestFxSessionIDFromSessionHeader(t *testing.T) {
-	body := []byte(`{"model":"zai/glm-5.2","input":"hi"}`)
-	req := httptest.NewRequest(http.MethodPost, "/ve/responses", bytes.NewReader(body))
-	req.Header.Set("X-Session-Id", "session-123")
-	if sid := fxSessionID(req, body); sid != "session-123" {
-		t.Fatalf("expected session header, got %q", sid)
-	}
-}
-
-func TestFxSessionIDIgnoresGrokHeaders(t *testing.T) {
-	body := []byte(`{"model":"zai/glm-5.2","input":"hi"}`)
-	req := httptest.NewRequest(http.MethodPost, "/ve/responses", bytes.NewReader(body))
-	req.Header.Set("X-Grok-Session-Id", "grok-session-123")
-	req.Header.Set("X-Grok-Conv-Id", "conv-456")
-	sid := fxSessionID(req, body)
-	if sid == "grok-session-123" || sid == "conv-456" {
-		t.Fatalf("fx session id must not leak grok headers, got %q", sid)
-	}
-	if !strings.HasPrefix(sid, "pi-") {
-		t.Fatalf("expected random pi- fallback when no cache key or session header, got %q", sid)
-	}
-}
-
-func TestFxSessionIDFallbackRandom(t *testing.T) {
-	body := []byte(`{"model":"zai/glm-5.2","input":"hi"}`)
-	req := httptest.NewRequest(http.MethodPost, "/ve/responses", bytes.NewReader(body))
-	sid := fxSessionID(req, body)
-	if !strings.HasPrefix(sid, "pi-") {
-		t.Fatalf("expected random pi- fallback, got %q", sid)
-	}
-}
-
-func TestFxSessionIDStableAcrossRequests(t *testing.T) {
-	body := []byte(`{"model":"zai/glm-5.2","prompt_cache_key":"stable-key","input":"hi"}`)
-	req1 := httptest.NewRequest(http.MethodPost, "/ve/responses", bytes.NewReader(body))
-	req2 := httptest.NewRequest(http.MethodPost, "/ve/responses", bytes.NewReader(body))
-	if fxSessionID(req1, body) != fxSessionID(req2, body) {
-		t.Fatal("session id must be stable across requests with same prompt_cache_key")
-	}
-}
-
-func TestFXModeStableSessionIDEndToEnd(t *testing.T) {
-	var gotSessionIDs []string
+// End-to-end check with the exact request shape Grok Build sends and the
+// event stream its strict parser accepts: xAI-only request extensions are
+// stripped before the upstream sees them, and ping / unknown event types are
+// dropped from the reply instead of failing the whole client stream.
+func TestProxyGrokBuildResponsesEndToEnd(t *testing.T) {
+	var upstreamBody map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotSessionIDs = append(gotSessionIDs, r.Header.Get("X-Session-Id"))
+		_ = json.NewDecoder(r.Body).Decode(&upstreamBody)
 		w.Header().Set("Content-Type", "text/event-stream")
-		// Minimal v3 SSE: a finish event with empty output.
-		finish := `data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"},"usage":{"inputTokens":{"total":10,"noCache":10,"cacheRead":0},"outputTokens":{"total":5,"text":5,"reasoning":0}}}` + "\n\n"
-		_, _ = io.WriteString(w, finish)
-		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1,\"status\":\"in_progress\",\"model\":\"m\",\"output\":[]}}\n\n")
+		_, _ = fmt.Fprint(w, "data: ping\n\n")
+		_, _ = fmt.Fprint(w, "event: response.reasoning_text.delta\ndata: {\"type\":\"response.reasoning_text.delta\",\"sequence_number\":1,\"item_id\":\"rs_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"thinking\"}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"msg_1\",\"output_index\":1,\"content_index\":0,\"delta\":\"hello\"}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.apply_patch_call_operation_diff.delta\ndata: {\"type\":\"response.apply_patch_call_operation_diff.delta\",\"sequence_number\":3,\"delta\":\"x\"}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":4,\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1,\"status\":\"completed\",\"model\":\"m\",\"output\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens_details\":{\"reasoning_tokens\":0}}}}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
 	defer upstream.Close()
 
@@ -686,28 +656,140 @@ func TestFXModeStableSessionIDEndToEnd(t *testing.T) {
 	}
 	defer st.Close()
 	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
-	gateway := cfg.Gateways["ve"]
+	gateway := cfg.Gateways["std"]
 	gateway.BaseURL = upstream.URL
-	gateway.FXDisguiseEnabled = true
-	cfg.Gateways["ve"] = gateway
+	cfg.Gateways["std"] = gateway
 	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client()}
 
-	requestBody := []byte(`{"model":"zai/glm-5.2","prompt_cache_key":"conv-abc","stream":true,"input":"hi"}`)
-	for i := 0; i < 3; i++ {
-		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/ve/responses", bytes.NewReader(requestBody))
-		recorder := httptest.NewRecorder()
-		p.ServeHTTP(recorder, req)
-		if recorder.Code != http.StatusOK {
-			t.Fatalf("request %d failed: %d %s", i, recorder.Code, recorder.Body.String())
-		}
+	// The xAI-flavored body: backend-only option, raw hosted tools, xAI-only
+	// include, reasoning history with reasoning_text content parts.
+	requestBody := `{"model":"some-model","stream":true,"stream_tool_calls":true,"store":false,` +
+		`"include":["reasoning.encrypted_content","no_inline_citations"],` +
+		`"tools":[{"type":"x_search","from_date":"2026-01-01"},{"type":"web_search","filters":{"excluded_domains":["a.example"]}},` +
+		`{"type":"function","name":"lookup","description":"find","parameters":{"type":"object","properties":{}}}],` +
+		`"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},` +
+		`{"type":"reasoning","id":"rs_1","content":[{"type":"reasoning_text","text":"old"}],"summary":[]}]}`
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/std/responses", strings.NewReader(requestBody))
+	recorder := httptest.NewRecorder()
+	p.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d %s", recorder.Code, recorder.Body.String())
 	}
 
-	if len(gotSessionIDs) != 3 {
-		t.Fatalf("expected 3 upstream calls, got %d", len(gotSessionIDs))
+	// Request direction: standard vocabulary only.
+	if _, exists := upstreamBody["stream_tool_calls"]; exists {
+		t.Fatalf("stream_tool_calls reached upstream: %+v", upstreamBody)
 	}
-	for i, sid := range gotSessionIDs {
-		if sid != "conv-abc" {
-			t.Fatalf("upstream request %d got session id %q, want %q", i, sid, "conv-abc")
+	tools := upstreamBody["tools"].([]any)
+	if len(tools) != 1 || tools[0].(map[string]any)["type"] != "function" {
+		t.Fatalf("non-standard tools reached upstream: %+v", tools)
+	}
+	include := upstreamBody["include"].([]any)
+	if len(include) != 1 || include[0] != "reasoning.encrypted_content" {
+		t.Fatalf("non-standard include values reached upstream: %+v", include)
+	}
+	input := upstreamBody["input"].([]any)
+	reasoning := input[1].(map[string]any)
+	content := reasoning["content"].([]any)
+	if content[0].(map[string]any)["type"] != "reasoning_text" {
+		t.Fatalf("reasoning input item was not preserved: %+v", reasoning)
+	}
+
+	// Response direction: client-parseable events only.
+	client := recorder.Body.String()
+	for _, forbidden := range []string{"ping", "apply_patch"} {
+		if strings.Contains(client, forbidden) {
+			t.Fatalf("client stream contains %q event: %s", forbidden, client)
 		}
+	}
+	for _, required := range []string{"response.created", "response.reasoning_text.delta", "response.output_text.delta", "response.completed", "data: [DONE]"} {
+		if !strings.Contains(client, required) {
+			t.Fatalf("client stream lost %q: %s", required, client)
+		}
+	}
+}
+
+// DeepSeek 网关全链路：grok build 形状的请求清洗为 DeepSeek 接受的标准
+// Responses 请求（include 移除、reasoning 明文 content 保留回传），上游
+// 事件流无 data: [DONE] 时客户端按 EOF 完整收尾。
+func TestProxyDeepSeekResponsesEndToEnd(t *testing.T) {
+	var upstreamBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&upstreamBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1,\"status\":\"in_progress\",\"model\":\"deepseek-v4-flash\",\"output\":[]}}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.reasoning_text.delta\ndata: {\"type\":\"response.reasoning_text.delta\",\"sequence_number\":1,\"item_id\":\"rs_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"thinking\"}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"msg_1\",\"output_index\":1,\"content_index\":0,\"delta\":\"hello\"}\n\n")
+		_, _ = fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1,\"status\":\"completed\",\"model\":\"deepseek-v4-flash\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens_details\":{\"reasoning_tokens\":1}}}}\n\n")
+	}))
+	defer upstream.Close()
+
+	st, err := store.OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
+	gateway := cfg.Gateways["ds"]
+	gateway.BaseURL = upstream.URL
+	cfg.Gateways["ds"] = gateway
+	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client()}
+
+	requestBody := `{"model":"deepseek-v4-flash","stream":true,"stream_tool_calls":true,` +
+		`"include":["reasoning.encrypted_content"],` +
+		`"reasoning":{"effort":"xhigh"},` +
+		`"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],` +
+		`"input":[{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"reasoning_text","text":"prior thoughts"}]},{"type":"message","role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/ds/responses", strings.NewReader(requestBody))
+	recorder := httptest.NewRecorder()
+	p.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if _, exists := upstreamBody["include"]; exists {
+		t.Fatalf("include reached DeepSeek: %+v", upstreamBody)
+	}
+	if upstreamBody["reasoning"].(map[string]any)["effort"] != "xhigh" {
+		t.Fatalf("reasoning.effort was rewritten: %+v", upstreamBody["reasoning"])
+	}
+	input := upstreamBody["input"].([]any)
+	reasoning := input[0].(map[string]any)
+	if _, hasSummary := reasoning["summary"]; hasSummary {
+		t.Fatalf("reasoning summary reached DeepSeek: %+v", reasoning)
+	}
+	content := reasoning["content"].([]any)
+	if content[0].(map[string]any)["text"] != "prior thoughts" {
+		t.Fatalf("reasoning content was lost: %+v", reasoning)
+	}
+
+	client := recorder.Body.String()
+	for _, required := range []string{"response.created", "response.reasoning_text.delta", "response.output_text.delta", "response.completed"} {
+		if !strings.Contains(client, required) {
+			t.Fatalf("client stream lost %q: %s", required, client)
+		}
+	}
+	if strings.Contains(client, "response.failed") || !strings.Contains(client, "response.completed") {
+		t.Fatalf("stream was terminated prematurely: %s", client)
+	}
+}
+
+// Base URL 留空的网关在请求时必须返回明确的 503，而不是模糊的上游错误。
+func TestProxyUnconfiguredBaseURLReturns503(t *testing.T) {
+	st, err := store.OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
+	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default()}
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/ds/responses", strings.NewReader(`{"model":"deepseek-v4-flash","input":"hi"}`))
+	recorder := httptest.NewRecorder()
+	p.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), "base URL") {
+		t.Fatalf("expected 503 with a clear message, got %d: %s", recorder.Code, recorder.Body.String())
 	}
 }

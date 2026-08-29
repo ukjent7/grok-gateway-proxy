@@ -165,7 +165,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := p.forwardUpstreamResponse(w, &logEntry, adapter, gateway, p.ClientFor(gateway), upstreamRequest, logEntry.Stream, bodyLimit); err != nil {
+	if err := p.forwardUpstreamResponse(w, &logEntry, adapter, gateway, p.ClientFor(gateway), upstreamRequest, bodyLimit); err != nil {
 		logEntry.Error = err.Error()
 		// If nothing was written to the client yet (a transport-level failure
 		// before any upstream headers arrived), surface a gateway error instead
@@ -210,11 +210,14 @@ func (p *Proxy) resolveGateway(r *http.Request, body []byte) (config.GatewayConf
 // buildUpstreamRequest assembles the upstream HTTP request: URL, headers,
 // body transformation, and records them in the log entry.
 func (p *Proxy) buildUpstreamRequest(ctx context.Context, r *http.Request, gateway config.GatewayConfig, subpath string, adapter GatewayAdapter, requestBody []byte, logEntry *store.RequestLog) (*http.Request, error) {
-	upstreamURL, err := gatewayUpstreamURL(adapter, gateway, subpath, r.URL.RawQuery)
+	if strings.TrimSpace(gateway.BaseURL) == "" {
+		return nil, &statusError{status: http.StatusServiceUnavailable, message: fmt.Sprintf("gateway %q has no base URL configured; set it in the console", gateway.ID)}
+	}
+	upstreamURL, err := joinUpstreamURL(gateway.BaseURL, subpath, r.URL.RawQuery)
 	if err != nil {
 		return nil, &statusError{status: http.StatusBadGateway, message: err.Error()}
 	}
-	upstreamBody, err := gatewayTransformRequest(adapter, gateway, logEntry.Model, requestBody)
+	upstreamBody, err := transformRequestBody(adapter, requestBody)
 	if err != nil {
 		return nil, &statusError{status: http.StatusBadRequest, message: err.Error()}
 	}
@@ -239,9 +242,6 @@ func (p *Proxy) buildUpstreamRequest(ctx context.Context, r *http.Request, gatew
 	upstreamRequest.Header.Del("Content-Length")
 	if gateway.UserAgentOverrideEnabled {
 		upstreamRequest.Header.Set("User-Agent", gateway.UserAgentOverride)
-	}
-	for name, value := range gatewayExtraHeaders(adapter, gateway, r, requestBody, logEntry.Model) {
-		upstreamRequest.Header.Set(name, value)
 	}
 	logEntry.UpstreamHeaders = headersJSON(upstreamRequest.Header)
 	return upstreamRequest, nil
@@ -280,7 +280,7 @@ func (p *Proxy) ClientFor(gateway config.GatewayConfig) *http.Client {
 
 // forwardUpstreamResponse performs the upstream HTTP call and writes the
 // response back to the client, filling in the response-side audit fields.
-func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.RequestLog, adapter GatewayAdapter, gateway config.GatewayConfig, client *http.Client, upstreamRequest *http.Request, stream bool, bodyLimit int64) error {
+func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.RequestLog, adapter GatewayAdapter, gateway config.GatewayConfig, client *http.Client, upstreamRequest *http.Request, bodyLimit int64) error {
 	upstreamResponse, err := client.Do(upstreamRequest)
 	if err != nil {
 		// Transport-level failure (DNS, connect, timeout) before any upstream
@@ -322,19 +322,16 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 
 	// Success path: stream or buffer based on content-type.
 	copyResponseHeaders(w.Header(), upstreamResponse.Header)
-	if ct := gatewayResponseContentType(adapter, gateway, upstreamResponse.Header, stream); ct != "" {
-		w.Header().Set("Content-Type", ct)
-	}
 	writeResponseStatusAndHeaders(w, upstreamResponse)
 
-	eventStream := gatewayIsEventStream(adapter, gateway, upstreamResponse.Header, stream)
+	eventStream := isEventStream(upstreamResponse.Header)
 	var responseBody []byte
 	var copyErr error
 
 	if eventStream {
 		rawResponse := newCappedBuffer(bodyLimit)
 		responseReader := io.TeeReader(upstreamResponse.Body, rawResponse)
-		responseReader = gatewayTransformSSE(adapter, gateway, logEntry.Model, responseReader)
+		responseReader = transformSSE(adapter, responseReader)
 		responseBody, copyErr = copyAndCapture(w, responseReader, true, bodyLimit)
 		logEntry.UpstreamResponseBody = append([]byte(nil), rawResponse.Bytes()...)
 		logEntry.ResponseTruncated = rawResponse.truncated
@@ -351,7 +348,7 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 		logEntry.ResponseTruncated = rawCapture.truncated
 
 		var transformErr error
-		responseBody, transformErr = gatewayTransformResponse(adapter, gateway, logEntry.Model, rawResponse)
+		responseBody, transformErr = transformResponseBody(adapter, rawResponse)
 		if transformErr != nil {
 			copyErr = transformErr
 			responseBody = rawResponse
@@ -366,7 +363,7 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 	}
 	logEntry.Success = upstreamResponse.StatusCode >= 200 && upstreamResponse.StatusCode < 300
 	if logEntry.Success {
-		logEntry.Usage = gatewayExtractUsage(adapter, gateway, logEntry.UpstreamResponseBody, responseBody)
+		logEntry.Usage = ExtractUsage(responseBody, gateway.Protocol)
 	}
 	if logEntry.StatusCode >= 400 && logEntry.Error == "" {
 		logEntry.Error = fmt.Sprintf("upstream returned HTTP %d", logEntry.StatusCode)
@@ -581,12 +578,16 @@ func isBlockedModel(model string) bool {
 
 func writeBlockedModelResponse(w http.ResponseWriter, model string, stream bool) {
 	responseID := "resp-blocked-" + strings.TrimPrefix(newRequestID(), "req-")
+	// created_at is a required field on the Responses object; strict clients
+	// (Grok Build's async-openai types) fail to deserialize the synthetic
+	// response without it.
 	response := map[string]any{
-		"id":     responseID,
-		"object": "response",
-		"status": "completed",
-		"model":  model,
-		"output": []any{},
+		"id":         responseID,
+		"object":     "response",
+		"created_at": time.Now().Unix(),
+		"status":     "completed",
+		"model":      model,
+		"output":     []any{},
 	}
 
 	if !stream {

@@ -118,8 +118,8 @@ func TestSenseNovaResponseTransformScopedToToolCalls(t *testing.T) {
 	}
 }
 
-func TestVercelFiltersPingEventsFromResponsesStream(t *testing.T) {
-	adapter := VercelResponsesAdapter{}
+func TestStandardFiltersPingEventsFromResponsesStream(t *testing.T) {
+	adapter := StandardResponsesAdapter{}
 	input := "event: ping\ndata: {\"type\":\"ping\"}\n\n" +
 		"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r1\"}}\n\n" +
 		"event: ping\ndata: {\"type\":\"ping\"}\n\n" +
@@ -138,8 +138,8 @@ func TestVercelFiltersPingEventsFromResponsesStream(t *testing.T) {
 	}
 }
 
-func TestVercelRenamesLegacyReasoningEvents(t *testing.T) {
-	adapter := VercelResponsesAdapter{}
+func TestStandardRenamesLegacyReasoningEvents(t *testing.T) {
+	adapter := StandardResponsesAdapter{}
 	input := "event: response.reasoning.delta\ndata: {\"type\":\"response.reasoning.delta\",\"sequence_number\":3,\"item_id\":\"rs_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"thinking\"}\n\n" +
 		"event: response.reasoning.done\ndata: {\"type\":\"response.reasoning.done\",\"sequence_number\":26,\"item_id\":\"rs_1\",\"output_index\":0,\"content_index\":0,\"text\":\"thinking\"}\n\n" +
 		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":30,\"delta\":\"hello\"}\n\n"
@@ -155,8 +155,8 @@ func TestVercelRenamesLegacyReasoningEvents(t *testing.T) {
 	}
 }
 
-func TestVercelRenameDoesNotCorruptQuotedContent(t *testing.T) {
-	adapter := VercelResponsesAdapter{}
+func TestStandardRenameDoesNotCorruptQuotedContent(t *testing.T) {
+	adapter := StandardResponsesAdapter{}
 	// The old event name quoted inside delta text must survive untouched.
 	input := "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"the event is response.reasoning.delta\"}\n\n"
 	reader := adapter.TransformSSE(strings.NewReader(input))
@@ -169,8 +169,29 @@ func TestVercelRenameDoesNotCorruptQuotedContent(t *testing.T) {
 	}
 }
 
-func TestVercelPassesResponsesStreamThroughUnchanged(t *testing.T) {
-	adapter := VercelResponsesAdapter{}
+// Event types outside the client's vocabulary are dropped; the legacy
+// reasoning names count as known because they are renamed downstream.
+func TestStandardFiltersUnknownEventTypes(t *testing.T) {
+	adapter := StandardResponsesAdapter{}
+	input := "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0}\n\n" +
+		"event: response.apply_patch_call_operation_diff.delta\ndata: {\"type\":\"response.apply_patch_call_operation_diff.delta\",\"delta\":\"diff\"}\n\n" +
+		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n" +
+		"data: [DONE]\n\n"
+	want := "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0}\n\n" +
+		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n" +
+		"data: [DONE]\n\n"
+	reader := adapter.TransformSSE(strings.NewReader(input))
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != want {
+		t.Fatalf("unknown event type was not filtered:\nwant: %q\ngot:  %q", want, body)
+	}
+}
+
+func TestStandardPassesResponsesStreamThroughUnchanged(t *testing.T) {
+	adapter := StandardResponsesAdapter{}
 	input := "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r1\",\"status\":\"in_progress\"}}\n\n" +
 		"event: response.reasoning_text.delta\ndata: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"think\"}\n\n" +
 		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n" +
@@ -191,8 +212,8 @@ func TestVercelPassesResponsesStreamThroughUnchanged(t *testing.T) {
 // name appearing as the value of a different key (e.g. "delta" text) where it
 // must survive untouched. Only "type" properties whose value is the legacy
 // event name are renamed; other string values are left intact.
-func TestVercelRenameHandlesSpacedAndNestedSerialization(t *testing.T) {
-	adapter := VercelResponsesAdapter{}
+func TestStandardRenameHandlesSpacedAndNestedSerialization(t *testing.T) {
+	adapter := StandardResponsesAdapter{}
 	// Extra spaces around the colon; the legacy name also appears as a "delta"
 	// string value, which must NOT be rewritten (it is payload text, not an
 	// event name).
@@ -260,68 +281,79 @@ func TestSenseNovaStreamingToolCallContinuationKeepsIdentity(t *testing.T) {
 	}
 }
 
-func TestOpenCodeAppliesMuseRulesOnlyForMuseModels(t *testing.T) {
-	adapter := OpenCodeResponsesAdapter{}
-	body := []byte(`{"model":"muse-spark-1.2-contributor","stream":true,"stream_tool_calls":true,"input":[]}`)
-	for _, model := range []string{"muse-spark-1.2", "muse-spark-1.2-contributor", "MUSE-SPARK-2.0"} {
-		upstreamBody, err := adapter.TransformModelRequest(model, body)
+// Every Responses request sent upstream must conform to the standard
+// protocol: xAI-only extensions are stripped regardless of model, while
+// everything else survives untouched.
+func TestStandardSanitizesResponsesRequestsForAllModels(t *testing.T) {
+	adapter := StandardResponsesAdapter{}
+	body := []byte(`{"model":"deepseek-v4-flash","stream":true,"stream_tool_calls":true,"tools":[{"type":"x_search"},{"type":"web_search","filters":{"excluded_domains":["evil.example"]}},{"type":"web_search","filters":{"allowed_domains":["docs.example"]}},{"type":"function","name":"lookup","parameters":{}}],"include":["reasoning.encrypted_content","no_inline_citations"],"input":[]}`)
+	for _, model := range []string{"deepseek-chat", "deepseek-v4-flash"} {
+		upstreamBody, err := adapter.TransformRequestBody(body)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if strings.Contains(string(upstreamBody), `"stream_tool_calls"`) {
-			t.Fatalf("unsupported Muse parameter survived for %q: %s", model, upstreamBody)
+		var payload map[string]any
+		if err := json.Unmarshal(upstreamBody, &payload); err != nil {
+			t.Fatal(err)
 		}
-		if !strings.Contains(string(upstreamBody), `"model":"muse-spark-1.2-contributor"`) {
-			t.Fatalf("Muse request was changed unexpectedly: %s", upstreamBody)
+		if _, exists := payload["stream_tool_calls"]; exists {
+			t.Fatalf("non-standard stream_tool_calls survived for %q: %s", model, upstreamBody)
 		}
-	}
-
-	// Non-Muse models must pass through byte-for-byte.
-	plain := []byte(`{"model":"deepseek-chat","stream":true,"stream_tool_calls":true,"input":[]}`)
-	out, err := adapter.TransformModelRequest("deepseek-chat", plain)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(out) != string(plain) {
-		t.Fatalf("non-Muse request was rewritten: %s", out)
+		tools := payload["tools"].([]any)
+		if len(tools) != 2 {
+			t.Fatalf("x_search and excluded-domains web_search were not dropped for %q: %s", model, upstreamBody)
+		}
+		if tools[0].(map[string]any)["type"] != "web_search" || tools[1].(map[string]any)["type"] != "function" {
+			t.Fatalf("standard tools were not preserved for %q: %s", model, upstreamBody)
+		}
+		include := payload["include"].([]any)
+		if len(include) != 1 || include[0] != "reasoning.encrypted_content" {
+			t.Fatalf("non-standard include value survived for %q: %s", model, upstreamBody)
+		}
+		if payload["model"] != "deepseek-v4-flash" {
+			t.Fatalf("request fields were changed unexpectedly for %q: %s", model, upstreamBody)
+		}
 	}
 }
 
-func TestOpenCodeLeavesRequestsWithoutUnsupportedParameterUnchanged(t *testing.T) {
-	adapter := OpenCodeResponsesAdapter{}
-	body := []byte(`{"model":"muse-spark-1.2","stream":true,"input":[]}`)
-	transformed, err := adapter.TransformModelRequest("muse-spark-1.2", body)
+// A request that already conforms to the standard protocol must pass through
+// byte-for-byte.
+func TestStandardLeavesConformantRequestsUnchanged(t *testing.T) {
+	adapter := StandardResponsesAdapter{}
+	body := []byte(`{"model":"deepseek-v4-flash","stream":true,"input":[]}`)
+	transformed, err := adapter.TransformRequestBody(body)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(transformed) != string(body) {
-		t.Fatalf("request without stream_tool_calls was rewritten: %s", transformed)
+		t.Fatalf("conformant request was rewritten: %s", transformed)
 	}
 }
 
-func TestOpenCodeFiltersPingEventsForMuseModels(t *testing.T) {
-	adapter := OpenCodeResponsesAdapter{}
+// Pings and event types outside the client's vocabulary are dropped, legacy
+// reasoning event names are renamed to the standard reasoning_text variants,
+// and known events (and the [DONE] sentinel) are preserved — identically for
+// every model.
+func TestStandardFiltersPingsAndUnknownEvents(t *testing.T) {
+	adapter := StandardResponsesAdapter{}
 	input := "event: ping\ndata: {\"type\":\"ping\",\"cost\":\"0\"}\n\n" +
 		"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0}\n\n" +
-		"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":1}\n\n" +
+		"event: response.reasoning.delta\ndata: {\"type\":\"response.reasoning.delta\",\"sequence_number\":1,\"delta\":\"think\"}\n\n" +
+		"event: response.apply_patch_call_operation_diff.delta\ndata: {\"type\":\"response.apply_patch_call_operation_diff.delta\",\"delta\":\"diff\"}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":2}\n\n" +
 		"data: [DONE]\n\n"
-	reader := adapter.TransformModelSSE("muse-spark-1.2", strings.NewReader(input))
-	body, err := io.ReadAll(reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result := string(body)
-	if strings.Contains(result, "ping") {
-		t.Fatalf("Muse ping event was not filtered: %q", result)
-	}
-	if !strings.Contains(result, "response.created") || !strings.Contains(result, "response.completed") || !strings.Contains(result, "data: [DONE]") {
-		t.Fatalf("non-ping Responses events were lost: %q", result)
-	}
-
-	// Non-Muse models must not have ping events filtered.
-	pingReader := adapter.TransformModelSSE("deepseek-chat", strings.NewReader("event: ping\ndata: {\"type\":\"ping\"}\n\n"))
-	pingOut, _ := io.ReadAll(pingReader)
-	if !strings.Contains(string(pingOut), "ping") {
-		t.Fatalf("ping was filtered for a non-Muse model: %q", pingOut)
+	want := "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0}\n\n" +
+		"event: response.reasoning_text.delta\ndata: {\"type\":\"response.reasoning_text.delta\",\"sequence_number\":1,\"delta\":\"think\"}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":2}\n\n" +
+		"data: [DONE]\n\n"
+	for _, model := range []string{"deepseek-chat", "deepseek-v4-flash"} {
+		reader := adapter.TransformSSE(strings.NewReader(input))
+		body, err := io.ReadAll(reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(body) != want {
+			t.Fatalf("stream was not aligned for %q:\nwant: %q\ngot:  %q", model, want, body)
+		}
 	}
 }

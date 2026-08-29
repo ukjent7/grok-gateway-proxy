@@ -16,9 +16,10 @@ import (
 // sseLineTransformer buffers the upstream stream line by line, applies an
 // optional per-line transform, and drops keepalive ping events announced
 // either by an `event: ping` line (isPingEvent) or by their `data:` payload
-// (isPingPayload). When a ping is dropped, the blank line terminating the
-// event is consumed as well so the stream stays byte-identical apart from the
-// removed event.
+// (isPingPayload), plus any event whose `data:` payload matches dropPayload
+// (e.g. event types outside the client's vocabulary). When an event is
+// dropped, the blank line terminating it is consumed as well so the stream
+// stays byte-identical apart from the removed event.
 type sseLineTransformer struct {
 	reader        *bufio.Reader
 	pending       bytes.Buffer
@@ -29,27 +30,17 @@ type sseLineTransformer struct {
 	transformLine func([]byte) []byte
 	isPingEvent   func(trimmed []byte) bool
 	isPingPayload func(payload []byte) bool
+	dropPayload   func(payload []byte) bool
 }
 
-func newSSELineTransformer(reader io.Reader, transformLine func([]byte) []byte, isPingEvent, isPingPayload func([]byte) bool) *sseLineTransformer {
+func newSSELineTransformer(reader io.Reader, transformLine func([]byte) []byte, isPingEvent, isPingPayload, dropPayload func([]byte) bool) *sseLineTransformer {
 	return &sseLineTransformer{
 		reader:        bufio.NewReaderSize(reader, 64*1024),
 		transformLine: transformLine,
 		isPingEvent:   isPingEvent,
 		isPingPayload: isPingPayload,
+		dropPayload:   dropPayload,
 	}
-}
-
-// newMuseSSEReader passes the stream through unchanged except for dropping
-// ping keepalives (`event: ping` lines or `data: ping` payloads).
-func newMuseSSEReader(reader io.Reader) io.Reader {
-	return newSSELineTransformer(reader, nil, isEventPingLine, isVercelPing)
-}
-
-// newVercelSSEReader drops ping keepalives and renames the legacy
-// response.reasoning.* events to the response.reasoning_text.* variants.
-func newVercelSSEReader(reader io.Reader) io.Reader {
-	return newSSELineTransformer(reader, rewriteVercelReasoningEvent, nil, isVercelPing)
 }
 
 func (r *sseLineTransformer) Read(p []byte) (int, error) {
@@ -85,7 +76,7 @@ func (r *sseLineTransformer) Read(p []byte) (int, error) {
 			}
 		case bytes.HasPrefix(trimmed, []byte("data:")):
 			payload := bytes.TrimSpace(trimmed[len("data:"):])
-			if r.isPingPayload != nil && r.isPingPayload(payload) {
+			if (r.isPingPayload != nil && r.isPingPayload(payload)) || (r.dropPayload != nil && r.dropPayload(payload)) {
 				r.eventLine = nil
 				r.skipBlank = true
 				continue
@@ -171,14 +162,14 @@ func transformSenseNovaSSELine(line []byte) []byte {
 	return result
 }
 
-// rewriteVercelReasoningEvent renames the legacy reasoning stream event names
-// to the newer `reasoning_text` variants. `data:` lines are rewritten via
-// structured JSON property replacement so only the "type" field value is
+// rewriteLegacyReasoningEventNames renames the legacy reasoning stream event
+// names to the newer `reasoning_text` variants. `data:` lines are rewritten
+// via structured JSON property replacement so only the "type" field value is
 // touched — event names embedded in other string values (e.g. delta text)
 // survive intact, and the rename is immune to key-order/whitespace variations
 // in the upstream serialization. `event:` lines are plain text and use a
 // targeted match on the event name.
-func rewriteVercelReasoningEvent(line []byte) []byte {
+func rewriteLegacyReasoningEventNames(line []byte) []byte {
 	// `event:` lines are not JSON — match the announced event name directly.
 	if trimmed := bytes.TrimLeft(line, " \t"); bytes.HasPrefix(trimmed, []byte("event:")) {
 		name := bytes.TrimSpace(trimmed[len("event:"):])

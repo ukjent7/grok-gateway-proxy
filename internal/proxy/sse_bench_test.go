@@ -8,15 +8,15 @@ import (
 )
 
 // BenchmarkSSEPassThrough measures the cost of streaming a typical SSE
-// response through the transformer with no per-line transform (Muse mode:
-// only ping filtering).
+// response through the transformer with no per-line transform (Responses
+// event filtering: ping and unknown-type event dropping).
 func BenchmarkSSEPassThrough(b *testing.B) {
 	stream := buildBenchmarkSSEStream(200, false)
 	b.SetBytes(int64(len(stream)))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		r := newMuseSSEReader(bytes.NewReader(stream))
+		r := newResponsesSSEFilter(bytes.NewReader(stream))
 		_, _ = io.Copy(io.Discard, r)
 	}
 }
@@ -29,7 +29,7 @@ func BenchmarkSSEWithTransform(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		r := newVercelSSEReader(bytes.NewReader(stream))
+		r := newResponsesSSEFilter(bytes.NewReader(stream))
 		_, _ = io.Copy(io.Discard, r)
 	}
 }
@@ -69,7 +69,7 @@ func TestSSEPingFilteringRemovesPings(t *testing.T) {
 		"data: ping\n\n" +
 		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"b\"}\n\n" +
 		"data: [DONE]\n\n")
-	r := newMuseSSEReader(bytes.NewReader(stream))
+	r := newResponsesSSEFilter(bytes.NewReader(stream))
 	out, err := io.ReadAll(r)
 	if err != nil {
 		t.Fatal(err)
@@ -85,7 +85,7 @@ func TestSSEPingFilteringRemovesPings(t *testing.T) {
 // Verify that the Vercel reasoning rename works on a full stream.
 func TestSSEReasoningRenameEndToEnd(t *testing.T) {
 	stream := []byte("event: response.reasoning.delta\ndata: {\"type\":\"response.reasoning.delta\",\"delta\":\"x\"}\n\n")
-	r := newVercelSSEReader(bytes.NewReader(stream))
+	r := newResponsesSSEFilter(bytes.NewReader(stream))
 	out, err := io.ReadAll(r)
 	if err != nil {
 		t.Fatal(err)
