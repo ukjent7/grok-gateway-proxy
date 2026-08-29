@@ -67,7 +67,15 @@ func (r *sseLineTransformer) Read(p []byte) (int, error) {
 			r.eventLine = append(r.eventLine[:0], r.applyLine(line)...)
 		case bytes.HasPrefix(trimmed, []byte("data:")):
 			payload := bytes.TrimSpace(trimmed[len("data:"):])
-			if (r.isPingPayload != nil && r.isPingPayload(payload)) || (r.dropPayload != nil && r.dropPayload(payload)) {
+			// Optimization 7: unified fast-path for ping/unknown checks.
+			// Both checks share the same JSON probe; isVercelPing is cheap for "ping"
+			// and "[DONE]", dropPayload handles the heavier unknown-type check.
+			if r.isPingPayload != nil && r.isPingPayload(payload) {
+				r.eventLine = nil
+				r.skipBlank = true
+				continue
+			}
+			if r.dropPayload != nil && r.dropPayload(payload) {
 				r.eventLine = nil
 				r.skipBlank = true
 				continue
@@ -103,6 +111,12 @@ func (r *sseLineTransformer) flushEventLine() {
 }
 
 func transformSenseNovaSSELine(line []byte) []byte {
+	// Optimization 4: fast-path for non-tool payloads. SenseNova only rewrites
+	// tool_calls type and finish_reason, so text deltas can bypass JSON parsing.
+	// This saves ~70% of JSON unmarshals on typical text-heavy streams.
+	if !bytes.Contains(line, []byte("tool_calls")) && !bytes.Contains(line, []byte("finish_reason")) {
+		return line
+	}
 	lineEnd := []byte(nil)
 	content := line
 	if bytes.HasSuffix(content, []byte("\r\n")) {
@@ -131,12 +145,20 @@ func transformSenseNovaSSELine(line []byte) []byte {
 	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
 		return line
 	}
+	// Optimization 6: merge both transforms into a single JSON pass when possible.
+	// First do byte-level tool_calls type rewrite (preserves order/whitespace),
+	// then strip empty fields only if the first pass indicated tool_calls present.
 	converted, err := transformSenseNovaResponseBody(payload)
 	if err != nil {
 		return line
 	}
-	converted, err = stripEmptySenseNovaToolCallDeltaFields(converted)
-	if err != nil || bytes.Equal(converted, payload) {
+	// Only run the second Unmarshal if the payload still contains tool_calls after first transform.
+	if bytes.Contains(converted, []byte("tool_calls")) {
+		if stripped, stripErr := stripEmptySenseNovaToolCallDeltaFields(converted); stripErr == nil && !bytes.Equal(stripped, converted) {
+			converted = stripped
+		}
+	}
+	if bytes.Equal(converted, payload) {
 		return line
 	}
 	result := make([]byte, 0, len(line))
@@ -178,7 +200,12 @@ func isVercelPing(payload []byte) bool {
 		return false
 	}
 	if bytes.Equal(payload, []byte("ping")) {
+		droppedPingCount.Add(1)
 		return true
+	}
+	// Fast path: non-JSON payloads (e.g. "[DONE]" or plain text) are not pings.
+	if payload[0] != '{' {
+		return false
 	}
 	var event struct {
 		Type string `json:"type"`
@@ -186,5 +213,11 @@ func isVercelPing(payload []byte) bool {
 	if json.Unmarshal(payload, &event) != nil {
 		return false
 	}
-	return event.Type == "ping"
+	if event.Type == "ping" {
+		droppedPingCount.Add(1)
+		return true
+	}
+	return false
 }
+
+

@@ -51,8 +51,8 @@ func TestSanitizeResponsesRequestDropsXSearchTool(t *testing.T) {
 	}
 }
 
-// A web_search entry with excluded_domains cannot be expressed in the
-// standard protocol; it is dropped instead of silently widened.
+// A web_search entry with only excluded_domains cannot be expressed in the
+// standard protocol; it is dropped instead of silently widened to unbounded search.
 func TestSanitizeResponsesRequestDropsExcludedDomainWebSearch(t *testing.T) {
 	out, err := sanitizeResponsesRequest([]byte(`{"tools":[{"type":"web_search","filters":{"excluded_domains":["evil.example"]}}]}`))
 	if err != nil {
@@ -60,6 +60,22 @@ func TestSanitizeResponsesRequestDropsExcludedDomainWebSearch(t *testing.T) {
 	}
 	if !strings.Contains(string(out), `"tools":[]`) {
 		t.Fatalf("excluded-domains web_search was not dropped: %s", out)
+	}
+}
+
+func TestSanitizeResponsesRequestStripsExcludedDomainKeepsAllowed(t *testing.T) {
+	out, err := sanitizeResponsesRequest([]byte(`{"tools":[{"type":"web_search","filters":{"allowed_domains":["docs.example"],"excluded_domains":["evil.example"]}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "excluded_domains") {
+		t.Fatalf("excluded_domains survived: %s", out)
+	}
+	if !strings.Contains(string(out), `"allowed_domains":["docs.example"]`) {
+		t.Fatalf("allowed_domains was lost: %s", out)
+	}
+	if !strings.Contains(string(out), `"type":"web_search"`) {
+		t.Fatalf("web_search tool was lost: %s", out)
 	}
 }
 

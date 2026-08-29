@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
+	"sync"
 )
 
 // responseCapture wraps the client-facing ResponseWriter to snapshot the
@@ -70,6 +72,26 @@ func newCappedBuffer(limit int64) *cappedBuffer {
 	return c
 }
 
+// newCappedBufferWithHint pre-allocates based on Content-Length hint when available.
+// This reduces reallocations for large non-streaming bodies.
+func newCappedBufferWithHint(limit int64, contentLength string) *cappedBuffer {
+	if contentLength != "" {
+		if n, err := strconv.ParseInt(contentLength, 10, 64); err == nil && n > 0 {
+			// Clamp hint to limit to avoid over-allocation.
+			hint := n
+			if limit > 0 && hint > limit {
+				hint = limit
+			}
+			if hint < 64*1024 {
+				c := &cappedBuffer{limit: limit}
+				c.buf.Grow(int(hint))
+				return c
+			}
+		}
+	}
+	return newCappedBuffer(limit)
+}
+
 func (c *cappedBuffer) Write(p []byte) (int, error) {
 	if c.truncated {
 		return len(p), nil
@@ -99,9 +121,19 @@ func cloneHeaders(src http.Header) http.Header {
 	return dst
 }
 
+// bufferPool reuses 32KB copy buffers to reduce GC pressure on streaming paths.
+var bufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
 func copyAndCapture(w http.ResponseWriter, reader io.Reader, streaming bool, limit int64) ([]byte, error) {
 	capture := newCappedBuffer(limit)
-	buf := make([]byte, 32*1024)
+	bufPtr := bufferPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer bufferPool.Put(bufPtr)
 	flusher, canFlush := w.(http.Flusher)
 	for {
 		n, err := reader.Read(buf)

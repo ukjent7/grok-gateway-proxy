@@ -17,6 +17,10 @@ import (
 // transformToolCallType rewrites every "type":"from" inside tool_calls arrays
 // to "to", using a JSON-aware walk so unrelated "type" fields are untouched.
 func transformToolCallType(body []byte, from, to string) ([]byte, error) {
+	// Optimization 6: fast-path check before JSON parse.
+	if !bytes.Contains(body, []byte(`"tool_calls"`)) || !bytes.Contains(body, []byte(from)) {
+		return body, nil
+	}
 	var payload any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return body, nil
@@ -37,6 +41,10 @@ func transformToolCallType(body []byte, from, to string) ([]byte, error) {
 // entire request with "function/name/arguments cannot be empty". Its matching
 // tool result is removed as well because it would otherwise be an orphan.
 func sanitizeSenseNovaToolCallHistory(body []byte) ([]byte, error) {
+	// Fast path: body without tool_calls or messages cannot need cleaning.
+	if !bytes.Contains(body, []byte(`"tool_calls"`)) && !bytes.Contains(body, []byte(`"messages"`)) {
+		return body, nil
+	}
 	var payload any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return body, nil
@@ -145,13 +153,27 @@ func transformSenseNovaResponseBody(body []byte) ([]byte, error) {
 	if !json.Valid(body) {
 		return body, nil
 	}
+	// Fast path: only scan if relevant markers present.
+	hasToolCall := bytes.Contains(body, []byte("function_call"))
+	hasFinish := bytes.Contains(body, []byte("finish_reason"))
+	if !hasToolCall && !hasFinish {
+		return body, nil
+	}
 	// Preserve key order/whitespace for streaming tests: use byte-level
 	// rewrites. The structured path (rewriteToolCallTypes) would randomize
 	// map iteration order and break byte-identical expectations.
-	result, changed := replaceJSONPropertyStringValueInToolCalls(body, "function_call", `"function"`)
-	var finishChanged bool
-	result, finishChanged = replaceJSONPropertyStringValue(result, "finish_reason", "", "null")
-	changed = changed || finishChanged
+	result := body
+	changed := false
+	if hasToolCall {
+		var c bool
+		result, c = replaceJSONPropertyStringValueInToolCalls(result, "function_call", `"function"`)
+		changed = changed || c
+	}
+	if hasFinish {
+		var finishChanged bool
+		result, finishChanged = replaceJSONPropertyStringValue(result, "finish_reason", "", "null")
+		changed = changed || finishChanged
+	}
 	if !changed {
 		return body, nil
 	}
@@ -327,6 +349,10 @@ func rewriteToolCallTypes(value any, from, to string) bool {
 // stripEmptySenseNovaToolCallDeltaFields removes empty id/name fields that
 // SenseNova repeats on tool-call continuation chunks.
 func stripEmptySenseNovaToolCallDeltaFields(body []byte) ([]byte, error) {
+	// Fast path: only parse if empty fields likely present.
+	if !bytes.Contains(body, []byte(`"id":""`)) && !bytes.Contains(body, []byte(`"name":""`)) {
+		return body, nil
+	}
 	var payload any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return body, nil

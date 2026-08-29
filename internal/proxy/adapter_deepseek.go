@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -75,20 +76,31 @@ func (DeepSeekResponsesAdapter) TransformSSE(reader io.Reader) io.Reader {
 // adaptResponsesRequestForDeepSeek applies the DeepSeek-specific request
 // cleanups. Bodies with none of the affected fields are returned
 // byte-for-byte.
+// Optimization 1&3: fast-path byte checks to avoid JSON parsing when body
+// contains none of the DeepSeek-specific fields.
 func adaptResponsesRequestForDeepSeek(body []byte) ([]byte, error) {
+	hasInclude := bytes.Contains(body, []byte(`"include"`))
+	hasReasoning := bytes.Contains(body, []byte(`"reasoning"`))
+	if !hasInclude && !hasReasoning {
+		return body, nil
+	}
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return body, nil
 	}
 	changed := false
-	if _, ok := payload["include"]; ok {
-		delete(payload, "include")
-		changed = true
-	}
-	if raw, ok := payload["input"]; ok {
-		if cleaned, inputChanged := stripUnsupportedReasoningFields(raw); inputChanged {
-			payload["input"] = cleaned
+	if hasInclude {
+		if _, ok := payload["include"]; ok {
+			delete(payload, "include")
 			changed = true
+		}
+	}
+	if hasReasoning {
+		if raw, ok := payload["input"]; ok {
+			if cleaned, inputChanged := stripUnsupportedReasoningFields(raw); inputChanged {
+				payload["input"] = cleaned
+				changed = true
+			}
 		}
 	}
 	if !changed {

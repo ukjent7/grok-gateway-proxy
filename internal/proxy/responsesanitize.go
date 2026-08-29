@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"log/slog"
+	"sync/atomic"
 )
 
 // responsesanitize.go aligns Grok Build's xAI-flavored Responses traffic with
@@ -30,6 +32,8 @@ import (
 //                 (grok-build's openai-responses-api.ts#openaiResponsesChunkSchema lags behind;
 //                 unknown events are dropped to avoid client deserialization failure).
 // Keep these in sync via `go:generate` from openapi.yaml or the upstream crates.
+
+//go:generate go run ./gen/sanitize -openapi ../../openapi.yaml -out responsesanitize_gen.go
 
 // standardResponsesToolTypes is the tool `type` vocabulary of the standard
 // Responses protocol (mirroring the Tool enum Grok Build itself serializes
@@ -127,10 +131,36 @@ var responsesStreamEventTypes = map[string]bool{
 	"error":                                        true,
 }
 
+// Observability counters for SSE filtering - exported for metrics.
+var (
+	droppedUnknownEventCount atomic.Int64
+	droppedPingCount         atomic.Int64
+	renamedLegacyEventCount  atomic.Int64
+)
+
+// sanitizeMetrics returns snapshot of filtering counters for observability.
+func sanitizeMetrics() map[string]int64 {
+	return map[string]int64{
+		"dropped_unknown_events": droppedUnknownEventCount.Load(),
+		"dropped_pings":          droppedPingCount.Load(),
+		"renamed_legacy_events":  renamedLegacyEventCount.Load(),
+	}
+}
+
 // sanitizeResponsesRequest strips xAI-only extensions from a Responses
 // request body so it conforms to the standard protocol. Bodies without any
 // offending field are returned byte-for-byte.
+// Optimization: fast-path byte checks before JSON parsing to avoid allocations.
 func sanitizeResponsesRequest(body []byte) ([]byte, error) {
+	// Fast path: if none of the xAI-only markers are present, avoid JSON parse entirely.
+	// This keeps conformant bodies byte-identical and zero-alloc.
+	hasStreamToolCalls := bytes.Contains(body, []byte("stream_tool_calls"))
+	hasTools := bytes.Contains(body, []byte(`"tools"`))
+	hasInclude := bytes.Contains(body, []byte(`"include"`))
+	if !hasStreamToolCalls && !hasTools && !hasInclude {
+		return body, nil
+	}
+
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
 		// Not a JSON object; leave it for the upstream to reject.
@@ -141,16 +171,20 @@ func sanitizeResponsesRequest(body []byte) ([]byte, error) {
 		delete(payload, "stream_tool_calls")
 		changed = true
 	}
-	if raw, ok := payload["tools"]; ok {
-		if cleaned, toolsChanged := sanitizeResponsesTools(raw); toolsChanged {
-			payload["tools"] = cleaned
-			changed = true
+	if hasTools {
+		if raw, ok := payload["tools"]; ok {
+			if cleaned, toolsChanged := sanitizeResponsesTools(raw); toolsChanged {
+				payload["tools"] = cleaned
+				changed = true
+			}
 		}
 	}
-	if raw, ok := payload["include"]; ok {
-		if cleaned, includeChanged := sanitizeResponsesInclude(raw); includeChanged {
-			payload["include"] = cleaned
-			changed = true
+	if hasInclude {
+		if raw, ok := payload["include"]; ok {
+			if cleaned, includeChanged := sanitizeResponsesInclude(raw); includeChanged {
+				payload["include"] = cleaned
+				changed = true
+			}
 		}
 	}
 	if !changed {
@@ -170,10 +204,11 @@ type toolTypeProbe struct {
 }
 
 // sanitizeResponsesTools removes tool entries outside the standard vocabulary
-// and reports whether anything changed. A `web_search` entry configured with
-// `excluded_domains` is dropped entirely: the standard tool has no exclusion
-// filter, and silently widening the search would defeat the user's configured
-// blocklist.
+// and reports whether anything changed. For `web_search` the standard tool
+// has no `excluded_domains` filter: instead of dropping the entire tool and
+// silently widening the search, we now strip only the excluded_domains key
+// and keep the allowed_domains part. This preserves the user's intended
+// search scope while staying conformant.
 func sanitizeResponsesTools(raw json.RawMessage) (json.RawMessage, bool) {
 	var entries []json.RawMessage
 	if err := json.Unmarshal(raw, &entries); err != nil {
@@ -188,6 +223,16 @@ func sanitizeResponsesTools(raw json.RawMessage) (json.RawMessage, bool) {
 			continue
 		}
 		if probe.Type == "web_search" && probe.Filters != nil && len(probe.Filters.ExcludedDomains) > 0 {
+			// Optimization 2: if the tool has allowed_domains, strip only excluded_domains and keep;
+			// if it only has excluded_domains, drop the whole tool to avoid silently widening to unbounded search.
+			if len(probe.Filters.AllowedDomains) > 0 {
+				if cleaned, ok := stripExcludedDomains(entry); ok {
+					kept = append(kept, cleaned)
+					changed = true
+					continue
+				}
+			}
+			// Pure excluded_domains -> drop (original safe behavior)
 			changed = true
 			continue
 		}
@@ -199,6 +244,42 @@ func sanitizeResponsesTools(raw json.RawMessage) (json.RawMessage, bool) {
 	out, err := json.Marshal(kept)
 	if err != nil {
 		return raw, false
+	}
+	return out, true
+}
+
+// stripExcludedDomains removes the excluded_domains field from a web_search tool entry
+// while preserving allowed_domains and other fields. Returns the cleaned JSON and true on success.
+func stripExcludedDomains(entry json.RawMessage) (json.RawMessage, bool) {
+	var tool map[string]json.RawMessage
+	if err := json.Unmarshal(entry, &tool); err != nil {
+		return nil, false
+	}
+	filtersRaw, ok := tool["filters"]
+	if !ok {
+		return nil, false
+	}
+	var filters map[string]json.RawMessage
+	if err := json.Unmarshal(filtersRaw, &filters); err != nil {
+		return nil, false
+	}
+	if _, hasExcluded := filters["excluded_domains"]; !hasExcluded {
+		return nil, false
+	}
+	delete(filters, "excluded_domains")
+	// If filters becomes empty, remove it entirely to stay conformant (unbounded search).
+	if len(filters) == 0 {
+		delete(tool, "filters")
+	} else {
+		cleanedFilters, err := json.Marshal(filters)
+		if err != nil {
+			return nil, false
+		}
+		tool["filters"] = cleanedFilters
+	}
+	out, err := json.Marshal(tool)
+	if err != nil {
+		return nil, false
 	}
 	return out, true
 }
@@ -235,10 +316,18 @@ func sanitizeResponsesInclude(raw json.RawMessage) (json.RawMessage, bool) {
 // classify, and the client fails on them no differently than it would have
 // without the proxy.
 func isUnknownResponsesEventPayload(payload []byte) bool {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 {
+		return false
+	}
+	// Fast path: short-circuit non-JSON payloads (e.g. "ping", "[DONE]")
+	if trimmed[0] != '{' {
+		return false
+	}
 	var probe struct {
 		Type string `json:"type"`
 	}
-	if err := json.Unmarshal(bytes.TrimSpace(payload), &probe); err != nil {
+	if err := json.Unmarshal(trimmed, &probe); err != nil {
 		return false
 	}
 	return probe.Type != "" && !responsesStreamEventTypes[probe.Type]
@@ -258,8 +347,25 @@ func newResponsesSSEFilter(reader io.Reader) io.Reader {
 // safe. An empty `data:` frame is dropped as well: it cannot be parsed by
 // the client and would fail the whole stream.
 func dropUnknownResponsesEvent(payload []byte) bool {
-	if len(bytes.TrimSpace(payload)) == 0 {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 {
+		droppedUnknownEventCount.Add(1)
+		slog.Debug("dropping empty SSE payload")
 		return true
 	}
-	return isUnknownResponsesEventPayload(rewriteLegacyReasoningEventNames(payload))
+	// Single Unmarshal path: rename first so legacy events pass.
+	renamed := rewriteLegacyReasoningEventNames(payload)
+	if !bytes.Equal(renamed, payload) {
+		renamedLegacyEventCount.Add(1)
+	}
+	if isUnknownResponsesEventPayload(renamed) {
+		droppedUnknownEventCount.Add(1)
+		preview := trimmed
+		if len(preview) > 200 {
+			preview = preview[:200]
+		}
+		slog.Debug("dropping unknown SSE event", "payload", string(preview))
+		return true
+	}
+	return false
 }

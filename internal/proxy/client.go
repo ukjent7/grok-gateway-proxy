@@ -19,7 +19,11 @@ func NewUpstreamClient(proxyURL string) *http.Client {
 	transport := &http.Transport{
 		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		TLSHandshakeTimeout:   15 * time.Second,
-		ResponseHeaderTimeout: 60 * time.Second,
+		// Optimization 10: increased header timeout for slow LLM first-token.
+		// Streaming responses can take >60s for the first token (reasoning models).
+		// Non-streaming paths still have the per-request context timeout (default 5m)
+		// so this only affects the header wait.
+		ResponseHeaderTimeout: 120 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
