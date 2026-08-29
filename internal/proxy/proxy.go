@@ -354,11 +354,15 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 		responseBody, copyErr = copyAndCapture(w, responseReader, true, bodyLimit)
 		logEntry.UpstreamResponseBody = append([]byte(nil), rawResponse.Bytes()...)
 		logEntry.ResponseTruncated = rawResponse.truncated
+		// Observability for SSE filtering (optimization 5)
+		if m := sanitizeMetrics(); m["dropped_unknown_events"] > 0 || m["dropped_pings"] > 0 {
+			slog.Debug("sse filter metrics", "metrics", m)
+		}
 	} else {
 		// Non-streaming: read the full body so the client always receives
 		// the complete (possibly transformed) response. Only the audit
 		// capture is capped.
-		rawCapture := newCappedBuffer(bodyLimit)
+		rawCapture := newCappedBufferWithHint(bodyLimit, upstreamResponse.Header.Get("Content-Length"))
 		rawResponse, readErr := io.ReadAll(io.TeeReader(upstreamResponse.Body, rawCapture))
 		if readErr != nil {
 			copyErr = readErr

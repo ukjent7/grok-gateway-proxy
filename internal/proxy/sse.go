@@ -219,5 +219,3 @@ func isVercelPing(payload []byte) bool {
 	}
 	return false
 }
-
-

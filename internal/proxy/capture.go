@@ -77,7 +77,6 @@ func newCappedBuffer(limit int64) *cappedBuffer {
 func newCappedBufferWithHint(limit int64, contentLength string) *cappedBuffer {
 	if contentLength != "" {
 		if n, err := strconv.ParseInt(contentLength, 10, 64); err == nil && n > 0 {
-			// Clamp hint to limit to avoid over-allocation.
 			hint := n
 			if limit > 0 && hint > limit {
 				hint = limit
