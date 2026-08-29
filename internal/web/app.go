@@ -119,6 +119,10 @@ func (a *App) startHealthCheck(ctx context.Context, interval time.Duration) {
 }
 
 func (a *App) probeUpstream(id string, gateway config.GatewayConfig) {
+	if strings.TrimSpace(gateway.BaseURL) == "" {
+		a.setHealth(id, upstreamHealth{Err: "base URL 未配置"})
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(gateway.BaseURL, "/")+"/models", nil)
@@ -169,8 +173,8 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // Uses exact prefix matching (not string HasPrefix) so /static/ is never
 // mistaken for /st/.
 func isGatewayPath(path string) bool {
-	for _, prefix := range []string{"/oc", "/st", "/ve"} {
-		if path == prefix || strings.HasPrefix(path, prefix+"/") {
+	for _, prefix := range []string{"/ds", "/st", "/std"} {
+		if hasPathPrefix(path, prefix) {
 			return true
 		}
 	}

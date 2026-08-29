@@ -110,13 +110,13 @@ func TestHealthzReportsGatewayStatus(t *testing.T) {
 	defer upstream.Close()
 
 	cfg := config.DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
-	gw := cfg.Gateways["oc"]
+	gw := cfg.Gateways["std"]
 	gw.BaseURL = upstream.URL
-	cfg.Gateways["oc"] = gw
+	cfg.Gateways["std"] = gw
 	app := &App{config: cfg, logger: slog.Default(), upstreams: map[string]upstreamHealth{}}
 	app.proxy = proxy.NewProxy(cfg, nil, slog.Default())
 	app.proxy.Client = upstream.Client()
-	app.probeUpstream("oc", cfg.Gateways["oc"])
+	app.probeUpstream("std", cfg.Gateways["std"])
 
 	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/healthz", nil)
 	recorder := httptest.NewRecorder()
@@ -132,9 +132,9 @@ func TestHealthzReportsGatewayStatus(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected upstreams map, got %s", recorder.Body.String())
 	}
-	oc, ok := upstreams["oc"].(map[string]any)
-	if !ok || oc["reachable"] != true || oc["status"] != float64(200) {
-		t.Fatalf("expected reachable oc gateway with status 200, got: %+v", upstreams)
+	std, ok := upstreams["std"].(map[string]any)
+	if !ok || std["reachable"] != true || std["status"] != float64(200) {
+		t.Fatalf("expected reachable std gateway with status 200, got: %+v", upstreams)
 	}
 }
 
