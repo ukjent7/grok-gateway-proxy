@@ -16,8 +16,10 @@ import (
 type StandardResponsesAdapter struct{ baseResponsesAdapter }
 
 func (StandardResponsesAdapter) ID() string { return "StandardResponsesAdapter" }
-func (a StandardResponsesAdapter) Protocol() config.Protocol { return a.baseResponsesAdapter.Protocol() }
-func (a StandardResponsesAdapter) EndpointPath() string      { return a.baseResponsesAdapter.EndpointPath() }
+func (a StandardResponsesAdapter) Protocol() config.Protocol {
+	return a.baseResponsesAdapter.Protocol()
+}
+func (a StandardResponsesAdapter) EndpointPath() string { return a.baseResponsesAdapter.EndpointPath() }
 func (a StandardResponsesAdapter) AcceptsPath(path string) bool {
 	return a.baseResponsesAdapter.AcceptsPath(path)
 }

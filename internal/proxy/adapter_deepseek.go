@@ -32,8 +32,10 @@ import (
 type DeepSeekResponsesAdapter struct{ baseResponsesAdapter }
 
 func (DeepSeekResponsesAdapter) ID() string { return "DeepSeekResponsesAdapter" }
-func (a DeepSeekResponsesAdapter) Protocol() config.Protocol { return a.baseResponsesAdapter.Protocol() }
-func (a DeepSeekResponsesAdapter) EndpointPath() string      { return a.baseResponsesAdapter.EndpointPath() }
+func (a DeepSeekResponsesAdapter) Protocol() config.Protocol {
+	return a.baseResponsesAdapter.Protocol()
+}
+func (a DeepSeekResponsesAdapter) EndpointPath() string { return a.baseResponsesAdapter.EndpointPath() }
 func (a DeepSeekResponsesAdapter) AcceptsPath(path string) bool {
 	return a.baseResponsesAdapter.AcceptsPath(path)
 }
