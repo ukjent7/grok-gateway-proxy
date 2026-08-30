@@ -176,9 +176,9 @@ export function renderGatewayCards() {
         <div class="field">
           <div class="field-label-row">
             <label class="field-label">请求头白名单 (Forward Headers)</label>
-            <span class="field-hint">每行一个标头名，代理将转发这些标头</span>
+            <span class="field-hint">每行一个标头名；留空使用默认（Authorization、Accept、User-Agent），填写后整体替换默认列表</span>
           </div>
-          <textarea class="f-headers textarea-modern" rows="3" placeholder="Authorization&#10;X-Api-Key&#10;X-Session-Id">${escapeHtml(headers)}</textarea>
+          <textarea class="f-headers textarea-modern" rows="3" placeholder="Authorization&#10;Accept&#10;User-Agent">${escapeHtml(headers)}</textarea>
           <div class="preset-pills">
             <span class="preset-pill-label">快捷添加：</span>
             <button type="button" class="btn-preset" data-header="Authorization">+ Authorization</button>

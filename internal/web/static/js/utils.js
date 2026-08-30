@@ -139,6 +139,35 @@ export function copyText(text) {
   });
 }
 
+// 折叠展示/复制时单个体量上限，超过则截断并用注释说明，避免把整段报文塞进
+// 剪贴板或 DOM。
+export const MAX_PREVIEW_BYTES = 64 * 1024;
+
+// 把一条日志还原成可复现的 curl 命令。请求体超过 MAX_PREVIEW_BYTES 时不内联，
+// 只留一行注释：完整报文在抽屉里看，命令本身仍可执行。
+export function buildCurlFromLog(log) {
+  const url = log.request_url || log.request_path || '';
+  let cmd = `curl ${JSON.stringify(url)} \\\n  -X ${log.method || 'POST'}`;
+  const headers = log.request_headers;
+  if (headers) {
+    try {
+      const obj = JSON.parse(headers);
+      for (const [k, v] of Object.entries(obj)) {
+        cmd += ` \\\n  -H ${JSON.stringify(k + ': ' + v)}`;
+      }
+    } catch (e) {}
+  }
+  const body = log.request_body || '';
+  if (body) {
+    if (body.length > MAX_PREVIEW_BYTES) {
+      cmd += ` \\\n  # 请求体过大（${body.length} 字符），已折叠`;
+    } else {
+      cmd += ` \\\n  -d ${JSON.stringify(body)}`;
+    }
+  }
+  return cmd;
+}
+
 export function downloadFile(filename, content, type = 'text/plain;charset=utf-8') {
   const blob = new Blob([content], { type });
   const url = URL.createObjectURL(blob);

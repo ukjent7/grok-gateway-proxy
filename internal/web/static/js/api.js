@@ -11,8 +11,11 @@ export async function api(path, opts = {}) {
   }, opts.headers || {});
 
   const timeoutMs = opts.timeout || 12000;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // Only own the timeout when the caller did not bring its own signal:
+  // otherwise the timer would abort a controller nothing is listening to,
+  // while the caller's own abort is the one that should win.
+  const controller = opts.signal ? null : new AbortController();
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
 
   let res;
   try {
@@ -21,13 +24,12 @@ export async function api(path, opts = {}) {
       signal: opts.signal || controller.signal
     }));
   } catch (e) {
-    clearTimeout(timer);
     if (e.name === 'AbortError') {
       throw new Error('请求超时（超过 ' + (timeoutMs / 1000) + ' 秒未响应）');
     }
     throw new Error('无法连接到代理服务（' + e.message + '）');
   } finally {
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
   }
 
   let body = null;

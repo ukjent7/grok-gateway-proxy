@@ -12,7 +12,7 @@ import { state } from './state.js';
 import { api } from './api.js';
 import {
   $, $all, fmtTime, fmtTimeRelative, fmtMs, fmtNum,
-  escapeHtml, copyText, tryPretty
+  escapeHtml, copyText, tryPretty, MAX_PREVIEW_BYTES, buildCurlFromLog
 } from './utils.js';
 import { showToast } from './ui.js';
 import {
@@ -21,7 +21,6 @@ import {
 } from './diff.js';
 
 const MAX_DIFF_BYTES = 1024 * 1024;
-const MAX_PREVIEW_BYTES = 64 * 1024;
 
 export async function openDrawer(id) {
   if (!id) return;
@@ -140,7 +139,7 @@ function renderDrawer(log) {
     metaHTML += `
       <div class="drawer-meta-chip is-warn full-width">
         <span class="chip-label">注意:</span>
-        <span class="chip-val">响应正文超过 64MB 上限，报文内容已部分截断显示</span>
+        <span class="chip-val">响应正文超过配置的采集上限（body_capture_limit_kb），存储的报文内容已截断；客户端收到的仍是完整响应</span>
       </div>
     `;
   }
@@ -152,7 +151,8 @@ function renderDrawer(log) {
 function previewOrFull(raw) {
   const text = raw || '';
   if (text.length > MAX_PREVIEW_BYTES) {
-    return text.slice(0, MAX_PREVIEW_BYTES) + `\n\n… [正文体积过大（${text.length} 字符），已折叠展示前 64KB]`;
+    const shownKB = Math.floor(MAX_PREVIEW_BYTES / 1024);
+    return text.slice(0, MAX_PREVIEW_BYTES) + `\n\n… [正文体积过大（${text.length} 字符），已折叠展示前 ${shownKB}KB]`;
   }
   return text;
 }
@@ -284,29 +284,6 @@ export function closeDrawer() {
     drawer.classList.remove('is-open');
     drawer.setAttribute('aria-hidden', 'true');
   }
-}
-
-function buildCurlFromLog(log) {
-  const url = log.request_url || log.request_path || '';
-  let cmd = `curl ${JSON.stringify(url)} \\\n  -X ${log.method || 'POST'}`;
-  const headers = log.request_headers;
-  if (headers) {
-    try {
-      const obj = JSON.parse(headers);
-      for (const [k, v] of Object.entries(obj)) {
-        cmd += ` \\\n  -H ${JSON.stringify(k + ': ' + v)}`;
-      }
-    } catch (e) {}
-  }
-  const body = log.request_body || '';
-  if (body) {
-    if (body.length > MAX_PREVIEW_BYTES) {
-      cmd += ` \\\n  # 请求体过大（${body.length} 字符），已折叠`;
-    } else {
-      cmd += ` \\\n  -d ${JSON.stringify(body)}`;
-    }
-  }
-  return cmd;
 }
 
 export function initDrawer() {

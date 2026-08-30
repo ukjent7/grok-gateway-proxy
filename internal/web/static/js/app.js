@@ -212,15 +212,6 @@ async function boot() {
   restartAutoRefresh();
 }
 
-// Global debug access
-window.grokConsole = {
-  state,
-  switchView,
-  refreshAll,
-  loadLogs,
-  loadOverview
-};
-
 // Initialize modules
 initOverview();
 initLogs();

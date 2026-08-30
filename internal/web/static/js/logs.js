@@ -12,7 +12,7 @@ import { state } from './state.js';
 import { api } from './api.js';
 import {
   $, $all, fmtNum, fmtPct, fmtTime, fmtTimeShort, fmtTimeRelative, fmtMs,
-  escapeHtml, copyText, downloadFile
+  escapeHtml, copyText, downloadFile, buildCurlFromLog
 } from './utils.js';
 import { openDrawer } from './drawer.js';
 import { showToast, confirmModal } from './ui.js';
@@ -205,29 +205,6 @@ function bindRowClicks(scope) {
   });
 }
 
-function buildCurlFromLog(log) {
-  const url = log.request_url || log.request_path || '';
-  let cmd = `curl ${JSON.stringify(url)} \\\n  -X ${log.method || 'POST'}`;
-  const headers = log.request_headers;
-  if (headers) {
-    try {
-      const obj = JSON.parse(headers);
-      for (const [k, v] of Object.entries(obj)) {
-        cmd += ` \\\n  -H ${JSON.stringify(k + ': ' + v)}`;
-      }
-    } catch (e) {}
-  }
-  const body = log.request_body || '';
-  if (body) {
-    if (body.length > 50000) {
-      cmd += ` \\\n  # 请求体过大（${body.length} 字符），已折叠`;
-    } else {
-      cmd += ` \\\n  -d ${JSON.stringify(body)}`;
-    }
-  }
-  return cmd;
-}
-
 function appendLogRows(items) {
   const tbody = $('#logTableBody');
   if (!tbody) return;
@@ -337,11 +314,13 @@ export async function loadLogs(options = false) {
           <td colspan="9">
             <div class="empty-message-wrap">
               <span class="text-danger">加载失败：${escapeHtml(e.message)}</span>
-              <button type="button" class="btn-ghost small" onclick="window.grokConsole.loadLogs(true)">重试</button>
+              <button type="button" class="btn-ghost small" id="logsRetryBtn">重试</button>
             </div>
           </td>
         </tr>
       `;
+      const retryBtn = $('#logsRetryBtn', tbody);
+      if (retryBtn) retryBtn.addEventListener('click', () => loadLogs(true));
     }
   } finally {
     if (refreshBtn && !silent) {
