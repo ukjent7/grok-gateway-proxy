@@ -242,11 +242,16 @@ func TestProxyRoutesBothNativeResponseAdapters(t *testing.T) {
 	}
 }
 
-func TestProxyNormalizesUpstreamErrors(t *testing.T) {
+// Upstream error bodies are forwarded verbatim: `error.type` and `error.code`
+// are what clients branch on for retry / rate-limit / request-error handling,
+// so the proxy must not swap in an envelope of its own.
+func TestProxyPassesThroughUpstreamErrors(t *testing.T) {
+	const upstreamError = `{"error":{"message":"quota exceeded","type":"rate_limit_error","code":"rate_limit_exceeded"}}`
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "30")
 		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = w.Write([]byte(`{"error":{"message":"quota exceeded"}}`))
+		_, _ = w.Write([]byte(upstreamError))
 	}))
 	defer upstream.Close()
 
@@ -264,8 +269,17 @@ func TestProxyNormalizesUpstreamErrors(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/st/chat/completions", strings.NewReader(string(body)))
 	recorder := httptest.NewRecorder()
 	p.ServeHTTP(recorder, req)
-	if recorder.Code != http.StatusTooManyRequests || !strings.Contains(recorder.Body.String(), "upstream_error") || !strings.Contains(recorder.Body.String(), "quota exceeded") {
-		t.Fatalf("unexpected normalized error: %d %s", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("unexpected status: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder.Body.String() != upstreamError {
+		t.Fatalf("upstream error body was rewritten: %s", recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Retry-After"); got != "30" {
+		t.Fatalf("Retry-After was dropped: %q", got)
+	}
+	if got := recorder.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("upstream Content-Type was rewritten: %q", got)
 	}
 	logs, err := st.List(context.Background(), store.LogFilter{Limit: 10})
 	if err != nil || len(logs) != 1 || logs[0].Success {
@@ -375,6 +389,58 @@ func TestProxyCapsSSEResponseBodyCapture(t *testing.T) {
 	}
 	if !detail.ResponseTruncated {
 		t.Fatal("expected response_truncated flag on the log")
+	}
+}
+
+// Usage must be metered from the live stream, not from the capped capture: the
+// terminal usage-bearing event lands outside the capture window whenever the
+// stream is longer than the cap, and re-scanning the capture would then report
+// zero tokens for a response that was billed in full.
+func TestProxyStreamUsageSurvivesCaptureTruncation(t *testing.T) {
+	const capSize = 1024
+	var stream bytes.Buffer
+	for i := 0; i < 40; i++ {
+		stream.WriteString("data: {\"type\":\"response.output_text.delta\",\"delta\":\"" + strings.Repeat("x", 80) + "\"}\n\n")
+	}
+	stream.WriteString(`data: {"type":"response.completed","response":{"usage":{"input_tokens":111,"output_tokens":222,"output_tokens_details":{"reasoning_tokens":33}}}}` + "\n\n")
+	if stream.Len() <= capSize {
+		t.Fatalf("stream (%d bytes) must exceed the cap to exercise truncation", stream.Len())
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write(stream.Bytes())
+	}))
+	defer upstream.Close()
+
+	st, err := store.OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
+	gateway := cfg.Gateways["std"]
+	gateway.BaseURL = upstream.URL
+	cfg.Gateways["std"] = gateway
+	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client(), ResponseBodySize: capSize}
+
+	recorder := httptest.NewRecorder()
+	p.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/std/responses", strings.NewReader(`{"model":"m","stream":true,"input":"hi"}`)))
+
+	logs, err := st.List(context.Background(), store.LogFilter{Limit: 10})
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("expected one log, got %d, err=%v", len(logs), err)
+	}
+	detail, err := st.Get(context.Background(), logs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !detail.ResponseTruncated {
+		t.Fatal("expected the capture to be truncated, otherwise this test proves nothing")
+	}
+	if detail.Usage.InputTokens != 111 || detail.Usage.OutputTokens != 222 || detail.Usage.ReasoningTokens != 33 {
+		t.Fatalf("usage lost to capture truncation: in=%d out=%d reasoning=%d, want 111/222/33",
+			detail.Usage.InputTokens, detail.Usage.OutputTokens, detail.Usage.ReasoningTokens)
 	}
 }
 
@@ -584,53 +650,6 @@ func TestProxySanitizesResponsesRequestToUpstream(t *testing.T) {
 	}
 }
 
-func TestProxyBlocksGrokModelsWithoutCallingUpstream(t *testing.T) {
-	upstreamCalls := 0
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamCalls++
-		t.Error("blocked Grok request reached upstream")
-	}))
-	defer upstream.Close()
-
-	st, err := store.OpenStore(t.TempDir() + "/proxy.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
-	gateway := cfg.Gateways["std"]
-	gateway.BaseURL = upstream.URL
-	cfg.Gateways["std"] = gateway
-	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client()}
-
-	requestBody := []byte(`{"model":"grok-4.6","stream":true,"input":"title this"}`)
-	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/std/responses", strings.NewReader(string(requestBody)))
-	recorder := httptest.NewRecorder()
-	p.ServeHTTP(recorder, req)
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("expected synthetic success, got %d: %s", recorder.Code, recorder.Body.String())
-	}
-	if upstreamCalls != 0 {
-		t.Fatalf("blocked request called upstream %d times", upstreamCalls)
-	}
-	if !strings.Contains(recorder.Body.String(), "response.completed") || !strings.Contains(recorder.Body.String(), "data: [DONE]") {
-		t.Fatalf("synthetic Responses stream was incomplete: %s", recorder.Body.String())
-	}
-	// The synthetic response object must deserialize under the strict client
-	// schema: created_at is a required field.
-	if !strings.Contains(recorder.Body.String(), `"created_at":`) {
-		t.Fatalf("synthetic Responses stream is missing created_at: %s", recorder.Body.String())
-	}
-	logs, err := st.List(context.Background(), store.LogFilter{Limit: 1})
-	if err != nil || len(logs) != 1 {
-		t.Fatalf("expected one blocked request log, got %d, err=%v", len(logs), err)
-	}
-	if logs[0].StatusCode != http.StatusOK || !logs[0].Success || !strings.Contains(logs[0].Error, "blocked") {
-		t.Fatalf("blocked request was not logged clearly: %+v", logs[0])
-	}
-}
-
 // End-to-end check with the exact request shape Grok Build sends and the
 // event stream its strict parser accepts: xAI-only request extensions are
 // stripped before the upstream sees them, and ping / unknown event types are
@@ -681,9 +700,26 @@ func TestProxyGrokBuildResponsesEndToEnd(t *testing.T) {
 	if _, exists := upstreamBody["stream_tool_calls"]; exists {
 		t.Fatalf("stream_tool_calls reached upstream: %+v", upstreamBody)
 	}
+	// x_search is dropped; the excluded-domains web_search survives with its
+	// filter renamed to the standard blocked_domains.
 	tools := upstreamBody["tools"].([]any)
-	if len(tools) != 1 || tools[0].(map[string]any)["type"] != "function" {
+	if len(tools) != 2 {
 		t.Fatalf("non-standard tools reached upstream: %+v", tools)
+	}
+	webSearch := tools[0].(map[string]any)
+	if webSearch["type"] != "web_search" {
+		t.Fatalf("web_search tool was dropped instead of renamed: %+v", tools)
+	}
+	filters := webSearch["filters"].(map[string]any)
+	if _, exists := filters["excluded_domains"]; exists {
+		t.Fatalf("excluded_domains reached upstream: %+v", filters)
+	}
+	blocked := filters["blocked_domains"].([]any)
+	if len(blocked) != 1 || blocked[0] != "a.example" {
+		t.Fatalf("blocklist was not preserved as blocked_domains: %+v", filters)
+	}
+	if tools[1].(map[string]any)["type"] != "function" {
+		t.Fatalf("function tool was dropped: %+v", tools)
 	}
 	include := upstreamBody["include"].([]any)
 	if len(include) != 1 || include[0] != "reasoning.encrypted_content" {
@@ -792,4 +828,403 @@ func TestProxyUnconfiguredBaseURLReturns503(t *testing.T) {
 	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), "base URL") {
 		t.Fatalf("expected 503 with a clear message, got %d: %s", recorder.Code, recorder.Body.String())
 	}
+}
+
+// End-to-end proof that a gateway's configured ForwardHeaders reaches the
+// upstream: the units in headers_test.go only cover copyForwardHeaders, not
+// that buildUpstreamRequest actually feeds the configured list into it.
+func TestProxyForwardsConfiguredGrokHeaders(t *testing.T) {
+	var gotDoomLoop, gotUserID, gotAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotDoomLoop = r.Header.Get("X-Grok-Doom-Loop-Check")
+		gotUserID = r.Header.Get("X-Grok-User-Id")
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","object":"response","model":"m","status":"completed","output":[]}`))
+	}))
+	defer upstream.Close()
+
+	st, err := store.OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
+	gateway := cfg.Gateways["std"]
+	gateway.BaseURL = upstream.URL
+	gateway.ForwardHeaders = []string{"Authorization", "Content-Type", "X-Grok-Doom-Loop-Check"}
+	cfg.Gateways["std"] = gateway
+	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client()}
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/std/responses", strings.NewReader(`{"model":"m","input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("X-Grok-Doom-Loop-Check", "64")
+	req.Header.Set("X-Grok-User-Id", "u-1")
+	p.ServeHTTP(httptest.NewRecorder(), req)
+
+	if gotDoomLoop != "64" {
+		t.Fatalf("configured x-grok-doom-loop-check did not reach upstream: %q", gotDoomLoop)
+	}
+	if gotUserID != "" {
+		t.Fatalf("unconfigured x-grok-user-id reached upstream: %q", gotUserID)
+	}
+	if gotAuth != "Bearer secret" {
+		t.Fatalf("Authorization did not reach upstream: %q", gotAuth)
+	}
+}
+
+// Without configuration the same request must leak nothing to the upstream.
+func TestProxyDropsGrokHeadersWithoutConfiguration(t *testing.T) {
+	var gotDoomLoop, gotConvID string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotDoomLoop = r.Header.Get("X-Grok-Doom-Loop-Check")
+		gotConvID = r.Header.Get("X-Grok-Conv-Id")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","object":"response","model":"m","status":"completed","output":[]}`))
+	}))
+	defer upstream.Close()
+
+	st, err := store.OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
+	gateway := cfg.Gateways["std"]
+	gateway.BaseURL = upstream.URL
+	cfg.Gateways["std"] = gateway
+	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client()}
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/std/responses", strings.NewReader(`{"model":"m","input":"hi"}`))
+	req.Header.Set("X-Grok-Doom-Loop-Check", "64")
+	req.Header.Set("X-Grok-Conv-Id", "c-1")
+	p.ServeHTTP(httptest.NewRecorder(), req)
+
+	if gotDoomLoop != "" || gotConvID != "" {
+		t.Fatalf("default config leaked grok headers upstream: doom_loop=%q conv=%q", gotDoomLoop, gotConvID)
+	}
+}
+
+// An upstream that hangs up mid-stream answered 200 but never delivered a
+// complete response, so it must not be logged as a success: the dashboard's
+// success rate and token totals would otherwise count half an answer as a
+// whole one.
+func TestProxyRecordsMidStreamFailureAsFailure(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"half\"}\n\n")); err != nil {
+			return
+		}
+		w.(http.Flusher).Flush()
+		// Hang up mid-stream instead of terminating the event stream.
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		conn.Close()
+	}))
+	defer upstream.Close()
+
+	st, err := store.OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
+	gateway := cfg.Gateways["std"]
+	gateway.BaseURL = upstream.URL
+	cfg.Gateways["std"] = gateway
+	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client()}
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/std/responses",
+		strings.NewReader(`{"model":"m","stream":true,"input":"hi"}`))
+	p.ServeHTTP(httptest.NewRecorder(), req)
+
+	logs, err := st.List(context.Background(), store.LogFilter{Limit: 1})
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("expected one log, got %d, err=%v", len(logs), err)
+	}
+	if logs[0].Success {
+		t.Fatalf("stream broken mid-flight must not be logged as success: %+v", logs[0])
+	}
+	if logs[0].Error == "" {
+		t.Fatal("expected the copy error to be recorded on the log entry")
+	}
+}
+
+// config documents body_capture_limit_kb: 0 as "capture everything", so it
+// must not silently fall back to the default cap. It is still bounded by
+// maxCapturedBodySize — an opt-out must not become an unbounded write to
+// SQLite — but a 300KB body sits far below that ceiling and is stored whole.
+func TestProxyCaptureLimitZeroDisablesTruncation(t *testing.T) {
+	body := []byte(`{"id":"ok","choices":[{"text":"` + strings.Repeat("x", 300*1024) + `"}]}`)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer upstream.Close()
+
+	for _, test := range []struct {
+		name          string
+		limitKB       int
+		wantTruncated bool
+	}{
+		{name: "zero captures everything below the ceiling", limitKB: 0, wantTruncated: false},
+		{name: "one KB truncates", limitKB: 1, wantTruncated: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			st, err := store.OpenStore(t.TempDir() + "/proxy.db")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			cfg := config.DefaultConfig(t.TempDir() + "/config.json")
+			cfg.BodyCaptureLimitKB = test.limitKB
+			gateway := cfg.Gateways["st"]
+			gateway.BaseURL = upstream.URL
+			cfg.Gateways["st"] = gateway
+			p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client()}
+
+			req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/st/chat/completions",
+				strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+			p.ServeHTTP(httptest.NewRecorder(), req)
+
+			logs, err := st.List(context.Background(), store.LogFilter{Limit: 1})
+			if err != nil || len(logs) != 1 {
+				t.Fatalf("expected one log, got %d, err=%v", len(logs), err)
+			}
+			detail, err := st.Get(context.Background(), logs[0].ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if detail.ResponseTruncated != test.wantTruncated {
+				t.Fatalf("ResponseTruncated = %v, want %v (%d bytes stored of %d)",
+					detail.ResponseTruncated, test.wantTruncated, len(detail.ResponseBody), len(body))
+			}
+			if !test.wantTruncated && string(detail.ResponseBody) != string(body) {
+				t.Fatalf("body was altered: %d bytes, want %d", len(detail.ResponseBody), len(body))
+			}
+		})
+	}
+}
+
+// Upstream error bodies take the capBody path instead of the cappedBuffer one,
+// so they must honour "0 = capture everything" the same way a 200 body does:
+// comparing against a zero limit would flag every error response as truncated.
+// A 300KB error body is far below maxCapturedBodySize, so it is stored whole.
+func TestProxyCaptureLimitZeroLeavesErrorBodyUntruncated(t *testing.T) {
+	errorBody := []byte(`{"error":{"type":"invalid_request_error","message":"` + strings.Repeat("y", 300*1024) + `"}}`)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write(errorBody)
+	}))
+	defer upstream.Close()
+
+	st, err := store.OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
+	cfg.BodyCaptureLimitKB = 0
+	gateway := cfg.Gateways["st"]
+	gateway.BaseURL = upstream.URL
+	cfg.Gateways["st"] = gateway
+	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client()}
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/st/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	p.ServeHTTP(httptest.NewRecorder(), req)
+
+	logs, err := st.List(context.Background(), store.LogFilter{Limit: 1})
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("expected one log, got %d, err=%v", len(logs), err)
+	}
+	detail, err := st.Get(context.Background(), logs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.ResponseTruncated {
+		t.Fatal("error body was flagged truncated although capture is unlimited")
+	}
+	if string(detail.ResponseBody) != string(errorBody) {
+		t.Fatalf("error body was altered: %d bytes, want %d", len(detail.ResponseBody), len(errorBody))
+	}
+}
+
+// With a cap in effect, an oversized upstream error body is still flagged, and
+// the client still receives it in full.
+func TestProxyCapsErrorResponseBodyCapture(t *testing.T) {
+	const capSize = 1024
+	errorBody := bytes.Repeat([]byte("z"), 4*capSize)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write(errorBody)
+	}))
+	defer upstream.Close()
+
+	st, err := store.OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
+	gateway := cfg.Gateways["st"]
+	gateway.BaseURL = upstream.URL
+	cfg.Gateways["st"] = gateway
+	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client(), ResponseBodySize: capSize}
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/st/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	recorder := httptest.NewRecorder()
+	p.ServeHTTP(recorder, req)
+
+	if recorder.Body.Len() != len(errorBody) {
+		t.Fatalf("client did not receive the full error body: %d bytes, want %d", recorder.Body.Len(), len(errorBody))
+	}
+
+	logs, err := st.List(context.Background(), store.LogFilter{Limit: 1})
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("expected one log, got %d, err=%v", len(logs), err)
+	}
+	detail, err := st.Get(context.Background(), logs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detail.ResponseBody) != capSize {
+		t.Fatalf("expected capped error body of %d bytes, got %d", capSize, len(detail.ResponseBody))
+	}
+	if !detail.ResponseTruncated {
+		t.Fatal("expected response_truncated flag on the log")
+	}
+}
+
+// A configured limit of zero must still be bounded: "capture everything" means
+// up to maxCapturedBodySize, not unbounded. The ceiling mirrors the request
+// side (maxRequestBodySize) so both directions are capped the same way, and it
+// has to be large enough that no ordinary payload is truncated by it.
+func TestResponseBodyLimitZeroFallsBackToSafetyCeiling(t *testing.T) {
+	st, err := store.OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	for _, limitKB := range []int{0} {
+		cfg := config.DefaultConfig(t.TempDir() + "/config.json")
+		cfg.BodyCaptureLimitKB = limitKB
+		p := &Proxy{Config: cfg, Store: st}
+		if got := p.responseBodyLimit(); got != maxCapturedBodySize {
+			t.Fatalf("responseBodyLimit() with body_capture_limit_kb=%d = %d, want %d",
+				limitKB, got, maxCapturedBodySize)
+		}
+	}
+
+	// A non-zero configured limit is honoured verbatim and is not raised to
+	// the ceiling.
+	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
+	cfg.BodyCaptureLimitKB = 8
+	p := &Proxy{Config: cfg, Store: st}
+	if got := p.responseBodyLimit(); got != 8<<10 {
+		t.Fatalf("responseBodyLimit() = %d, want %d", got, 8<<10)
+	}
+
+	// The ceiling must not be smaller than what callers already rely on.
+	if maxCapturedBodySize < defaultResponseBodySize {
+		t.Fatalf("maxCapturedBodySize (%d) is below the default cap (%d)", maxCapturedBodySize, defaultResponseBodySize)
+	}
+}
+
+// capBody is the shared truncation helper for the request, upstream and error
+// bodies; a zero limit has to mean "keep everything" at this level too, with
+// the ceiling applied by the caller.
+func TestCapBodyHonoursLimit(t *testing.T) {
+	body := []byte(strings.Repeat("z", 4096))
+	if got := capBody(body, 0); len(got) != len(body) {
+		t.Fatalf("capBody with limit 0 returned %d bytes, want %d", len(got), len(body))
+	}
+	if got := capBody(body, 1024); len(got) != 1024 {
+		t.Fatalf("capBody with limit 1024 returned %d bytes, want 1024", len(got))
+	}
+	if got := capBody(body, 1<<20); len(got) != len(body) {
+		t.Fatalf("capBody with an oversized limit truncated: %d bytes", len(got))
+	}
+}
+
+// gatewayForPath must pick the most specific prefix, not whichever gateway
+// the map happens to yield first. Prefixes are not required to be disjoint,
+// and Go randomizes map iteration order, so a first-match-wins scan would
+// route the same path to different gateways across restarts.
+func TestGatewayForPathPrefersLongestPrefix(t *testing.T) {
+	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
+	// Deliberately overlapping prefixes: /std is nested inside /s.
+	cfg.Gateways = map[string]config.GatewayConfig{
+		"s":   {ID: "s", Prefix: "/s", Protocol: config.ProtocolChat, Enabled: true},
+		"std": {ID: "std", Prefix: "/std", Protocol: config.ProtocolResponses, Enabled: true},
+	}
+	p := &Proxy{Config: cfg}
+
+	tests := []struct {
+		path     string
+		gateway  string
+		subpath  string
+		resolved bool
+	}{
+		{path: "/std/chat/completions", gateway: "std", subpath: "/chat/completions", resolved: true},
+		{path: "/std", gateway: "std", subpath: "", resolved: true},
+		{path: "/s/chat/completions", gateway: "s", subpath: "/chat/completions", resolved: true},
+		// Path-component aware: /static must not match /s.
+		{path: "/static/app.js", resolved: false},
+		{path: "/status", resolved: false},
+	}
+	// Repeat because the failure mode is order-dependent and only shows up
+	// for some map iteration orders.
+	for attempt := 0; attempt < 50; attempt++ {
+		for _, test := range tests {
+			gateway, subpath, ok := p.gatewayForPath(test.path)
+			if ok != test.resolved {
+				t.Fatalf("gatewayForPath(%q) resolved=%v, want %v", test.path, ok, test.resolved)
+			}
+			if !test.resolved {
+				continue
+			}
+			if gateway.ID != test.gateway || subpath != test.subpath {
+				t.Fatalf("gatewayForPath(%q) = (%q, %q), want (%q, %q)",
+					test.path, gateway.ID, subpath, test.gateway, test.subpath)
+			}
+		}
+	}
+}
+
+// A request body that cannot be read must leave the same audit trail as the
+// other error paths: a row with only a bare 400 status and an empty error
+// field gives nothing to debug from.
+func TestReadRequestBodyRecordsFailureInLogEntry(t *testing.T) {
+	p := &Proxy{Logger: slog.Default()}
+	failing := &failingBody{}
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/ds/responses", failing)
+	recorder := httptest.NewRecorder()
+	logEntry := store.RequestLog{ID: "req-test"}
+
+	if _, ok := p.readRequestBody(recorder, req, &logEntry, 1024); ok {
+		t.Fatal("readRequestBody reported success for a failing body")
+	}
+	if logEntry.StatusCode != http.StatusBadRequest {
+		t.Fatalf("StatusCode = %d, want %d", logEntry.StatusCode, http.StatusBadRequest)
+	}
+	if logEntry.Error == "" {
+		t.Fatal("Error was not recorded in the log entry")
+	}
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("client status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+}
+
+type failingBody struct{}
+
+func (failingBody) Read([]byte) (int, error) {
+	return 0, fmt.Errorf("simulated read failure")
 }

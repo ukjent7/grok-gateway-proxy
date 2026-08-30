@@ -36,14 +36,81 @@ func ExtractUsage(body []byte, protocol config.Protocol) store.UsageMetrics {
 		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
 			continue
 		}
-		if json.Unmarshal(data, &root) == nil {
-			if metrics := extractUsageFromRoot(root, protocol); metrics.UsagePresent {
+		// Each event needs a fresh map. encoding/json merges into a non-nil
+		// map instead of clearing it, so reusing one across iterations keeps
+		// top-level keys the later event omits. That resurrects an earlier
+		// event's `response` envelope, and since extractUsageFromRoot checks
+		// it before the root-level `usage`, the stale figures win.
+		var event map[string]any
+		if json.Unmarshal(data, &event) == nil {
+			if metrics := extractUsageFromRoot(event, protocol); metrics.UsagePresent {
 				last = metrics
 			}
 		}
 	}
 	return last
 }
+
+// usageTracker accumulates usage metrics from an SSE stream chunk by chunk as
+// the bytes are forwarded, rather than re-scanning a buffer after the fact.
+// The buffered approach reported zero tokens whenever the terminal
+// usage-bearing event fell outside the capture window (the capture is capped)
+// or whenever a single `data:` line exceeded bufio.Scanner's 1 MiB line limit,
+// which stopped the scan outright. Neither can happen here: the terminal event
+// is seen as it flows past, and an incomplete line is carried in tail until
+// the rest arrives, so there is no line-length limit.
+type usageTracker struct {
+	protocol config.Protocol
+	tail     []byte
+	last     store.UsageMetrics
+}
+
+func newUsageTracker(protocol config.Protocol) *usageTracker {
+	return &usageTracker{protocol: protocol}
+}
+
+// observe feeds the next chunk of stream bytes, splitting it into lines.
+func (t *usageTracker) observe(chunk []byte) {
+	buf := chunk
+	if len(t.tail) > 0 {
+		t.tail = append(t.tail, chunk...)
+		buf = t.tail
+	}
+	consumed := 0
+	for {
+		index := bytes.IndexByte(buf[consumed:], '\n')
+		if index < 0 {
+			break
+		}
+		t.observeLine(buf[consumed : consumed+index])
+		consumed += index + 1
+	}
+	// Carry the trailing fragment. buf may alias t.tail here; append writes
+	// forward through copy, which tolerates the overlap.
+	t.tail = append(t.tail[:0], buf[consumed:]...)
+}
+
+func (t *usageTracker) observeLine(line []byte) {
+	data := bytes.TrimSpace(line)
+	if !bytes.HasPrefix(data, []byte("data:")) {
+		return
+	}
+	data = bytes.TrimSpace(data[len("data:"):])
+	if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
+		return
+	}
+	var root map[string]any
+	if json.Unmarshal(data, &root) != nil {
+		return
+	}
+	if metrics := extractUsageFromRoot(root, t.protocol); metrics.UsagePresent {
+		t.last = metrics
+	}
+}
+
+// usage returns the metrics of the last usage-bearing event seen, the same
+// "terminal event wins" rule ExtractUsage applies to buffered bodies.
+func (t *usageTracker) usage() store.UsageMetrics { return t.last }
 
 func extractUsageFromRoot(root map[string]any, protocol config.Protocol) store.UsageMetrics {
 	if response, ok := root["response"].(map[string]any); ok {
@@ -105,7 +172,7 @@ func extractChatUsage(usage map[string]any, result store.UsageMetrics) store.Usa
 	if hitOK && totalOK {
 		result.CacheReadTokens = hit
 		result.CacheWriteTokens = write
-		result.InputTokens = maxInt64(0, total-hit-write)
+		result.InputTokens = max(0, total-hit-write)
 		result.CacheSupported = true
 		result.CacheSource = "chat.prompt_tokens_details"
 		return result
@@ -138,7 +205,7 @@ func extractResponsesUsage(usage map[string]any, result store.UsageMetrics) stor
 		result.CacheWriteTokens = write
 	}
 	if totalOK && hitOK {
-		result.InputTokens = maxInt64(0, total-hit-write)
+		result.InputTokens = max(0, total-hit-write)
 		result.CacheSupported = true
 		result.CacheSource = "responses.input_tokens_details"
 	}
@@ -159,10 +226,6 @@ func firstNestedNumber(m map[string]any, parent, key string) int64 {
 		return 0
 	}
 	return firstNumber(child, key)
-}
-
-func maxInt64(a, b int64) int64 {
-	return numutil.MaxInt64(a, b)
 }
 
 func ParseModel(body []byte) string {

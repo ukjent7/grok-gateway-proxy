@@ -24,9 +24,6 @@ func (a SenseNovaChatAdapter) RejectMessage(path string) string {
 func (SenseNovaChatAdapter) ValidateRequest(body []byte) error {
 	return validateJSONRequest(body, "SenseNova Chat Completions")
 }
-func (SenseNovaChatAdapter) NormalizeError(status int, body []byte) []byte {
-	return normalizeUpstreamError(status, body)
-}
 
 // SenseNova's tool-call history decoder uses function_call for the tool call
 // variant, while the client-facing Chat Completions format uses function.

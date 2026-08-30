@@ -14,6 +14,24 @@ import (
 // sanitizeSenseNovaToolCallHistory) unmarshal and re-marshal the document
 // because they need structural edits that byte-level rewriting cannot express.
 
+// marshalJSONNoEscape marshals v compactly, leaving <, > and & unescaped.
+// encoding/json rewrites them to \u003c / \u003e / \u0026 by default, which
+// inflates every rewritten request body (a bare "<" triples in size) and makes
+// the logged upstream body diverge from the bytes the client actually sent.
+// Both matter for this proxy: prompts are mostly source code, and comparing the
+// two bodies is what the audit log is for. The result goes to a JSON API over
+// the wire and is never embedded in HTML, so dropping the escaping is safe.
+func marshalJSONNoEscape(value any) ([]byte, error) {
+	var out bytes.Buffer
+	encoder := json.NewEncoder(&out)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	// Encoder.Encode appends a trailing newline; Marshal would not.
+	return bytes.TrimRight(out.Bytes(), "\n"), nil
+}
+
 // transformToolCallType rewrites every "type":"from" inside tool_calls arrays
 // to "to", using a JSON-aware walk so unrelated "type" fields are untouched.
 func transformToolCallType(body []byte, from, to string) ([]byte, error) {
@@ -28,11 +46,7 @@ func transformToolCallType(body []byte, from, to string) ([]byte, error) {
 	if !rewriteToolCallTypes(payload, from, to) {
 		return body, nil
 	}
-	result, err := json.Marshal(payload)
-	if err != nil {
-		return nil, err
-	}
-	return result, nil
+	return marshalJSONNoEscape(payload)
 }
 
 // sanitizeSenseNovaToolCallHistory removes incomplete tool-call records from
@@ -115,12 +129,7 @@ func sanitizeSenseNovaToolCallHistory(body []byte) ([]byte, error) {
 	if !changed {
 		return body, nil
 	}
-
-	result, err := json.Marshal(payload)
-	if err != nil {
-		return nil, err
-	}
-	return result, nil
+	return marshalJSONNoEscape(payload)
 }
 
 func validSenseNovaToolCall(call map[string]any) bool {
@@ -349,8 +358,11 @@ func rewriteToolCallTypes(value any, from, to string) bool {
 // stripEmptySenseNovaToolCallDeltaFields removes empty id/name fields that
 // SenseNova repeats on tool-call continuation chunks.
 func stripEmptySenseNovaToolCallDeltaFields(body []byte) ([]byte, error) {
-	// Fast path: only parse if empty fields likely present.
-	if !bytes.Contains(body, []byte(`"id":""`)) && !bytes.Contains(body, []byte(`"name":""`)) {
+	// Fast path: only parse if empty fields likely present. The markers are
+	// matched token-wise rather than as fixed byte strings so that upstream
+	// pretty-printed or otherwise spaced payloads ({"id": ""}) are still
+	// detected; a literal `"id":""` search would silently miss them.
+	if !hasEmptyJSONStringField(body, "id") && !hasEmptyJSONStringField(body, "name") {
 		return body, nil
 	}
 	var payload any
@@ -360,11 +372,34 @@ func stripEmptySenseNovaToolCallDeltaFields(body []byte) ([]byte, error) {
 	if !stripEmptySenseNovaToolCallDeltaFieldsInValue(payload) {
 		return body, nil
 	}
-	result, err := json.Marshal(payload)
-	if err != nil {
-		return nil, err
+	return marshalJSONNoEscape(payload)
+}
+
+// hasEmptyJSONStringField reports whether body contains a JSON member named
+// key whose value is an empty string. Tokens are matched individually and
+// intervening whitespace is skipped, so both {"id":""} and {"id": ""} match.
+// It is a pre-filter for a full parse: false negatives are a correctness bug,
+// false positives only cost an extra unmarshal.
+func hasEmptyJSONStringField(body []byte, key string) bool {
+	quoted := []byte(`"` + key + `"`)
+	rest := body
+	for {
+		idx := bytes.Index(rest, quoted)
+		if idx < 0 {
+			return false
+		}
+		after := rest[idx+len(quoted):]
+		cursor := skipJSONWhitespace(after, 0)
+		if cursor >= len(after) || after[cursor] != ':' {
+			rest = after
+			continue
+		}
+		cursor = skipJSONWhitespace(after, cursor+1)
+		if cursor+1 < len(after) && after[cursor] == '"' && after[cursor+1] == '"' {
+			return true
+		}
+		rest = after
 	}
-	return result, nil
 }
 
 func stripEmptySenseNovaToolCallDeltaFieldsInValue(value any) bool {

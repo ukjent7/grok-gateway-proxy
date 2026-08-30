@@ -12,10 +12,15 @@ import (
 // the standard OpenAI Responses protocol. Grok Build serializes typed request
 // fields from an enum of standard vocabulary, but adds xAI-only extensions on
 // top: the backend-only `stream_tool_calls` option, raw-JSON hosted tools
-// (`x_search`, and a `web_search` entry whose filters can carry
-// `excluded_domains`), and extra `include` values such as
-// `no_inline_citations`. None of these exist in the standard protocol, so a
-// conformant upstream can reject the request outright.
+// (`x_search`), and extra `include` values such as `no_inline_citations`. None
+// of these exist in the standard protocol, so a conformant upstream can reject
+// the request outright.
+//
+// `web_search.filters.excluded_domains` is deliberately not in that list: the
+// standard protocol spells the same capability `blocked_domains`
+// (openai-4.0.51/package/src/responses/openai-responses-api.ts#OpenAIResponsesTool),
+// so the key is renamed instead of dropped, which keeps the caller's intended
+// search scope intact for an upstream that implements it.
 //
 // The request sanitizer strips exactly those extensions and returns the body
 // byte-for-byte when nothing offending is present. The SSE filter drops
@@ -24,16 +29,24 @@ import (
 // frame fails the whole stream client-side).
 //
 // Whitelists in this file are derived from the canonical specs:
-//   - Tool types: openai-4.0.51/src/responses/openai-responses-api.ts#OpenAIResponsesTool
-//                 + async-openai/src/types/responses/{api,response}.rs#Tool
-//   - Include values: openai-4.0.51/src/responses/openai-responses-api.ts#OpenAIResponsesIncludeValue
-//                 = async-openai/src/types/responses/api.rs#IncludeEnum
+//   - Tool types: openai-4.0.51/package/src/responses/openai-responses-api.ts#OpenAIResponsesTool
+//                 + async-openai/src/types/responses/response.rs#Tool
+//   - Include values: openai-4.0.51/package/src/responses/openai-responses-api.ts#OpenAIResponsesIncludeValue
+//                 = async-openai/src/types/responses/response.rs#IncludeEnum
 //   - Stream events: async-openai/src/types/responses/stream.rs#ResponseStreamEvent
-//                 (grok-build's openai-responses-api.ts#openaiResponsesChunkSchema lags behind;
-//                 unknown events are dropped to avoid client deserialization failure).
-// Keep these in sync via `go:generate` from openapi.yaml or the upstream crates.
-
-//go:generate go run ./gen/sanitize -openapi ../../openapi.yaml -out responsesanitize_gen.go
+//   - Client-intercepted events: crates/codegen/xai-grok-sampler/src/client.rs
+//     (raw-JSON hooks that run before typed deserialization)
+//
+// These lists are hand-maintained against the sources above; there is no
+// generator. Two things to know when bumping dependencies:
+//
+//   - grok-build resolves async-openai from a fork (our-forks/async-openai.git
+//     pinned by Cargo.lock), not from the upstream checkout these paths refer
+//     to. If the fork adds event variants, they belong in
+//     responsesStreamEventTypes.
+//   - The two specs drift apart over time. The tool list is the union of both;
+//     the include and stream-event lists have matched exactly so far. Re-diff
+//     rather than assuming.
 
 // standardResponsesToolTypes is the tool `type` vocabulary of the standard
 // Responses protocol (mirroring the Tool enum Grok Build itself serializes
@@ -131,6 +144,22 @@ var responsesStreamEventTypes = map[string]bool{
 	"error":                                        true,
 }
 
+// responsesClientInterceptedEventTypes are events Grok Build consumes through
+// raw-JSON hooks that run *before* typed deserialization, so they never reach
+// the ResponseStreamEvent enum. Unlike the set above, these must be forwarded
+// even though the typed parser cannot deserialize them: the hook swallows them
+// before parsing, so forwarding is safe, whereas dropping them silently
+// disables the feature behind the hook without any error.
+//
+//   - response.doom_loop_check: consumed by is_check_event /
+//     DoomLoopCollector::absorb (crates/codegen/xai-grok-sampler/src/client.rs),
+//     which matches either the SSE `event:` name or the payload `type` and
+//     runs whether or not doom-loop recovery is enabled. Dropping it disabled
+//     doom-loop recovery silently.
+var responsesClientInterceptedEventTypes = map[string]bool{
+	"response.doom_loop_check": true,
+}
+
 // Observability counters for SSE filtering - exported for metrics.
 var (
 	droppedUnknownEventCount atomic.Int64
@@ -147,14 +176,34 @@ func sanitizeMetrics() map[string]int64 {
 	}
 }
 
+// sanitizeMetricsDelta reports what accumulated since `before`. The counters
+// are process-wide, so per-stream observability has to diff them: logging the
+// raw snapshots would print a forever-growing total on every stream once
+// anything had ever been filtered. Counters that did not move are omitted.
+func sanitizeMetricsDelta(before map[string]int64) map[string]int64 {
+	after := sanitizeMetrics()
+	delta := make(map[string]int64, len(after))
+	for key, value := range after {
+		if moved := value - before[key]; moved > 0 {
+			delta[key] = moved
+		}
+	}
+	return delta
+}
+
 // sanitizeResponsesRequest strips xAI-only extensions from a Responses
 // request body so it conforms to the standard protocol. Bodies without any
 // offending field are returned byte-for-byte.
 // Optimization: fast-path byte checks before JSON parsing to avoid allocations.
 func sanitizeResponsesRequest(body []byte) ([]byte, error) {
-	// Fast path: if none of the xAI-only markers are present, avoid JSON parse entirely.
-	// This keeps conformant bodies byte-identical and zero-alloc.
-	hasStreamToolCalls := bytes.Contains(body, []byte("stream_tool_calls"))
+	// Fast path: if none of the xAI-only markers are present, avoid JSON parse
+	// entirely. This keeps conformant bodies byte-identical and zero-alloc.
+	//
+	// Each marker is matched with its surrounding quotes so only a real member
+	// name counts. An unquoted search also matches the same text inside a
+	// value — a user message talking about `stream_tool_calls` — and would
+	// then parse and reserialize a body that needs no changes.
+	hasStreamToolCalls := bytes.Contains(body, []byte(`"stream_tool_calls"`))
 	hasTools := bytes.Contains(body, []byte(`"tools"`))
 	hasInclude := bytes.Contains(body, []byte(`"include"`))
 	if !hasStreamToolCalls && !hasTools && !hasInclude {
@@ -190,11 +239,13 @@ func sanitizeResponsesRequest(body []byte) ([]byte, error) {
 	if !changed {
 		return body, nil
 	}
-	return json.Marshal(payload)
+	return marshalJSONNoEscape(payload)
 }
 
+// webSearchFilters reads only the keys the sanitizer acts on. The rest of a
+// `filters` object (e.g. `allowed_domains`) is never touched: rewriting
+// happens on the raw JSON, so unknown keys survive untouched.
 type webSearchFilters struct {
-	AllowedDomains  []string `json:"allowed_domains"`
 	ExcludedDomains []string `json:"excluded_domains"`
 }
 
@@ -204,11 +255,11 @@ type toolTypeProbe struct {
 }
 
 // sanitizeResponsesTools removes tool entries outside the standard vocabulary
-// and reports whether anything changed. For `web_search` the standard tool
-// has no `excluded_domains` filter: instead of dropping the entire tool and
-// silently widening the search, we now strip only the excluded_domains key
-// and keep the allowed_domains part. This preserves the user's intended
-// search scope while staying conformant.
+// and reports whether anything changed. A `web_search` tool carrying the xAI
+// `filters.excluded_domains` key is not removed: the standard protocol spells
+// the same capability `blocked_domains`, so the key is renamed and the tool
+// kept, preserving the caller's intended search scope. Dropping the tool
+// instead would silently widen the search to unbounded.
 func sanitizeResponsesTools(raw json.RawMessage) (json.RawMessage, bool) {
 	var entries []json.RawMessage
 	if err := json.Unmarshal(raw, &entries); err != nil {
@@ -223,34 +274,34 @@ func sanitizeResponsesTools(raw json.RawMessage) (json.RawMessage, bool) {
 			continue
 		}
 		if probe.Type == "web_search" && probe.Filters != nil && len(probe.Filters.ExcludedDomains) > 0 {
-			// Optimization 2: if the tool has allowed_domains, strip only excluded_domains and keep;
-			// if it only has excluded_domains, drop the whole tool to avoid silently widening to unbounded search.
-			if len(probe.Filters.AllowedDomains) > 0 {
-				if cleaned, ok := stripExcludedDomains(entry); ok {
-					kept = append(kept, cleaned)
-					changed = true
-					continue
-				}
+			if renamed, ok := renameExcludedDomains(entry); ok {
+				kept = append(kept, renamed)
+				changed = true
+				continue
 			}
-			// Pure excluded_domains -> drop (original safe behavior)
-			changed = true
-			continue
 		}
 		kept = append(kept, entry)
 	}
 	if !changed {
 		return raw, false
 	}
-	out, err := json.Marshal(kept)
+	out, err := marshalJSONNoEscape(kept)
 	if err != nil {
 		return raw, false
 	}
 	return out, true
 }
 
-// stripExcludedDomains removes the excluded_domains field from a web_search tool entry
-// while preserving allowed_domains and other fields. Returns the cleaned JSON and true on success.
-func stripExcludedDomains(entry json.RawMessage) (json.RawMessage, bool) {
+// renameExcludedDomains renames the xAI `filters.excluded_domains` key of a
+// web_search tool to the standard `filters.blocked_domains`, preserving every
+// other field. It reports false only when the entry does not carry the key,
+// in which case it must be forwarded untouched.
+//
+// A tool that spells the capability both ways is resolved in favour of
+// `excluded_domains`, the only spelling the caller (Grok Build) emits; the
+// standard spelling is then no longer reachable from its request, so the
+// merged value is the one the caller actually asked for.
+func renameExcludedDomains(entry json.RawMessage) (json.RawMessage, bool) {
 	var tool map[string]json.RawMessage
 	if err := json.Unmarshal(entry, &tool); err != nil {
 		return nil, false
@@ -263,21 +314,18 @@ func stripExcludedDomains(entry json.RawMessage) (json.RawMessage, bool) {
 	if err := json.Unmarshal(filtersRaw, &filters); err != nil {
 		return nil, false
 	}
-	if _, hasExcluded := filters["excluded_domains"]; !hasExcluded {
+	excluded, hasExcluded := filters["excluded_domains"]
+	if !hasExcluded {
 		return nil, false
 	}
 	delete(filters, "excluded_domains")
-	// If filters becomes empty, remove it entirely to stay conformant (unbounded search).
-	if len(filters) == 0 {
-		delete(tool, "filters")
-	} else {
-		cleanedFilters, err := json.Marshal(filters)
-		if err != nil {
-			return nil, false
-		}
-		tool["filters"] = cleanedFilters
+	filters["blocked_domains"] = excluded
+	renamedFilters, err := marshalJSONNoEscape(filters)
+	if err != nil {
+		return nil, false
 	}
-	out, err := json.Marshal(tool)
+	tool["filters"] = renamedFilters
+	out, err := marshalJSONNoEscape(tool)
 	if err != nil {
 		return nil, false
 	}
@@ -303,34 +351,54 @@ func sanitizeResponsesInclude(raw json.RawMessage) (json.RawMessage, bool) {
 	if !changed {
 		return raw, false
 	}
-	out, err := json.Marshal(kept)
+	out, err := marshalJSONNoEscape(kept)
 	if err != nil {
 		return raw, false
 	}
 	return out, true
 }
 
-// isUnknownResponsesEventPayload reports whether a `data:` payload carries a
-// JSON `type` outside the known event vocabulary. Non-JSON and typeless
-// payloads pass through: the proxy does not second-guess frames it cannot
-// classify, and the client fails on them no differently than it would have
-// without the proxy.
+// isUnknownResponsesEventPayload reports whether a `data:` payload is a frame
+// the client cannot deserialize, i.e. one that would fail the whole stream:
+// a JSON object whose `type` is absent or outside the known vocabularies, a
+// valid JSON value that is not an object (async-openai's ResponseStreamEvent
+// is a `#[serde(tag = "type")]` enum with no untagged or catch-all variant, so
+// `null`, arrays, and scalars all fail it), or a malformed object.
+//
+// Non-JSON payloads pass through: `ping` and `[DONE]` are legitimate SSE
+// protocol elements handled by the client's SSE decoder before any typed
+// parsing, and the filter is only ever attached to Responses streams (the
+// chat-completions gateway uses its own transform with no drop predicate).
 func isUnknownResponsesEventPayload(payload []byte) bool {
 	trimmed := bytes.TrimSpace(payload)
 	if len(trimmed) == 0 {
 		return false
 	}
-	// Fast path: short-circuit non-JSON payloads (e.g. "ping", "[DONE]")
-	if trimmed[0] != '{' {
+	if trimmed[0] == '{' {
+		var probe struct {
+			Type string `json:"type"`
+		}
+		// The Unmarshal happens anyway for classification, so rejecting
+		// malformed objects here costs nothing extra: the client cannot parse
+		// them either, and forwarding one would fail the entire stream.
+		if err := json.Unmarshal(trimmed, &probe); err != nil {
+			return true
+		}
+		// probe.Type is "" when the object carries no `type`, which matches
+		// neither vocabulary and is therefore dropped.
+		return !responsesStreamEventTypes[probe.Type] &&
+			!responsesClientInterceptedEventTypes[probe.Type]
+	}
+	// Everything else that IS valid JSON but not an object is equally
+	// undeserializable. The scan is cheap in practice: pings are classified by
+	// isPingPayload before this runs, so per stream only the single [DONE]
+	// sentinel reaches here — and it fails the Unmarshal, passing through.
+	var value any
+	if err := json.Unmarshal(trimmed, &value); err != nil {
 		return false
 	}
-	var probe struct {
-		Type string `json:"type"`
-	}
-	if err := json.Unmarshal(trimmed, &probe); err != nil {
-		return false
-	}
-	return probe.Type != "" && !responsesStreamEventTypes[probe.Type]
+	_, isObject := value.(map[string]any)
+	return !isObject
 }
 
 // newResponsesSSEFilter translates the upstream stream into the event

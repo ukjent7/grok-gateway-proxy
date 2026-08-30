@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"grok-gateway-proxy/internal/config"
@@ -32,8 +33,9 @@ func TestExtractResponsesUsage(t *testing.T) {
 	if !usage.CacheSupported || usage.OutputTokens != 12 || usage.ReasoningTokens != 4 {
 		t.Fatalf("unexpected usage details: %+v", usage)
 	}
-	if usage.HitRate() == nil || *usage.HitRate() != 31.25 {
-		t.Fatalf("unexpected hit rate: %v", usage.HitRate())
+	// 50 cache reads out of 160 prompt tokens.
+	if hitRate := float64(usage.CacheReadTokens) / float64(usage.PromptTokens) * 100; hitRate != 31.25 {
+		t.Fatalf("unexpected hit rate: %v%%", hitRate)
 	}
 }
 
@@ -110,10 +112,102 @@ func TestExtractSSEUsagePrefersTerminalEvent(t *testing.T) {
 	}
 }
 
+// Each event must be decoded into a fresh map. encoding/json merges into an
+// existing map instead of clearing it, so a map reused across iterations
+// keeps top-level keys that later events lack: a stream that opens with
+// envelope-shaped events (response.usage) still carries that stale envelope
+// when the terminal chunk reports usage at the root, and the stale one wins
+// because extractUsageFromRoot checks the envelope first.
+func TestExtractSSEUsageDoesNotLeakAcrossEvents(t *testing.T) {
+	enveloped := mustJSON(t, map[string]any{
+		"type": "response.in_progress",
+		"response": map[string]any{
+			"usage": map[string]any{
+				"prompt_tokens":            10,
+				"completion_tokens":        2,
+				"prompt_cache_hit_tokens":  3,
+				"prompt_cache_miss_tokens": 7,
+			},
+		},
+	})
+	rootLevel := mustJSON(t, map[string]any{
+		"usage": map[string]any{
+			"prompt_tokens":            100,
+			"completion_tokens":        20,
+			"prompt_cache_hit_tokens":  30,
+			"prompt_cache_miss_tokens": 70,
+		},
+	})
+	body := append([]byte("data: "), enveloped...)
+	body = append(body, []byte("\n\ndata: ")...)
+	body = append(body, rootLevel...)
+	body = append(body, []byte("\n\n")...)
+	usage := ExtractUsage(body, config.ProtocolChat)
+	if !usage.UsagePresent || usage.InputTokens != 70 || usage.CacheReadTokens != 30 || usage.OutputTokens != 20 {
+		t.Fatalf("expected the terminal root-level usage to win, got: %+v", usage)
+	}
+}
+
 func TestUsageWithoutCacheFieldsIsUnsupported(t *testing.T) {
 	body := mustJSON(t, map[string]any{"usage": map[string]any{"prompt_tokens": 100, "completion_tokens": 8}})
 	usage := ExtractUsage(body, config.ProtocolChat)
-	if usage.CacheSupported || usage.HitRate() != nil {
+	if usage.CacheSupported || usage.CacheReadTokens != 0 {
 		t.Fatalf("expected unavailable cache metrics: %+v", usage)
+	}
+}
+
+// A single `data:` line past bufio.Scanner's 1 MiB limit used to stop the
+// buffered scan dead, losing every event after it — including the terminal
+// usage event. The tracker carries partial lines instead, so it has no limit.
+func TestUsageTrackerHandlesOversizedLine(t *testing.T) {
+	tracker := newUsageTracker(config.ProtocolResponses)
+	tracker.observe([]byte(`data: {"type":"response.image_generation_call.partial_image","b64":"`))
+	for i := 0; i < 11; i++ {
+		tracker.observe([]byte(strings.Repeat("A", 100000)))
+	}
+	tracker.observe([]byte("\"}\n\n"))
+	tracker.observe([]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":333,"output_tokens":444}}}` + "\n\n"))
+
+	got := tracker.usage()
+	if got.InputTokens != 333 || got.OutputTokens != 444 {
+		t.Fatalf("usage after an oversized line: in=%d out=%d, want 333/444", got.InputTokens, got.OutputTokens)
+	}
+}
+
+// Feed the same stream in different chunkings: line splitting must not depend
+// on where chunk boundaries fall.
+func TestUsageTrackerIsChunkBoundaryAgnostic(t *testing.T) {
+	stream := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":8}}}\n\n"
+
+	whole := newUsageTracker(config.ProtocolResponses)
+	whole.observe([]byte(stream))
+
+	split := newUsageTracker(config.ProtocolResponses)
+	for i := 0; i < len(stream); i += 3 {
+		end := i + 3
+		if end > len(stream) {
+			end = len(stream)
+		}
+		split.observe([]byte(stream[i:end]))
+	}
+
+	if whole.usage() != split.usage() {
+		t.Fatalf("chunking changed usage: whole=%+v split=%+v", whole.usage(), split.usage())
+	}
+	if split.usage().InputTokens != 7 || split.usage().OutputTokens != 8 {
+		t.Fatalf("usage: %+v, want 7/8", split.usage())
+	}
+}
+
+// The terminal event wins even when it is preceded by the all-zero usage
+// object that response.created carries.
+func TestUsageTrackerPrefersTerminalEvent(t *testing.T) {
+	tracker := newUsageTracker(config.ProtocolResponses)
+	tracker.observe([]byte(`data: {"type":"response.created","response":{"usage":{"input_tokens":0,"output_tokens":0}}}` + "\n\n"))
+	tracker.observe([]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":11,"output_tokens":22}}}` + "\n\n"))
+
+	if got := tracker.usage(); got.InputTokens != 11 || got.OutputTokens != 22 {
+		t.Fatalf("usage: %+v, want 11/22", got)
 	}
 }

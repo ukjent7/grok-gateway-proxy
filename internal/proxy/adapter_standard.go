@@ -29,9 +29,6 @@ func (a StandardResponsesAdapter) RejectMessage(path string) string {
 func (StandardResponsesAdapter) ValidateRequest(body []byte) error {
 	return validateJSONRequest(body, "standard Responses")
 }
-func (StandardResponsesAdapter) NormalizeError(status int, body []byte) []byte {
-	return normalizeUpstreamError(status, body)
-}
 
 // TransformRequestBody strips xAI-only request extensions so the upstream
 // receives a standard Responses request.

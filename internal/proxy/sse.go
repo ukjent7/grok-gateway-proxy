@@ -18,6 +18,18 @@ import (
 // event types outside the client's vocabulary). When an event is dropped,
 // the blank line terminating it is consumed as well so the stream stays
 // byte-identical apart from the removed event.
+//
+// That pending skip applies only to the blank line immediately following the
+// drop: any other line clears it. Without that limit, a kept event following a
+// dropped one lost its own terminating blank line, and the client never
+// dispatched it.
+//
+// Dropping an event discards the `event:` line that preceded it, which assumes
+// one `data:` line per event. SSE permits several per event, concatenated with
+// newlines, and then dropping one would leave the remaining lines emitted
+// without their event name. Both Responses dialects this proxy targets emit
+// exactly one, so the assumption holds today; if that ever changes, eventLine
+// has to survive until the terminating blank line instead of being cleared.
 type sseLineTransformer struct {
 	reader        *bufio.Reader
 	pending       bytes.Buffer
@@ -61,6 +73,14 @@ func (r *sseLineTransformer) Read(p []byte) (int, error) {
 			continue
 		}
 		trimmed := bytes.TrimRight(line, "\r\n")
+		// A drop pending from the previous line only ever swallows the blank
+		// line right after it; anything else clears the pending skip so a kept
+		// event keeps its own terminator.
+		skipBlank := r.skipBlank && len(trimmed) == 0
+		r.skipBlank = false
+		if skipBlank {
+			continue
+		}
 		switch {
 		case bytes.HasPrefix(trimmed, []byte("event:")):
 			r.flushEventLine()
@@ -83,13 +103,6 @@ func (r *sseLineTransformer) Read(p []byte) (int, error) {
 			r.flushEventLine()
 			r.pending.Write(r.applyLine(line))
 		default:
-			// Drop the blank line that terminates a dropped ping event so the
-			// stream stays byte-identical apart from the removed event.
-			if r.skipBlank && len(trimmed) == 0 {
-				r.skipBlank = false
-				continue
-			}
-			r.skipBlank = false
 			r.flushEventLine()
 			r.pending.Write(r.applyLine(line))
 		}

@@ -5,7 +5,30 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"grok-gateway-proxy/internal/config"
 )
+
+// The two tables listing the supported gateways — config.DefaultGateways
+// (identity: prefix, protocol, base URL) and gatewayAdapters (behaviour) —
+// are separate literals in separate packages, so adding a gateway can easily
+// update only one of them. That is only caught at request time today, as a
+// 500 from adapterFor. This pins the two together.
+func TestEveryDefaultGatewayHasAnAdapter(t *testing.T) {
+	if len(config.DefaultGateways) == 0 {
+		t.Fatal("config.DefaultGateways is empty")
+	}
+	for id := range config.DefaultGateways {
+		if _, ok := adapterFor(id); !ok {
+			t.Errorf("gateway %q has no entry in gatewayAdapters; requests to it will fail with 500", id)
+		}
+	}
+	for id := range gatewayAdapters {
+		if _, ok := config.DefaultGateways[id]; !ok {
+			t.Errorf("gatewayAdapters has an entry for %q, which is not a known gateway", id)
+		}
+	}
+}
 
 func TestSenseNovaTransformsToolCallTypesWithoutChangingToolDefinitions(t *testing.T) {
 	body := []byte(`{"tools":[{"type":"function","function":{"name":"lookup"}}],"messages":[{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}]}`)
@@ -281,6 +304,62 @@ func TestSenseNovaStreamingToolCallContinuationKeepsIdentity(t *testing.T) {
 	}
 }
 
+// The upstream payload is not required to be compact: pretty-printed or
+// otherwise spaced JSON must be cleaned up just the same. A naive
+// bytes.Contains(`"id":""`) pre-filter silently misses {"id": ""}.
+func TestSenseNovaSpacedToolCallContinuationKeepsIdentity(t *testing.T) {
+	adapter := SenseNovaChatAdapter{}
+	input := "data: { \"choices\": [ { \"delta\": { \"tool_calls\": [ { \"index\": 0, \"id\": \"call-1\", \"type\": \"function\", \"function\": { \"name\": \"lookup\", \"arguments\": \"{\" } } ] }, \"finish_reason\": \"\" } ] }\n\n" +
+		"data: { \"choices\": [ { \"delta\": { \"tool_calls\": [ { \"index\": 0, \"id\": \"\", \"type\": \"function\", \"function\": { \"name\": \"\", \"arguments\": \"x\" } } ] }, \"finish_reason\": \"\" } ] }\n\n"
+	body, err := io.ReadAll(adapter.TransformSSE(strings.NewReader(input)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := string(body)
+	// Whitespace is collapsed so the assertions match regardless of whether
+	// the adapter re-marshals a chunk or forwards it verbatim.
+	compacted := strings.Join(strings.Fields(result), "")
+	if !strings.Contains(compacted, `"id":"call-1"`) || !strings.Contains(compacted, `"name":"lookup"`) {
+		t.Fatalf("initial tool-call identity was lost: %s", result)
+	}
+	if strings.Contains(compacted, `"id":""`) || strings.Contains(compacted, `"name":""`) {
+		t.Fatalf("empty continuation identity fields were forwarded: %s", result)
+	}
+	if !strings.Contains(compacted, `"arguments":"x"`) {
+		t.Fatalf("tool-call argument continuation was changed: %s", result)
+	}
+}
+
+// hasEmptyJSONStringField is the parse pre-filter: it must tolerate
+// whitespace between JSON tokens, including none at all.
+func TestHasEmptyJSONStringField(t *testing.T) {
+	tests := []struct {
+		name  string
+		body  string
+		key   string
+		found bool
+	}{
+		{"compact", `{"id":"","name":"x"}`, "id", true},
+		{"spaced after colon", `{"id": "","name":"x"}`, "id", true},
+		{"spaced around colon", `{"id" : "","name":"x"}`, "id", true},
+		{"newline separated", "{\n  \"id\":\n  \"\",\n  \"name\": \"x\"\n}", "id", true},
+		{"non-empty value", `{"id":"call-1"}`, "id", false},
+		{"missing key", `{"name":""}`, "id", false},
+		{"key as substring", `{"parent_id":""}`, "id", false},
+		{"key not a member", `{"values":["id"]}`, "id", false},
+		{"empty body", ``, "id", false},
+		{"truncated after key", `{"id"`, "id", false},
+		{"second occurrence empty", `{"id":"a","id": ""}`, "id", true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := hasEmptyJSONStringField([]byte(test.body), test.key); got != test.found {
+				t.Fatalf("hasEmptyJSONStringField(%q, %q) = %v, want %v", test.body, test.key, got, test.found)
+			}
+		})
+	}
+}
+
 // Every Responses request sent upstream must conform to the standard
 // protocol: xAI-only extensions are stripped regardless of model, while
 // everything else survives untouched.
@@ -300,11 +379,26 @@ func TestStandardSanitizesResponsesRequestsForAllModels(t *testing.T) {
 			t.Fatalf("non-standard stream_tool_calls survived for %q: %s", model, upstreamBody)
 		}
 		tools := payload["tools"].([]any)
-		if len(tools) != 2 {
-			t.Fatalf("x_search and excluded-domains web_search were not dropped for %q: %s", model, upstreamBody)
+		// x_search is dropped; the excluded-domains web_search survives with
+		// its filter renamed to blocked_domains.
+		if len(tools) != 3 {
+			t.Fatalf("x_search was not dropped, or a standard tool was lost, for %q: %s", model, upstreamBody)
 		}
-		if tools[0].(map[string]any)["type"] != "web_search" || tools[1].(map[string]any)["type"] != "function" {
+		if tools[0].(map[string]any)["type"] != "web_search" ||
+			tools[1].(map[string]any)["type"] != "web_search" ||
+			tools[2].(map[string]any)["type"] != "function" {
 			t.Fatalf("standard tools were not preserved for %q: %s", model, upstreamBody)
+		}
+		if _, exists := tools[0].(map[string]any)["filters"].(map[string]any)["excluded_domains"]; exists {
+			t.Fatalf("excluded_domains survived for %q: %s", model, upstreamBody)
+		}
+		blocked := tools[0].(map[string]any)["filters"].(map[string]any)["blocked_domains"].([]any)
+		if len(blocked) != 1 || blocked[0] != "evil.example" {
+			t.Fatalf("blocklist was not preserved as blocked_domains for %q: %s", model, upstreamBody)
+		}
+		allowed := tools[1].(map[string]any)["filters"].(map[string]any)["allowed_domains"].([]any)
+		if len(allowed) != 1 || allowed[0] != "docs.example" {
+			t.Fatalf("allowed_domains was lost for %q: %s", model, upstreamBody)
 		}
 		include := payload["include"].([]any)
 		if len(include) != 1 || include[0] != "reasoning.encrypted_content" {

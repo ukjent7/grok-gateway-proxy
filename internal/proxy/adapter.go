@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"strconv"
 	"strings"
 
 	"grok-gateway-proxy/internal/config"
@@ -20,7 +19,6 @@ type GatewayAdapter interface {
 	AcceptsPath(path string) bool
 	RejectMessage(path string) string
 	ValidateRequest(body []byte) error
-	NormalizeError(status int, body []byte) []byte
 }
 
 // payloadTransformer is implemented by adapters that need to rewrite the JSON
@@ -66,38 +64,6 @@ func validateJSONRequest(body []byte, protocolName string) error {
 		return fmt.Errorf("%s request body must be valid JSON", protocolName)
 	}
 	return nil
-}
-
-// normalizeUpstreamError converts an upstream error body into the proxy's
-// stable error envelope while keeping the original body under "details" for
-// debugging.
-func normalizeUpstreamError(status int, body []byte) []byte {
-	message := fmt.Sprintf("upstream returned HTTP %d", status)
-	var upstream struct {
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if json.Unmarshal(body, &upstream) == nil && strings.TrimSpace(upstream.Error.Message) != "" {
-		message = upstream.Error.Message
-	}
-	errorBody := map[string]any{
-		"type":    "upstream_error",
-		"message": message,
-		"code":    strconv.Itoa(status),
-	}
-	if len(body) > 0 {
-		if json.Valid(body) {
-			errorBody["details"] = json.RawMessage(body)
-		} else {
-			errorBody["details"] = string(body)
-		}
-	}
-	result, err := json.Marshal(map[string]any{"error": errorBody})
-	if err != nil {
-		return []byte(`{"error":{"type":"upstream_error","message":"upstream request failed"}}`)
-	}
-	return result
 }
 
 // gatewayAdapters maps a gateway ID to its protocol adapter. Adapters are

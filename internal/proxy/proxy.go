@@ -33,20 +33,30 @@ const (
 	// request via the X-Proxy-Timeout header.
 	maxUpstreamTimeout = 30 * time.Minute
 
-	// Optimization 10: idle timeout for streaming responses. Streams use the
-	// request context (no hard deadline) but are aborted if no bytes arrive
-	// within this window, preventing hung connections from leaking goroutines.
-	streamIdleTimeout = 5 * time.Minute
+	// maxCapturedBodySize is the safety ceiling for a single captured column
+	// when body_capture_limit_kb is 0 ("capture everything"). Opting out of
+	// truncation must not mean unbounded: the request side is already capped
+	// by maxRequestBodySize, and without a matching ceiling here one large
+	// upstream response would land in SQLite in full. This mirrors the
+	// request-side limit so both directions are bounded the same way.
+	maxCapturedBodySize int64 = 64 << 20
 )
 
 type Proxy struct {
-	Config           *config.Config
-	Store            *store.Store
-	Logger           *slog.Logger
-	Client           *http.Client // global configured-proxy client; also test fallback
-	DirectClient     *http.Client
-	clientMu         sync.RWMutex
-	ResponseBodySize int64 // override body capture limit (0 = use config or default)
+	Config *config.Config
+	Store  *store.Store
+	Logger *slog.Logger
+	// Client/DirectClient serve non-streaming requests (no transport-level
+	// header cap — the request context bounds them). StreamClient and
+	// StreamDirectClient serve streaming requests (capped header wait against
+	// hung upstreams). Tests may set only Client/DirectClient; ClientFor falls
+	// back to them when the streaming pair is absent.
+	Client             *http.Client
+	DirectClient       *http.Client
+	StreamClient       *http.Client
+	StreamDirectClient *http.Client
+	clientMu           sync.RWMutex
+	ResponseBodySize   int64 // override body capture limit (0 = use config or default)
 }
 
 // statusError carries an HTTP status code alongside the error message.
@@ -83,9 +93,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	gateway, subpath, adapter, resolveErr := p.resolveGateway(r, requestBody)
 	p.populateLogGateway(&logEntry, gateway, subpath, adapter)
 	if resolveErr != nil {
-		if p.handleBlockedModel(w, &logEntry, resolveErr) {
-			return
-		}
 		logEntry.Error = resolveErr.Error()
 		logEntry.StatusCode = statusOf(resolveErr)
 		WriteError(w, logEntry.StatusCode, resolveErr)
@@ -103,7 +110,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := p.forwardUpstreamResponse(w, &logEntry, adapter, gateway, p.ClientFor(gateway), upstreamRequest, bodyLimit); err != nil {
+	if err := p.forwardUpstreamResponse(w, &logEntry, adapter, gateway, p.ClientFor(gateway, logEntry.Stream), upstreamRequest, bodyLimit); err != nil {
 		logEntry.Error = err.Error()
 		if capture.statusCode == 0 {
 			logEntry.StatusCode = statusOf(err)
@@ -140,11 +147,18 @@ func (p *Proxy) finalizeLog(ctx context.Context, logEntry *store.RequestLog, cap
 func (p *Proxy) readRequestBody(w http.ResponseWriter, r *http.Request, logEntry *store.RequestLog, bodyLimit int64) ([]byte, bool) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodySize+1))
 	if err != nil {
+		// The other error paths record what went wrong; a read failure must
+		// not leave an audit row that only shows a bare 400.
+		logEntry.Error = err.Error()
+		logEntry.StatusCode = http.StatusBadRequest
 		WriteError(w, http.StatusBadRequest, err)
 		return nil, false
 	}
 	if int64(len(body)) > maxRequestBodySize {
-		WriteError(w, http.StatusRequestEntityTooLarge, fmt.Errorf("request body exceeds %d bytes", maxRequestBodySize))
+		err := fmt.Errorf("request body exceeds %d bytes", maxRequestBodySize)
+		logEntry.Error = err.Error()
+		logEntry.StatusCode = http.StatusRequestEntityTooLarge
+		WriteError(w, http.StatusRequestEntityTooLarge, err)
 		return nil, false
 	}
 	logEntry.RequestBody = capBody(body, bodyLimit)
@@ -165,20 +179,15 @@ func (p *Proxy) populateLogGateway(logEntry *store.RequestLog, gateway config.Ga
 	}
 }
 
-func (p *Proxy) handleBlockedModel(w http.ResponseWriter, logEntry *store.RequestLog, err error) bool {
-	var blocked *blockedModelError
-	if !errors.As(err, &blocked) {
-		return false
-	}
-	logEntry.Error = blocked.Error()
-	logEntry.StatusCode = http.StatusOK
-	logEntry.Success = true
-	writeBlockedModelResponse(w, logEntry.Model, logEntry.Stream)
-	return true
-}
-
 func (p *Proxy) upstreamContext(r *http.Request, stream bool) (context.Context, context.CancelFunc) {
 	if stream {
+		// Streams deliberately get no hard deadline: reasoning models can run
+		// far past the non-streaming timeout. What bounds a stalled upstream is
+		// the request context cancelling on client disconnect, plus the
+		// transport's ResponseHeaderTimeout for an upstream that never sends
+		// headers at all. A mid-stream stall with the client still attached is
+		// not bounded, so a hung upstream keeps its goroutine until the client
+		// goes away.
 		return r.Context(), func() {}
 	}
 	return context.WithTimeout(r.Context(), p.upstreamTimeout(r))
@@ -203,9 +212,6 @@ func (p *Proxy) resolveGateway(r *http.Request, body []byte) (config.GatewayConf
 	}
 	if err := adapter.ValidateRequest(body); err != nil {
 		return gateway, subpath, adapter, &statusError{status: http.StatusBadRequest, message: err.Error()}
-	}
-	if model := ParseModel(body); isBlockedModel(model) {
-		return gateway, subpath, adapter, &blockedModelError{model: model}
 	}
 	if !gateway.Enabled {
 		return gateway, subpath, adapter, &statusError{status: http.StatusServiceUnavailable, message: fmt.Sprintf("gateway %s is disabled", gateway.ID)}
@@ -253,25 +259,41 @@ func (p *Proxy) buildUpstreamRequest(ctx context.Context, r *http.Request, gatew
 	return upstreamRequest, nil
 }
 
-// SetProxyURL replaces the global proxy client so an address saved in the UI
+// SetProxyURL replaces the global proxy clients so an address saved in the UI
 // applies to subsequent requests without restarting the process.
 func (p *Proxy) SetProxyURL(proxyURL string) {
-	next := NewUpstreamClient(proxyURL)
+	next := newSyncUpstreamClient(proxyURL)
+	nextDirect := newSyncUpstreamClient("")
+	nextStream := NewUpstreamClient(proxyURL)
+	nextStreamDirect := NewUpstreamClient("")
 	p.clientMu.Lock()
-	old := p.Client
-	p.Client = next
+	old := []*http.Client{p.Client, p.DirectClient, p.StreamClient, p.StreamDirectClient}
+	p.Client, p.DirectClient = next, nextDirect
+	p.StreamClient, p.StreamDirectClient = nextStream, nextStreamDirect
 	p.clientMu.Unlock()
-	if old != nil {
-		old.CloseIdleConnections()
+	for _, client := range old {
+		if client != nil {
+			client.CloseIdleConnections()
+		}
 	}
 }
 
-// clientFor selects the global configured-proxy or direct transport according
-// to the gateway setting. Separate clients keep their connection pools isolated.
-func (p *Proxy) ClientFor(gateway config.GatewayConfig) *http.Client {
+// clientFor selects the transport pair matching the gateway's proxy setting
+// and the request mode. Streaming and non-streaming requests use different
+// transports because their header-wait bounds differ; see client.go.
+func (p *Proxy) ClientFor(gateway config.GatewayConfig, stream bool) *http.Client {
 	p.clientMu.RLock()
 	proxyClient, directClient := p.Client, p.DirectClient
+	streamProxyClient, streamDirectClient := p.StreamClient, p.StreamDirectClient
 	p.clientMu.RUnlock()
+	if stream {
+		if gateway.UseProxy && streamProxyClient != nil {
+			return streamProxyClient
+		}
+		if !gateway.UseProxy && streamDirectClient != nil {
+			return streamDirectClient
+		}
+	}
 	if gateway.UseProxy && proxyClient != nil {
 		return proxyClient
 	}
@@ -302,61 +324,64 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 	logEntry.UpstreamResponseStatusCode = upstreamResponse.StatusCode
 	logEntry.UpstreamResponseHeaders = headersJSON(upstreamResponse.Header)
 
-	// Error path: read the full error body, normalize, and write back.
-	// Optimization 10: preserve Retry-After for 429/503 so clients can backoff correctly.
+	// Error path: forward the upstream error body verbatim. Clients key their
+	// retry / rate-limit / request-error handling off `error.type` and
+	// `error.code`, so the proxy must not replace them with its own envelope;
+	// only the audit copy is capped, never the bytes the client receives.
+	// Retry-After reaches the client via copyResponseHeaders below: it is not
+	// a hop-by-hop header, so no special handling is needed for clients to
+	// back off correctly.
 	if upstreamResponse.StatusCode >= http.StatusBadRequest {
-		rawError, readErr := io.ReadAll(io.LimitReader(upstreamResponse.Body, bodyLimit+1))
-		if int64(len(rawError)) > bodyLimit {
-			rawError = rawError[:bodyLimit]
-			logEntry.ResponseTruncated = true
-		}
-		logEntry.UpstreamResponseBody = append([]byte(nil), rawError...)
+		rawError, readErr := io.ReadAll(upstreamResponse.Body)
+		logEntry.ResponseBody = capBody(rawError, bodyLimit)
+		// A limit of zero means "capture everything", so nothing is truncated
+		// no matter how large the body: compare only when a cap is in effect.
+		logEntry.ResponseTruncated = bodyLimit > 0 && int64(len(rawError)) > bodyLimit
+		logEntry.UpstreamResponseBody = logEntry.ResponseBody
 		if readErr != nil {
 			logEntry.Error = readErr.Error()
 		}
-		responseBody := adapter.NormalizeError(upstreamResponse.StatusCode, rawError)
-		logEntry.ResponseBody = responseBody
 		logEntry.Success = false
 		if logEntry.Error == "" {
 			logEntry.Error = fmt.Sprintf("upstream returned HTTP %d", upstreamResponse.StatusCode)
 		}
 		copyResponseHeaders(w.Header(), upstreamResponse.Header)
-		// Ensure Retry-After is explicitly preserved (not filtered as hop-by-hop).
-		if retryAfter := upstreamResponse.Header.Get("Retry-After"); retryAfter != "" {
-			w.Header().Set("Retry-After", retryAfter)
+		// Trust the upstream's own Content-Type (an HTML edge page must not be
+		// announced as JSON); fall back to JSON only when it sent none.
+		if w.Header().Get("Content-Type") == "" {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		writeResponseStatusAndHeaders(w, upstreamResponse)
-		_, _ = w.Write(responseBody)
+		_, _ = w.Write(rawError)
 		return nil
 	}
 
-	// Success path: stream or buffer based on content-type.
+	// Success path: stream or buffer based on content-type. Reached only when
+	// the upstream answered below 400 — the error branch above returns — so
+	// logEntry.StatusCode needs no further status-to-error mapping here.
 	copyResponseHeaders(w.Header(), upstreamResponse.Header)
-	// Preserve rate-limit headers for observability.
-	for _, h := range []string{"Retry-After", "X-RateLimit-Remaining", "X-RateLimit-Reset"} {
-		if v := upstreamResponse.Header.Get(h); v != "" {
-			w.Header().Set(h, v)
-		}
-	}
 	writeResponseStatusAndHeaders(w, upstreamResponse)
 
 	eventStream := isEventStream(upstreamResponse.Header)
-	var responseBody []byte
 	var copyErr error
+	var usage store.UsageMetrics
 
 	if eventStream {
 		rawResponse := newCappedBuffer(bodyLimit)
 		responseReader := io.TeeReader(upstreamResponse.Body, rawResponse)
 		responseReader = transformSSE(adapter, responseReader)
-		// Optimization 10: apply idle timeout to streaming reader to prevent hung connections.
-		responseReader = withIdleTimeout(upstreamRequest.Context(), responseReader, streamIdleTimeout)
-		responseBody, copyErr = copyAndCapture(w, responseReader, true, bodyLimit)
+		// Metering is fed from the live stream: the capture below is capped, so
+		// a stream longer than the capture limit would lose the terminal
+		// usage-bearing event and be billed as zero tokens.
+		tracker := newUsageTracker(gateway.Protocol)
+		filterBefore := sanitizeMetrics()
+		copyErr = copyStream(w, responseReader, tracker)
+		usage = tracker.usage()
 		logEntry.UpstreamResponseBody = append([]byte(nil), rawResponse.Bytes()...)
 		logEntry.ResponseTruncated = rawResponse.truncated
 		// Observability for SSE filtering (optimization 5)
-		if m := sanitizeMetrics(); m["dropped_unknown_events"] > 0 || m["dropped_pings"] > 0 {
-			slog.Debug("sse filter metrics", "metrics", m)
+		if delta := sanitizeMetricsDelta(filterBefore); len(delta) > 0 {
+			slog.Debug("sse filter metrics", "metrics", delta)
 		}
 	} else {
 		// Non-streaming: read the full body so the client always receives
@@ -370,8 +395,7 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 		logEntry.UpstreamResponseBody = append([]byte(nil), rawCapture.Bytes()...)
 		logEntry.ResponseTruncated = rawCapture.truncated
 
-		var transformErr error
-		responseBody, transformErr = transformResponseBody(adapter, rawResponse)
+		responseBody, transformErr := transformResponseBody(adapter, rawResponse)
 		if transformErr != nil {
 			copyErr = transformErr
 			responseBody = rawResponse
@@ -379,17 +403,22 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 		if _, writeErr := w.Write(responseBody); copyErr == nil && writeErr != nil {
 			copyErr = writeErr
 		}
+		// Non-streaming: responseBody is the complete body (not a capped
+		// capture), so the buffered scan sees the usage object.
+		usage = ExtractUsage(responseBody, gateway.Protocol)
 	}
 
 	if copyErr != nil {
 		logEntry.Error = copyErr.Error()
 	}
-	logEntry.Success = upstreamResponse.StatusCode >= 200 && upstreamResponse.StatusCode < 300
+	// A stream that broke mid-flight — or a body the client never received in
+	// full — is not a success, however the upstream answered: recording it as
+	// one counts a truncated answer as a whole one in the dashboard's success
+	// rate and token totals.
+	logEntry.Success = copyErr == nil &&
+		upstreamResponse.StatusCode >= 200 && upstreamResponse.StatusCode < 300
 	if logEntry.Success {
-		logEntry.Usage = ExtractUsage(responseBody, gateway.Protocol)
-	}
-	if logEntry.StatusCode >= 400 && logEntry.Error == "" {
-		logEntry.Error = fmt.Sprintf("upstream returned HTTP %d", logEntry.StatusCode)
+		logEntry.Usage = usage
 	}
 	return copyErr
 }
@@ -409,15 +438,22 @@ func (p *Proxy) upstreamTimeout(r *http.Request) time.Duration {
 	return t
 }
 
+// responseBodyLimit returns the per-column capture cap in bytes. A configured
+// limit of zero means "capture everything" as far as the caller is concerned,
+// so it must not be replaced by the default (which is what "unset" falls back
+// to). It is still bounded by maxCapturedBodySize: that is what keeps an
+// opt-out from turning into an unbounded write to SQLite, and it is the only
+// difference from the configured value — everything below the ceiling is
+// stored whole, exactly as a bare "no truncation" would.
 func (p *Proxy) responseBodyLimit() int64 {
 	if p.ResponseBodySize > 0 {
 		return p.ResponseBodySize
 	}
 	if p.Config != nil {
-		limitKB := p.Config.GetBodyCaptureLimitKB()
-		if limitKB > 0 {
-			return int64(limitKB) << 10
+		if limit := int64(p.Config.GetBodyCaptureLimitKB()) << 10; limit > 0 {
+			return limit
 		}
+		return maxCapturedBodySize
 	}
 	return defaultResponseBodySize
 }
@@ -429,14 +465,30 @@ func capBody(data []byte, limit int64) []byte {
 	return append([]byte(nil), data...)
 }
 
+// gatewayForPath resolves a request path to its gateway. The longest matching
+// prefix wins: prefixes are not guaranteed to be disjoint, and Snapshot
+// returns a map, so returning the first match would make routing depend on
+// Go's randomized map iteration order.
 func (p *Proxy) gatewayForPath(path string) (config.GatewayConfig, string, bool) {
+	var (
+		best    config.GatewayConfig
+		bestLen = -1
+	)
 	for _, gateway := range p.Config.Snapshot() {
-		if path == gateway.Prefix || !strings.HasPrefix(path, gateway.Prefix+"/") {
+		if path != gateway.Prefix && !strings.HasPrefix(path, gateway.Prefix+"/") {
 			continue
 		}
-		return gateway, strings.TrimPrefix(path, gateway.Prefix), true
+		// Ties (two gateways configured with the same prefix) are broken by ID
+		// so the result stays deterministic across restarts.
+		if len(gateway.Prefix) > bestLen ||
+			(len(gateway.Prefix) == bestLen && gateway.ID < best.ID) {
+			best, bestLen = gateway, len(gateway.Prefix)
+		}
 	}
-	return config.GatewayConfig{}, "", false
+	if bestLen < 0 {
+		return config.GatewayConfig{}, "", false
+	}
+	return best, strings.TrimPrefix(path, best.Prefix), true
 }
 
 func (p *Proxy) finishLog(ctx context.Context, logEntry *store.RequestLog, started time.Time) {
@@ -499,20 +551,6 @@ func requestStream(body []byte) bool {
 
 func isEventStream(headers http.Header) bool {
 	return strings.Contains(strings.ToLower(headers.Get("Content-Type")), "text/event-stream")
-}
-
-// withIdleTimeout wraps a reader with an idle timeout: if no Read succeeds
-// within the timeout, Read returns context error. Timer resets on every successful Read.
-// Currently implemented as a lightweight deadline check without per-read goroutine to avoid
-// races on the caller's buffer. The stream's request context is used so cancellation propagates.
-func withIdleTimeout(ctx context.Context, r io.Reader, idle time.Duration) io.Reader {
-	// Fast path: idle timeout is long (5m), so we use a simple deadline reader that
-	// checks ctx and a shared timer. For now we return the original reader and rely on
-	// the request context timeout; the constant exists for future tuning and metrics.
-	// A full per-read goroutine is avoided to prevent buffer races on the hot path.
-	_ = idle
-	_ = ctx
-	return r
 }
 
 func copyResponseHeaders(dst, src http.Header) {

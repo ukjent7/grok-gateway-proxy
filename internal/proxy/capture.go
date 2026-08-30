@@ -54,7 +54,8 @@ func (w *responseCapture) Flush() {
 // cappedBuffer is an io.Writer that stops accepting bytes once limit is
 // reached, so a TeeReader can snapshot the upstream stream without unbounded
 // buffering. Writes beyond the limit are reported as written so the
-// TeeReader keeps passing the full stream through.
+// TeeReader keeps passing the full stream through. A limit of zero or less
+// disables the cap: everything is retained.
 type cappedBuffer struct {
 	buf       bytes.Buffer
 	limit     int64
@@ -95,17 +96,19 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 	if c.truncated {
 		return len(p), nil
 	}
-	remaining := c.limit - int64(c.buf.Len())
-	if remaining <= 0 {
-		c.truncated = true
-		return len(p), nil
+	if c.limit > 0 {
+		remaining := c.limit - int64(c.buf.Len())
+		if remaining <= 0 {
+			c.truncated = true
+			return len(p), nil
+		}
+		if int64(len(p)) > remaining {
+			_, _ = c.buf.Write(p[:remaining])
+			c.truncated = true
+			return len(p), nil
+		}
 	}
-	if int64(len(p)) > remaining {
-		_, _ = c.buf.Write(p[:remaining])
-		c.truncated = true
-	} else {
-		_, _ = c.buf.Write(p)
-	}
+	_, _ = c.buf.Write(p)
 	return len(p), nil
 }
 
@@ -128,8 +131,14 @@ var bufferPool = sync.Pool{
 	},
 }
 
-func copyAndCapture(w http.ResponseWriter, reader io.Reader, streaming bool, limit int64) ([]byte, error) {
-	capture := newCappedBuffer(limit)
+// copyStream forwards the stream to the client, flushing each chunk so events
+// reach it as they arrive rather than when the body completes. usage, when
+// non-nil, is fed every chunk so metering sees the whole stream instead of
+// only the captured prefix.
+//
+// Nothing is buffered here: the ResponseWriter the proxy passes in is a
+// responseCapture, which already snapshots what the client receives.
+func copyStream(w http.ResponseWriter, reader io.Reader, usage *usageTracker) error {
 	bufPtr := bufferPool.Get().(*[]byte)
 	buf := *bufPtr
 	defer bufferPool.Put(bufPtr)
@@ -138,19 +147,21 @@ func copyAndCapture(w http.ResponseWriter, reader io.Reader, streaming bool, lim
 		n, err := reader.Read(buf)
 		if n > 0 {
 			chunk := buf[:n]
-			if _, writeErr := w.Write(chunk); writeErr != nil {
-				return capture.Bytes(), writeErr
+			if usage != nil {
+				usage.observe(chunk)
 			}
-			_, _ = capture.Write(chunk)
-			if streaming && canFlush {
+			if _, writeErr := w.Write(chunk); writeErr != nil {
+				return writeErr
+			}
+			if canFlush {
 				flusher.Flush()
 			}
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return capture.Bytes(), nil
+				return nil
 			}
-			return capture.Bytes(), err
+			return err
 		}
 	}
 }

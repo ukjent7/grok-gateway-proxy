@@ -46,9 +46,6 @@ func (a DeepSeekResponsesAdapter) RejectMessage(path string) string {
 func (DeepSeekResponsesAdapter) ValidateRequest(body []byte) error {
 	return validateJSONRequest(body, "DeepSeek Responses")
 }
-func (DeepSeekResponsesAdapter) NormalizeError(status int, body []byte) []byte {
-	return normalizeUpstreamError(status, body)
-}
 
 // TransformRequestBody sanitizes the request to the standard Responses
 // vocabulary and then applies the DeepSeek-specific cleanups.
@@ -106,7 +103,7 @@ func adaptResponsesRequestForDeepSeek(body []byte) ([]byte, error) {
 	if !changed {
 		return body, nil
 	}
-	return json.Marshal(payload)
+	return marshalJSONNoEscape(payload)
 }
 
 // stripUnsupportedReasoningFields removes `summary` and `encrypted_content`
@@ -142,7 +139,7 @@ func stripUnsupportedReasoningFields(raw json.RawMessage) (json.RawMessage, bool
 			itemChanged = true
 		}
 		if itemChanged {
-			cleaned, err := json.Marshal(fields)
+			cleaned, err := marshalJSONNoEscape(fields)
 			if err != nil {
 				kept = append(kept, item)
 				continue
@@ -156,7 +153,7 @@ func stripUnsupportedReasoningFields(raw json.RawMessage) (json.RawMessage, bool
 	if !changed {
 		return raw, false
 	}
-	out, err := json.Marshal(kept)
+	out, err := marshalJSONNoEscape(kept)
 	if err != nil {
 		return raw, false
 	}

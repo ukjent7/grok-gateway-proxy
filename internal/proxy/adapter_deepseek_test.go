@@ -69,8 +69,9 @@ func TestDeepSeekPassesReasoningEffortThroughUntouched(t *testing.T) {
 	}
 }
 
-// 共享的标准净化在 DeepSeek 网关同样生效：stream_tool_calls、x_search、
-// excluded_domains web_search 一并剔除；无违规字段的请求逐字节透传。
+// 共享的标准净化在 DeepSeek 网关同样生效：stream_tool_calls、x_search 一并
+// 剔除，web_search 的 excluded_domains 重命名为 blocked_domains；无违规字段
+// 的请求逐字节透传。
 func TestDeepSeekAppliesStandardSanitization(t *testing.T) {
 	adapter := DeepSeekResponsesAdapter{}
 	body := []byte(`{"model":"deepseek-v4-flash","stream_tool_calls":true,` +
