@@ -133,8 +133,7 @@ func DefaultConfig(path string) *Config {
 //
 // Precedence (highest to lowest): explicit flag/env > config file value >
 // built-in default (7 days). Passing nil means "no explicit value", so the
-// file value (or the default) applies. A nil value is preserved on the next
-// Save so an explicit runtime value is only made permanent if you also Save.
+// file value (or the default) applies.
 func LoadConfig(path string, logRetentionDays *int) (*Config, error) {
 	cfg := DefaultConfig(path)
 
@@ -228,14 +227,25 @@ func (c *Config) setBodyCaptureLimit(kb int) error {
 	return nil
 }
 
+// Save persists the config to disk. It takes the write lock, not a read one:
+// saveLocked serializes the in-memory config, and other goroutines mutate
+// those fields under the same write lock, so a read lock would allow a torn
+// snapshot (e.g. one gateway entry from before a concurrent edit).
 func (c *Config) Save() error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.saveLocked()
 }
 
-// saveLocked persists the config to disk. The caller must hold at least a read
-// lock on c.mu.
+// saveLocked persists the config to disk, writing to a uniquely named temp
+// file and renaming it into place so readers never observe a partially
+// written config. The caller must hold c.mu (write lock).
+//
+// The temp name is randomized rather than a fixed <path>.tmp: a fixed name is
+// shared state, so a concurrent writer (another Save, or an external tool)
+// could truncate it mid-write and leave the rename publishing someone else's
+// bytes. A unique name also means a crashed save leaves behind garbage that
+// the next save simply ignores, instead of a .tmp file the next save reuses.
 func (c *Config) saveLocked() error {
 	if err := c.validateLocked(); err != nil {
 		return err
@@ -258,14 +268,30 @@ func (c *Config) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(c.ConfigPath), 0o700); err != nil {
+	dir := filepath.Dir(c.ConfigPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	tmp := c.ConfigPath + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0o600); err != nil {
+	// CreateTemp applies 0o600 to the file it creates.
+	tmp, err := os.CreateTemp(dir, filepath.Base(c.ConfigPath)+".*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, c.ConfigPath)
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(append(b, '\n')); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, c.ConfigPath); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 func ValidateConfig(listenAddr string, gateways map[string]GatewayConfig) error {
@@ -350,6 +376,11 @@ type GatewayPatch struct {
 	LegacyUseSystemProxy     *bool     `json:"use_system_proxy"`
 }
 
+// ErrUnknownGateway reports a gateway id that has no configuration. Callers
+// match it with errors.Is to map the failure to a 404 instead of a string
+// comparison on the message.
+var ErrUnknownGateway = errors.New("unknown gateway")
+
 // PatchGateway applies a partial update to a single gateway and persists the
 // result. Unknown ids and invalid candidate values are rejected.
 func (c *Config) PatchGateway(id string, patch GatewayPatch) (GatewayConfig, error) {
@@ -358,7 +389,7 @@ func (c *Config) PatchGateway(id string, patch GatewayPatch) (GatewayConfig, err
 
 	current, ok := c.Gateways[id]
 	if !ok {
-		return GatewayConfig{}, fmt.Errorf("unknown gateway %q", id)
+		return GatewayConfig{}, fmt.Errorf("%w %q", ErrUnknownGateway, id)
 	}
 	gateway := current
 	if patch.Name != nil {
