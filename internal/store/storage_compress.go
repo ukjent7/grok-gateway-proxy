@@ -7,6 +7,9 @@ import (
 	"io"
 )
 
+// compressedColumns are the text/blob columns that benefit from gzip
+// compression. Bodies are the dominant space consumers (JSON/SSE text
+// compresses 5-10x); headers are smaller but also highly compressible.
 var compressedColumns = []string{
 	"request_body", "upstream_body", "upstream_response_body", "response_body",
 	"request_headers", "upstream_headers", "upstream_response_headers", "response_headers",
@@ -41,6 +44,9 @@ func gunzipBytes(data []byte) ([]byte, error) {
 	defer gr.Close()
 	return io.ReadAll(gr)
 }
+
+// gzipString compresses a header JSON string. Returns empty bytes for empty
+// input so no compression overhead is added for missing fields.
 func gzipString(s string) ([]byte, error) {
 	if s == "" {
 		return []byte{}, nil
@@ -74,6 +80,10 @@ func decompressBody(data []byte) []byte {
 	return decompressed
 }
 
+// compressExistingRows compresses all body and header columns for rows that
+// were written before transparent compression (schema_version < 3). A row is
+// only updated where compression actually saved space, so re-running this is a
+// no-op on already-compressed data.
 func (s *Store) compressExistingRows() error {
 	for _, column := range compressedColumns {
 		if err := s.compressColumn(column); err != nil {
@@ -89,50 +99,19 @@ func (s *Store) compressColumn(column string) error {
 	if err != nil || !exists {
 		return err
 	}
-	rows, err := s.db.Query(fmt.Sprintf(`SELECT id, %s FROM request_logs WHERE length(%s) > 0`, column, column))
-	if err != nil {
-		return err
-	}
-	type pendingUpdate struct {
-		id  string
-		val []byte
-	}
-	var updates []pendingUpdate
-	for rows.Next() {
-		var id string
-		var raw []byte
-		if err := rows.Scan(&id, &raw); err != nil {
-			rows.Close()
-			return err
-		}
+	return s.batchRewriteColumn(column, fmt.Sprintf(`AND length(%s) > 0`, column), func(raw []byte) ([]byte, bool, error) {
 		// Skip already-compressed rows (the magic prefix).
 		if bytes.HasPrefix(raw, []byte(compressedMagic)) {
-			continue
+			return nil, false, nil
 		}
 		compressed, err := gzipBytes(raw)
 		if err != nil {
-			rows.Close()
-			return err
+			return nil, false, err
 		}
 		// Only update if compression actually saved space.
-		if len(compressed) < len(raw) {
-			updates = append(updates, pendingUpdate{id: id, val: compressed})
+		if len(compressed) >= len(raw) {
+			return nil, false, nil
 		}
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	for _, update := range updates {
-		if _, err := s.db.Exec(
-			fmt.Sprintf(`UPDATE request_logs SET %s = ? WHERE id = ?`, column),
-			update.val, update.id,
-		); err != nil {
-			return err
-		}
-	}
-	return nil
+		return compressed, true, nil
+	})
 }

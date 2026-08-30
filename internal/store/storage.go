@@ -43,9 +43,7 @@ func parseTimestamp(s string) time.Time {
 	return time.Time{}
 }
 
-// compressedColumns are the text/blob columns that benefit from gzip
-// compression. Bodies are the dominant space consumers (JSON/SSE text
-// compresses 5-10x); headers are smaller but also highly compressible.
+// Store is the SQLite-backed audit log.
 type Store struct {
 	db *sql.DB
 }
@@ -92,32 +90,72 @@ func buildRequestLogInsertSQL() string {
 	return "INSERT INTO request_logs (" + strings.Join(requestLogInsertColumns, ", ") + ") VALUES (" + strings.Join(placeholders, ", ") + ")"
 }
 
+// parallelCompressThreshold is the total captured size at which compressing
+// the columns concurrently starts to pay for itself. Below it, eight
+// goroutines plus eight gzip writers cost more than the compression itself —
+// which is the common case, since most requests carry small header blobs and
+// empty upstream/response fields.
+const parallelCompressThreshold = 32 << 10
+
+// compressibleColumns are the eight captured columns, in the order the insert
+// statement expects them.
+func compressibleColumns(log RequestLog) [8]struct {
+	name  string
+	value []byte
+} {
+	return [8]struct {
+		name  string
+		value []byte
+	}{
+		{"request_headers", []byte(log.RequestHeaders)},
+		{"upstream_headers", []byte(log.UpstreamHeaders)},
+		{"upstream_response_headers", []byte(log.UpstreamResponseHeaders)},
+		{"response_headers", []byte(log.ResponseHeaders)},
+		{"request_body", log.RequestBody},
+		{"upstream_body", log.UpstreamBody},
+		{"upstream_response_body", log.UpstreamResponseBody},
+		{"response_body", log.ResponseBody},
+	}
+}
+
 func (s *Store) Insert(ctx context.Context, log RequestLog) error {
-	// Optimization 9: parallel gzip compression for 8 columns.
-	// Bodies are the dominant cost; compressing them concurrently cuts insert latency ~3x.
 	type gzipResult struct {
 		data []byte
 		err  error
 	}
-	results := make([]gzipResult, 8)
-	var wg sync.WaitGroup
-	wg.Add(8)
-	go func() { defer wg.Done(); results[0].data, results[0].err = gzipString(log.RequestHeaders) }()
-	go func() { defer wg.Done(); results[1].data, results[1].err = gzipString(log.UpstreamHeaders) }()
-	go func() { defer wg.Done(); results[2].data, results[2].err = gzipString(log.UpstreamResponseHeaders) }()
-	go func() { defer wg.Done(); results[3].data, results[3].err = gzipString(log.ResponseHeaders) }()
-	go func() { defer wg.Done(); results[4].data, results[4].err = gzipBytes(log.RequestBody) }()
-	go func() { defer wg.Done(); results[5].data, results[5].err = gzipBytes(log.UpstreamBody) }()
-	go func() { defer wg.Done(); results[6].data, results[6].err = gzipBytes(log.UpstreamResponseBody) }()
-	go func() { defer wg.Done(); results[7].data, results[7].err = gzipBytes(log.ResponseBody) }()
-	wg.Wait()
+	columns := compressibleColumns(log)
+	results := make([]gzipResult, len(columns))
+	compress := func(i int) {
+		results[i].data, results[i].err = gzipBytes(columns[i].value)
+	}
+
+	var total int
+	for i := range columns {
+		total += len(columns[i].value)
+	}
+	if total >= parallelCompressThreshold {
+		// Bodies are the dominant cost; compressing them concurrently cuts
+		// insert latency roughly 3x once there is real data to work on.
+		var wg sync.WaitGroup
+		wg.Add(len(columns))
+		for i := range columns {
+			go func(i int) {
+				defer wg.Done()
+				compress(i)
+			}(i)
+		}
+		wg.Wait()
+	} else {
+		for i := range columns {
+			compress(i)
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	for i, r := range results {
 		if r.err != nil {
-			names := []string{"request_headers", "upstream_headers", "upstream_response_headers", "response_headers", "request_body", "upstream_body", "upstream_response_body", "response_body"}
-			return fmt.Errorf("compress %s: %w", names[i], r.err)
+			return fmt.Errorf("compress %s: %w", columns[i].name, r.err)
 		}
 	}
 	compressedReqHeaders, compressedUpHeaders, compressedUpRespHeaders, compressedRespHeaders := results[0].data, results[1].data, results[2].data, results[3].data
@@ -141,8 +179,8 @@ func (s *Store) Insert(ctx context.Context, log RequestLog) error {
 	return err
 }
 
-// gzipString compresses a header JSON string. Returns empty bytes for empty
-// input so no compression overhead is added for missing fields.
+// List returns summary rows (no bodies or headers) matching filter, newest
+// first. Summaries are enough for the log table; Get loads the full row.
 func (s *Store) List(ctx context.Context, filter LogFilter) ([]RequestLog, error) {
 	where, args := buildLogFilter(filter)
 	query := `SELECT id, started_at, gateway_id, gateway_name, prefix,
@@ -157,7 +195,10 @@ FROM request_logs` + where + ` ORDER BY started_at DESC LIMIT ? OFFSET ?`
 		return nil, err
 	}
 	defer rows.Close()
-	var result []RequestLog
+	// Non-nil so an empty page marshals as [] rather than null: callers
+	// iterate the result, and the API hands it straight to JSON. No capacity
+	// hint — Limit is caller-supplied and unbounded here.
+	result := []RequestLog{}
 	for rows.Next() {
 		log, err := scanSummary(rows)
 		if err != nil {
@@ -327,17 +368,38 @@ func (s *Store) CheckpointWAL(ctx context.Context) error {
 // Vacuum rebuilds the database file, reclaiming space left behind by deleted
 // rows. This is the only way to actually shrink the .db file after large
 // DELETEs — SQLite's free-list keeps the pages internally but never returns
-// them to the filesystem. Runs in a transaction so it is atomic.
+// them to the filesystem.
+//
+// SQLite performs the rebuild atomically on its own, but refuses to VACUUM
+// from inside a transaction, so this must never be called within one. It also
+// needs exclusive use of the database: the pool is capped at a single
+// connection, so every other query — including the audit insert on the request
+// path — waits for it, and gives up after busy_timeout. Call it off the
+// request path and only when there is space worth reclaiming.
 func (s *Store) Vacuum(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, "VACUUM")
 	return err
 }
 
-// compressExistingRows compresses all body and header columns for rows that
-// were written before transparent compression (schema_version < 3). Rows are
-// processed in batches to avoid holding the full table in memory. A row is
-// only updated if at least one column actually changed size, so re-running
-// this is a no-op on already-compressed data.
+// ReclaimSpace shrinks the database file after rows have been deleted:
+// CheckpointWAL folds the WAL back into the main file, then VACUUM returns the
+// freed pages to the filesystem. Both steps are needed — a checkpoint alone
+// leaves the pages on SQLite's free-list, and the .db file never shrinks.
+//
+// It holds the single pooled connection for the whole rebuild, so call it off
+// the request path and only when there is space worth reclaiming.
+func (s *Store) ReclaimSpace(ctx context.Context) error {
+	if err := s.Vacuum(ctx); err != nil {
+		return fmt.Errorf("vacuum: %w", err)
+	}
+	if err := s.CheckpointWAL(ctx); err != nil {
+		return fmt.Errorf("checkpoint wal: %w", err)
+	}
+	return nil
+}
+
+// Delete removes logs started before `before`, or every row when it is nil,
+// and reports how many rows went.
 func (s *Store) Delete(ctx context.Context, before *time.Time) (int64, error) {
 	var result sql.Result
 	var err error
@@ -379,23 +441,29 @@ func buildLogFilter(filter LogFilter) (string, []any) {
 		args = append(args, "%"+escaped+"%")
 	}
 	if filter.Status != "" {
-		switch strings.ToLower(filter.Status) {
+		switch status := strings.ToLower(filter.Status); status {
 		case "success":
 			conditions = append(conditions, "success = 1")
 		case "failure":
 			conditions = append(conditions, "success = 0")
 		default:
-			if strings.HasSuffix(filter.Status, "xx") && len(filter.Status) == 3 {
-				prefix := strings.TrimSuffix(filter.Status, "xx")
-				if _, err := strconv.Atoi(prefix); err == nil {
+			if strings.HasSuffix(status, "xx") && len(status) == 3 {
+				if base, err := strconv.Atoi(strings.TrimSuffix(status, "xx")); err == nil {
 					conditions = append(conditions, "status_code >= ? AND status_code < ?")
-					base, _ := strconv.Atoi(prefix)
 					args = append(args, base*100, (base+1)*100)
+					break
 				}
-			} else if status, err := strconv.Atoi(filter.Status); err == nil {
-				conditions = append(conditions, "status_code = ?")
-				args = append(args, status)
 			}
+			if code, err := strconv.Atoi(status); err == nil {
+				conditions = append(conditions, "status_code = ?")
+				args = append(args, code)
+				break
+			}
+			// An unrecognized status is not expressible as a condition. It
+			// must narrow the result to nothing rather than fall through
+			// unfiltered: the caller believes it is looking at a subset, and
+			// silently returning every row corrupts counts and hit rates.
+			conditions = append(conditions, "1=0")
 		}
 	}
 	if filter.From != nil {

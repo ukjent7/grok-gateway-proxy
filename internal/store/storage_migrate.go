@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"strconv"
 
 	"grok-gateway-proxy/internal/redact"
@@ -84,6 +85,20 @@ const currentSchemaVersion = 4
 // credentials that may have been stored before write-time header
 // sanitization existed. The schema_version marker in proxy_meta makes each
 // migration run exactly once per database.
+//
+// The steps below are deliberately NOT wrapped in a single transaction: some
+// of them rewrite the whole table in batches, and holding one write
+// transaction across every batch would block readers for the entire
+// migration. That makes each step's idempotence a load-bearing contract
+// rather than a nice-to-have:
+//
+//   - every step must be safe to re-run from scratch (each is a conditional
+//     UPDATE or a value-preserving rewrite, never an unconditional transform);
+//   - schema_version is stamped only after all steps have succeeded.
+//
+// Together these mean an interrupted migration (crash, kill, disk full) simply
+// re-runs from the beginning on the next startup and converges. If you add a
+// step here, preserve both properties and bump currentSchemaVersion.
 func (s *Store) migrateDataIfNeeded() error {
 	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS proxy_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`); err != nil {
 		return err
@@ -133,39 +148,117 @@ WHERE client_response_status_code = 0 OR upstream_response_status_code = 0
 	return err
 }
 
-func (s *Store) normalizeTimestamps() error {
-	rows, err := s.db.Query(`SELECT id, started_at FROM request_logs WHERE length(started_at) < 30`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	type pendingTimeUpdate struct {
-		id        string
-		startedAt string
-	}
-	var updates []pendingTimeUpdate
-	for rows.Next() {
-		var id, raw string
-		if err := rows.Scan(&id, &raw); err != nil {
+// batchRewriteColumn rewrites one column of every matching row, handing each
+// row's current value to rewrite, which reports the replacement and whether it
+// differs. Rows whose rewrite reports no change are left alone.
+//
+// Rows are read in bounded batches and each batch is committed as a single
+// transaction. Reading the whole table first pins every candidate row (and its
+// rewritten value) in memory at once, while issuing one UPDATE per row costs a
+// transaction — and under WAL an fsync — per row. Paging on the primary key
+// keeps the scan indexed, so the total cost stays linear in the row count.
+//
+// column and where are interpolated into SQL and must be compile-time
+// constants from this file; neither ever carries caller-supplied text.
+// rewrite reports the replacement value, whether it differs from the original,
+// or an error, which aborts the whole migration.
+func (s *Store) batchRewriteColumn(column, where string, rewrite func(value []byte) ([]byte, bool, error)) error {
+	const batchSize = 256
+	lastID := ""
+	for {
+		nextID, exhausted, err := s.rewriteColumnBatch(column, where, lastID, batchSize, rewrite)
+		if err != nil {
 			return err
 		}
-		t := parseTimestamp(raw)
-		if !t.IsZero() {
-			updates = append(updates, pendingTimeUpdate{id: id, startedAt: formatTimestamp(t)})
+		if exhausted {
+			return nil
 		}
+		lastID = nextID
+	}
+}
+
+// rewriteColumnBatch applies one batch and reports the last id it saw and
+// whether that batch was the final one.
+func (s *Store) rewriteColumnBatch(column, where, lastID string, batchSize int, rewrite func([]byte) ([]byte, bool, error)) (string, bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", true, err
+	}
+	// Rollback after a successful commit is a no-op returning ErrTxDone; the
+	// only reason to call it is the early returns above.
+	defer func() { _ = tx.Rollback() }()
+
+	// The cursor cannot advance by OFFSET: an open Rows holds the single
+	// pooled connection, so the UPDATEs have to wait for it to be closed.
+	rows, err := tx.Query(
+		fmt.Sprintf(`SELECT id, %s FROM request_logs WHERE id > ? %s ORDER BY id LIMIT ?`, column, where),
+		lastID, batchSize,
+	)
+	if err != nil {
+		return "", true, err
+	}
+	type pendingUpdate struct {
+		id    string
+		value []byte
+	}
+	var updates []pendingUpdate
+	var scanned int
+	var last string
+	for rows.Next() {
+		var id string
+		var raw []byte
+		if err := rows.Scan(&id, &raw); err != nil {
+			rows.Close()
+			return "", true, err
+		}
+		rewritten, changed, err := rewrite(raw)
+		if err != nil {
+			rows.Close()
+			return "", true, fmt.Errorf("rewrite %s of %s: %w", column, id, err)
+		}
+		if changed {
+			updates = append(updates, pendingUpdate{id: id, value: rewritten})
+		}
+		last = id
+		scanned++
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		rows.Close()
+		return "", true, err
 	}
 	if err := rows.Close(); err != nil {
-		return err
+		return "", true, err
 	}
-	for _, update := range updates {
-		if _, err := s.db.Exec(`UPDATE request_logs SET started_at = ? WHERE id = ?`, update.startedAt, update.id); err != nil {
-			return err
+	if len(updates) > 0 {
+		statement, err := tx.Prepare(fmt.Sprintf(`UPDATE request_logs SET %s = ? WHERE id = ?`, column))
+		if err != nil {
+			return "", true, err
+		}
+		defer statement.Close()
+		for _, update := range updates {
+			if _, err := statement.Exec(update.value, update.id); err != nil {
+				return "", true, err
+			}
 		}
 	}
-	return nil
+	if err := tx.Commit(); err != nil {
+		return "", true, err
+	}
+	return last, scanned < batchSize, nil
+}
+
+func (s *Store) normalizeTimestamps() error {
+	return s.batchRewriteColumn("started_at", `AND length(started_at) < 30`, func(raw []byte) ([]byte, bool, error) {
+		t := parseTimestamp(string(raw))
+		if t.IsZero() {
+			return nil, false, nil
+		}
+		normalized := formatTimestamp(t)
+		if normalized == string(raw) {
+			return nil, false, nil
+		}
+		return []byte(normalized), true, nil
+	})
 }
 
 func (s *Store) addColumnIfMissing(name, definition string) error {
@@ -222,46 +315,23 @@ func (s *Store) scrubStoredHeaderCredentials() error {
 		if !exists {
 			continue
 		}
-		rows, err := s.db.Query(`SELECT id, ` + column + ` FROM request_logs WHERE ` + column + ` != ''`)
-		if err != nil {
-			return err
-		}
-		type pendingUpdate struct {
-			id    string
-			value []byte
-		}
-		var updates []pendingUpdate
-		for rows.Next() {
-			var id string
-			var raw []byte
-			if err := rows.Scan(&id, &raw); err != nil {
-				rows.Close()
-				return err
-			}
+		err = s.batchRewriteColumn(column, `AND `+column+` != ''`, func(raw []byte) ([]byte, bool, error) {
 			// Decompress in case a partial compression migration left rows
 			// compressed while version was not yet stamped.
 			text := gunzipString(raw)
-			if redacted := redact.RedactStoredHeaders(text); redacted != text {
-				// Re-compress the redacted value before storing.
-				compressed, err := gzipString(redacted)
-				if err != nil {
-					rows.Close()
-					return err
-				}
-				updates = append(updates, pendingUpdate{id: id, value: compressed})
+			redacted := redact.RedactStoredHeaders(text)
+			if redacted == text {
+				return nil, false, nil
 			}
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return err
-		}
-		if err := rows.Close(); err != nil {
-			return err
-		}
-		for _, update := range updates {
-			if _, err := s.db.Exec(`UPDATE request_logs SET `+column+` = ? WHERE id = ?`, update.value, update.id); err != nil {
-				return err
+			// Re-compress the redacted value before storing.
+			compressed, err := gzipString(redacted)
+			if err != nil {
+				return nil, false, err
 			}
+			return compressed, true, nil
+		})
+		if err != nil {
+			return err
 		}
 	}
 	return nil

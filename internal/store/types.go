@@ -19,14 +19,6 @@ type UsageMetrics struct {
 	UsagePresent     bool   `json:"usage_present"`
 }
 
-func (u UsageMetrics) HitRate() *float64 {
-	if !u.CacheSupported || u.PromptTokens <= 0 {
-		return nil
-	}
-	rate := float64(u.CacheReadTokens) / float64(u.PromptTokens) * 100
-	return &rate
-}
-
 type RequestLog struct {
 	ID                         string          `json:"id"`
 	StartedAt                  time.Time       `json:"started_at"`

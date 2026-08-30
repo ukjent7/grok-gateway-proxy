@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"math"
 	"path/filepath"
 	"strings"
@@ -230,6 +231,118 @@ VALUES ('legacy-1', '2026-01-01T00:00:00Z', 've', 'Vercel AI Gateway', '/ve', 'r
 	}
 }
 
+// Data migrations page through request_logs in bounded batches on the primary
+// key, so they must keep advancing past a batch that produced no updates, and
+// must not stop after the first batch. 300 rows is more than one batch.
+func TestMigrationsRewriteRowsBeyondFirstBatch(t *testing.T) {
+	const rows = 300
+
+	// shortTimestamp makes started_at narrower than the 30-char fixed-width
+	// format, which is what the timestamp migration looks for.
+	shortTimestamp := "2026-01-01T00:00:00Z"
+	fullTimestamp := formatTimestamp(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+
+	cases := []struct {
+		name string
+		// timestampFor decides which rows need rewriting.
+		timestampFor func(index int) string
+	}{
+		{name: "every row needs rewriting", timestampFor: func(int) string { return shortTimestamp }},
+		{
+			name: "only the last row needs rewriting",
+			timestampFor: func(index int) string {
+				if index == rows-1 {
+					return shortTimestamp
+				}
+				return fullTimestamp
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "proxy.db")
+			legacy, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			legacy.SetMaxOpenConns(1)
+			if _, err := legacy.Exec(`PRAGMA journal_mode=WAL;`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := legacy.Exec(`
+CREATE TABLE request_logs (
+    id TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    gateway_id TEXT NOT NULL,
+    gateway_name TEXT NOT NULL,
+    prefix TEXT NOT NULL,
+    ingress_protocol TEXT NOT NULL,
+    upstream_protocol TEXT NOT NULL,
+    model TEXT NOT NULL,
+    request_path TEXT NOT NULL,
+    upstream_url TEXT NOT NULL,
+    method TEXT NOT NULL,
+    status_code INTEGER NOT NULL DEFAULT 0,
+    success INTEGER NOT NULL DEFAULT 0,
+    stream INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    request_headers TEXT NOT NULL,
+    request_body BLOB NOT NULL,
+    upstream_headers TEXT NOT NULL,
+    upstream_body BLOB NOT NULL,
+    response_headers TEXT NOT NULL,
+    response_body BLOB NOT NULL,
+    error TEXT NOT NULL DEFAULT '',
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_supported INTEGER NOT NULL DEFAULT 0,
+    usage_present INTEGER NOT NULL DEFAULT 0,
+    cache_source TEXT NOT NULL DEFAULT ''
+)`); err != nil {
+				t.Fatal(err)
+			}
+			statement, err := legacy.Prepare(`INSERT INTO request_logs (id, started_at, gateway_id, gateway_name, prefix, ingress_protocol, upstream_protocol, model, request_path, upstream_url, method, request_headers, request_body, upstream_headers, upstream_body, response_headers, response_body) VALUES (?, ?, 'ds', 'DeepSeek', '/ds', 'responses', 'responses', 'm', '/responses', 'https://example.test', 'POST', '{}', X'7b7d', '{}', X'7b7d', '{}', X'7b7d')`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for index := 0; index < rows; index++ {
+				// Zero-padded so lexicographic id order matches insertion order.
+				if _, err := statement.Exec(fmt.Sprintf("legacy-%03d", index), tc.timestampFor(index)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			statement.Close()
+			legacy.Close()
+
+			store, err := OpenStore(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+
+			var remaining int
+			if err := store.db.QueryRow(`SELECT COUNT(*) FROM request_logs WHERE length(started_at) < 30`).Scan(&remaining); err != nil {
+				t.Fatal(err)
+			}
+			if remaining != 0 {
+				t.Fatalf("%d rows were still in the narrow timestamp format after migration", remaining)
+			}
+			// Rewriting must not have lost or duplicated a row.
+			var total int
+			if err := store.db.QueryRow(`SELECT COUNT(*) FROM request_logs`).Scan(&total); err != nil {
+				t.Fatal(err)
+			}
+			if total != rows {
+				t.Fatalf("row count = %d, want %d", total, rows)
+			}
+		})
+	}
+}
+
 func TestStoreCountRespectsFilters(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
 	if err != nil {
@@ -261,6 +374,14 @@ func TestStoreCountRespectsFilters(t *testing.T) {
 		{name: "status success", filter: LogFilter{Status: "success"}, want: 2},
 		{name: "status failure", filter: LogFilter{Status: "failure"}, want: 1},
 		{name: "time range", filter: LogFilter{From: ptrTime(now.Add(-90 * time.Minute))}, want: 2},
+		// A status we cannot express must match nothing: falling through
+		// unfiltered would report the whole table as a subset, which silently
+		// corrupts every count and rate derived from it.
+		{name: "status unrecognized", filter: LogFilter{Status: "not-a-status"}, want: 0},
+		{name: "status class", filter: LogFilter{Status: "5xx"}, want: 1},
+		{name: "status class absent", filter: LogFilter{Status: "3xx"}, want: 0},
+		{name: "status code", filter: LogFilter{Status: "200"}, want: 2},
+		{name: "status SUCCESS case-insensitive", filter: LogFilter{Status: "SUCCESS"}, want: 2},
 	}
 	for _, tc := range cases {
 		n, err := store.Count(context.Background(), tc.filter)
@@ -698,5 +819,71 @@ func TestStoreVacuumIsNoError(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("expected 1 row after VACUUM, got %d", count)
+	}
+}
+
+// An empty page must marshal as [] and not null: the API hands the slice
+// straight to JSON and callers iterate it.
+func TestListEmptyResultIsNotNull(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	logs, err := store.List(context.Background(), LogFilter{Limit: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if logs == nil {
+		t.Fatal("List returned a nil slice for an empty result")
+	}
+	if len(logs) != 0 {
+		t.Fatalf("expected no rows, got %d", len(logs))
+	}
+	encoded, err := json.Marshal(map[string]any{"items": logs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != `{"items":[]}` {
+		t.Fatalf("empty result marshaled as %s, want {\"items\":[]}", encoded)
+	}
+}
+
+// ReclaimSpace is the single delete -> vacuum -> checkpoint sequence shared by
+// startup pruning and the console's delete endpoint; it must leave the data
+// that was not deleted intact.
+func TestReclaimSpaceKeepsRemainingRows(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	for _, log := range []RequestLog{
+		{ID: "old", StartedAt: now.Add(-48 * time.Hour), GatewayID: "ds"},
+		{ID: "new", StartedAt: now, GatewayID: "ds"},
+	} {
+		if err := store.Insert(context.Background(), log); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deleted, err := store.Delete(context.Background(), &[]time.Time{now.Add(-24 * time.Hour)}[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted = %d, want 1", deleted)
+	}
+	if err := store.ReclaimSpace(context.Background()); err != nil {
+		t.Fatalf("ReclaimSpace: %v", err)
+	}
+	logs, err := store.List(context.Background(), LogFilter{Limit: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 || logs[0].ID != "new" {
+		t.Fatalf("unexpected rows after reclaim: %+v", logs)
 	}
 }
