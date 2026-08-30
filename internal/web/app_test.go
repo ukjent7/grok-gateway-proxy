@@ -71,7 +71,7 @@ func TestManagementAPIIsOpenForLocalTool(t *testing.T) {
 func TestPatchGatewayPartialUpdate(t *testing.T) {
 	cfg := config.DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
 	app := &App{config: cfg, logger: slog.Default()}
-	before := cfg.Gateways["st"]
+	before := cfg.Snapshot()["st"]
 
 	req := httptest.NewRequest(http.MethodPatch, "http://127.0.0.1:8787/api/gateways/st", strings.NewReader(`{"enabled":false}`))
 	recorder := httptest.NewRecorder()
@@ -79,7 +79,7 @@ func TestPatchGatewayPartialUpdate(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
 	}
-	gw := cfg.Gateways["st"]
+	gw := cfg.Snapshot()["st"]
 	if gw.Enabled {
 		t.Fatal("enabled flag should be patched to false")
 	}
@@ -116,7 +116,7 @@ func TestHealthzReportsGatewayStatus(t *testing.T) {
 	app := &App{config: cfg, logger: slog.Default(), upstreams: map[string]upstreamHealth{}}
 	app.proxy = proxy.NewProxy(cfg, nil, slog.Default())
 	app.proxy.Client = upstream.Client()
-	app.probeUpstream("std", cfg.Gateways["std"])
+	app.probeUpstream("std", cfg.Snapshot()["std"])
 
 	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/healthz", nil)
 	recorder := httptest.NewRecorder()
@@ -135,6 +135,38 @@ func TestHealthzReportsGatewayStatus(t *testing.T) {
 	std, ok := upstreams["std"].(map[string]any)
 	if !ok || std["reachable"] != true || std["status"] != float64(200) {
 		t.Fatalf("expected reachable std gateway with status 200, got: %+v", upstreams)
+	}
+}
+
+// A 401/403 means the proxy reached the upstream but no request can succeed
+// without credentials; reporting plain reachability would light the dashboard
+// green for an unusable gateway.
+func TestProbeUpstreamMarksAuthenticationRejection(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer upstream.Close()
+
+	cfg := config.DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
+	gw := cfg.Gateways["std"]
+	gw.BaseURL = upstream.URL
+	cfg.Gateways["std"] = gw
+	app := &App{config: cfg, logger: slog.Default(), upstreams: map[string]upstreamHealth{}}
+	app.proxy = proxy.NewProxy(cfg, nil, slog.Default())
+	app.proxy.Client = upstream.Client()
+	app.probeUpstream("std", cfg.Snapshot()["std"])
+
+	app.healthMu.RLock()
+	health := app.upstreams["std"]
+	app.healthMu.RUnlock()
+	if health.Reachable {
+		t.Fatalf("401 must not be reported as reachable: %+v", health)
+	}
+	if health.Status != http.StatusUnauthorized {
+		t.Fatalf("Status = %d, want 401", health.Status)
+	}
+	if health.Err == "" {
+		t.Fatal("authentication rejection must carry an explanatory error")
 	}
 }
 
@@ -158,6 +190,58 @@ func TestGatewayConfigAPIUpdatesUserAgentOverride(t *testing.T) {
 	}
 	if !cfg.Gateways["st"].UserAgentOverrideEnabled || cfg.Gateways["st"].UserAgentOverride != "debug-agent/1" {
 		t.Fatalf("config was not updated: %+v", cfg.Gateways["st"])
+	}
+}
+
+// The console's Forward Headers field is the only way to route an xAI-only
+// opt-in (x-grok-doom-loop-check) to a backend that understands it, so the
+// PATCH path has to persist it — including names that the proxy drops by
+// default.
+func TestGatewayConfigAPIUpdatesForwardHeaders(t *testing.T) {
+	cfg := config.DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
+	app := &App{config: cfg, logger: slog.Default()}
+	req := httptest.NewRequest(http.MethodPatch, "http://127.0.0.1:8787/api/gateways/std",
+		strings.NewReader(`{"forward_headers":["Authorization","Accept","User-Agent","x-grok-doom-loop-check"]}`))
+	recorder := httptest.NewRecorder()
+	app.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	gateway, ok := response["gateway"].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected gateway response: %+v", response)
+	}
+	headers, ok := gateway["forward_headers"].([]any)
+	if !ok || len(headers) != 4 {
+		t.Fatalf("forward_headers not echoed back: %+v", gateway["forward_headers"])
+	}
+	stored := cfg.Gateways["std"].ForwardHeaders
+	if len(stored) != 4 || stored[3] != "x-grok-doom-loop-check" {
+		t.Fatalf("config was not updated: %+v", stored)
+	}
+}
+
+// Clearing the field must restore the default allowlist rather than leaving
+// the gateway forwarding nothing at all.
+func TestGatewayConfigAPIClearingForwardHeadersRestoresDefaults(t *testing.T) {
+	cfg := config.DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
+	app := &App{config: cfg, logger: slog.Default()}
+	app.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPatch,
+		"http://127.0.0.1:8787/api/gateways/std", strings.NewReader(`{"forward_headers":["X-Api-Key"]}`)))
+	app.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPatch,
+		"http://127.0.0.1:8787/api/gateways/std", strings.NewReader(`{"forward_headers":[]}`)))
+
+	// Clearing yields a nil (not empty-non-nil) slice, which serializes away
+	// under omitempty and leaves the gateway on the default allowlist. An
+	// empty request-side allowlist is what buildUpstreamRequest replaces with
+	// defaultForwardHeaders, so a gateway can never end up forwarding nothing.
+	if got := len(cfg.Gateways["std"].ForwardHeaders); got != 0 {
+		t.Fatalf("expected the allowlist to be cleared, got %d entries: %#v", got, cfg.Gateways["std"].ForwardHeaders)
 	}
 }
 

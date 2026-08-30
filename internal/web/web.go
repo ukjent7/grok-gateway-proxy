@@ -40,7 +40,11 @@ func (a *App) handleUI(w http.ResponseWriter, r *http.Request) {
 	http.StripPrefix("/static/", http.FileServer(http.FS(root))).ServeHTTP(w, r)
 }
 
-func parseFilter(r *http.Request) store.LogFilter {
+// parseFilter builds the log filter from query parameters. An unparsable
+// from/to is an error rather than a silently dropped bound: the caller believes
+// it is looking at a time window, and answering with every row would corrupt
+// counts and totals.
+func parseFilter(r *http.Request) (store.LogFilter, error) {
 	query := r.URL.Query()
 	filter := store.LogFilter{
 		GatewayID: query.Get("gateway"),
@@ -55,16 +59,20 @@ func parseFilter(r *http.Request) store.LogFilter {
 		filter.Offset = value
 	}
 	if value := query.Get("from"); value != "" {
-		if parsed, err := time.Parse(time.RFC3339, value); err == nil {
-			filter.From = &parsed
+		parsed, err := time.Parse(time.RFC3339, value)
+		if err != nil {
+			return store.LogFilter{}, fmt.Errorf("invalid from timestamp: %w", err)
 		}
+		filter.From = &parsed
 	}
 	if value := query.Get("to"); value != "" {
-		if parsed, err := time.Parse(time.RFC3339, value); err == nil {
-			filter.To = &parsed
+		parsed, err := time.Parse(time.RFC3339, value)
+		if err != nil {
+			return store.LogFilter{}, fmt.Errorf("invalid to timestamp: %w", err)
 		}
+		filter.To = &parsed
 	}
-	return filter
+	return filter, nil
 }
 
 // setupSnippets renders per-gateway client config snippets. The base URL uses
@@ -86,7 +94,9 @@ api_backend = "%s"
 }
 
 // normalizeListenAddr turns a listen address into a usable base URL, adding a
-// default host when the address is hostless.
+// default host when the address is hostless. A wildcard host (0.0.0.0 / ::)
+// is rewritten to the loopback: the snippet is meant to be opened by a browser
+// on this machine, and no browser can connect to 0.0.0.0.
 func normalizeListenAddr(listenAddr string) string {
 	addr := strings.TrimSpace(listenAddr)
 	if addr == "" {
@@ -102,5 +112,10 @@ func normalizeListenAddr(listenAddr string) string {
 			addr = "http://" + addr
 		}
 	}
+	// A wildcard listen address is reachable on every interface, but only a
+	// concrete host works as a base URL.
+	addr = strings.Replace(addr, "://0.0.0.0", "://127.0.0.1", 1)
+	addr = strings.Replace(addr, "://[::]", "://127.0.0.1", 1)
+	addr = strings.Replace(addr, "://::", "://127.0.0.1", 1)
 	return strings.TrimRight(addr, "/")
 }

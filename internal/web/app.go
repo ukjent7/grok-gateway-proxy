@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -34,7 +35,11 @@ type App struct {
 	healthMu  sync.RWMutex
 	upstreams map[string]upstreamHealth
 
-	apiMux *http.ServeMux
+	reclaimMu  sync.Mutex
+	reclaiming bool
+
+	apiMux     *http.ServeMux
+	apiMuxOnce sync.Once
 }
 
 func NewApp(cfg *config.Config, st *store.Store, logger *slog.Logger, version string) *App {
@@ -131,13 +136,23 @@ func (a *App) probeUpstream(id string, gateway config.GatewayConfig) {
 		return
 	}
 	req.Header.Set("User-Agent", "grok-gateway-proxy/healthz")
-	resp, err := a.proxy.ClientFor(gateway).Do(req)
+	resp, err := a.proxy.ClientFor(gateway, false).Do(req)
 	if err != nil {
 		a.setHealth(id, upstreamHealth{Err: err.Error()})
 		return
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	// 401/403 mean the proxy reached the upstream but cannot use it without
+	// credentials: reporting that as plain reachability would light the
+	// dashboard green for a gateway no request can succeed on.
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		a.setHealth(id, upstreamHealth{
+			Status: resp.StatusCode,
+			Err:    fmt.Sprintf("upstream rejected authentication (HTTP %d)", resp.StatusCode),
+		})
+		return
+	}
 	a.setHealth(id, upstreamHealth{Reachable: resp.StatusCode < 500, Status: resp.StatusCode})
 }
 
@@ -156,9 +171,14 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasPrefix(path, "/api/") || path == "/api" {
-		if a.apiMux == nil {
-			a.apiMux = a.buildAPIRoutes()
-		}
+		// NewApp builds the mux eagerly; this covers Apps built as bare struct
+		// literals. Either way the build must be once-only: concurrent requests
+		// would otherwise race on the field.
+		a.apiMuxOnce.Do(func() {
+			if a.apiMux == nil {
+				a.apiMux = a.buildAPIRoutes()
+			}
+		})
 		a.apiMux.ServeHTTP(w, r)
 		return
 	}
@@ -170,11 +190,16 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // isGatewayPath reports whether the path targets a known gateway prefix.
-// Uses exact prefix matching (not string HasPrefix) so /static/ is never
+// The prefixes are read from config.DefaultGateways so that adding a gateway
+// does not require editing this file; config.ValidateConfig already rejects a
+// configured gateway whose prefix differs from its default, so the defaults
+// are also the live prefixes.
+//
+// Matching is path-component aware (not string HasPrefix) so /static/ is never
 // mistaken for /st/.
 func isGatewayPath(path string) bool {
-	for _, prefix := range []string{"/ds", "/st", "/std"} {
-		if hasPathPrefix(path, prefix) {
+	for _, gateway := range config.DefaultGateways {
+		if hasPathPrefix(path, gateway.Prefix) {
 			return true
 		}
 	}
@@ -197,7 +222,11 @@ func (a *App) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	filter := parseFilter(r)
+	filter, err := parseFilter(r)
+	if err != nil {
+		proxy.WriteError(w, http.StatusBadRequest, err)
+		return
+	}
 	metrics, err := a.store.Metrics(r.Context(), filter)
 	if err != nil {
 		proxy.WriteError(w, http.StatusInternalServerError, err)
@@ -224,11 +253,16 @@ func (a *App) getLogByID(w http.ResponseWriter, r *http.Request) {
 	proxy.WriteJSON(w, http.StatusOK, log)
 }
 
+// maxAPIBodySize bounds the body of management API requests. The payloads are
+// tiny (a gateway patch is a few hundred bytes); the limit is a courtesy cap,
+// not a security control — the proxy path has its own, much larger bound.
+const maxAPIBodySize = 1 << 20
+
 func (a *App) patchProxy(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		ProxyURL string `json:"proxy_url"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxAPIBodySize)).Decode(&body); err != nil {
 		proxy.WriteError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -257,14 +291,14 @@ func (a *App) patchGateway(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	var patch config.GatewayPatch
-	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxAPIBodySize)).Decode(&patch); err != nil {
 		proxy.WriteError(w, http.StatusBadRequest, err)
 		return
 	}
 	gateway, err := a.config.PatchGateway(id, patch)
 	if err != nil {
 		status := http.StatusBadRequest
-		if strings.HasPrefix(err.Error(), "unknown gateway") {
+		if errors.Is(err, config.ErrUnknownGateway) {
 			status = http.StatusNotFound
 		}
 		proxy.WriteError(w, status, err)
@@ -274,7 +308,12 @@ func (a *App) patchGateway(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func (a *App) listLogs(w http.ResponseWriter, r *http.Request) {
-	logs, err := a.store.List(r.Context(), parseFilter(r))
+	filter, err := parseFilter(r)
+	if err != nil {
+		proxy.WriteError(w, http.StatusBadRequest, err)
+		return
+	}
+	logs, err := a.store.List(r.Context(), filter)
 	if err != nil {
 		proxy.WriteError(w, http.StatusInternalServerError, err)
 		return
@@ -297,21 +336,52 @@ func (a *App) deleteLogs(w http.ResponseWriter, r *http.Request) {
 		proxy.WriteError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if count > 0 && a.store != nil {
-		if err := a.store.Vacuum(r.Context()); err != nil && a.logger != nil {
-			a.logger.Warn("VACUUM failed after delete logs", "error", err)
-		}
-		if err := a.store.CheckpointWAL(r.Context()); err != nil && a.logger != nil {
-			a.logger.Warn("WAL checkpoint failed after delete logs", "error", err)
-		}
-	}
 	proxy.WriteJSON(w, http.StatusOK, map[string]any{"deleted": count})
+	// The rows are already gone, so reclaiming their pages is not part of the
+	// answer: VACUUM rebuilds the whole file and holds the single pooled
+	// connection while it runs, which would stall every audit insert behind
+	// this request. Reclaim off the request path instead.
+	if count > 0 {
+		a.reclaimSpaceAsync()
+	}
+}
+
+// reclaimSpaceAsync reclaims the pages freed by a delete in the background,
+// coalescing concurrent requests: a second caller while one reclaim is already
+// in flight is a no-op, because queueing N full rebuilds on a single
+// connection is exactly the stall this avoids.
+func (a *App) reclaimSpaceAsync() {
+	a.reclaimMu.Lock()
+	if a.reclaiming {
+		a.reclaimMu.Unlock()
+		return
+	}
+	a.reclaiming = true
+	a.reclaimMu.Unlock()
+
+	go func() {
+		defer func() {
+			a.reclaimMu.Lock()
+			a.reclaiming = false
+			a.reclaimMu.Unlock()
+		}()
+		// Deliberately not the request context: it is cancelled as soon as the
+		// handler returns, which is before this goroutine gets to run.
+		if err := a.store.ReclaimSpace(context.Background()); err != nil && a.logger != nil {
+			a.logger.Warn("reclaiming space after delete logs failed", "error", err)
+		}
+	}()
 }
 
 // countLogs reports how many logs match the same filters as /api/logs,
 // letting the dashboard render total counts without fetching every row.
 func (a *App) countLogs(w http.ResponseWriter, r *http.Request) {
-	n, err := a.store.Count(r.Context(), parseFilter(r))
+	filter, err := parseFilter(r)
+	if err != nil {
+		proxy.WriteError(w, http.StatusBadRequest, err)
+		return
+	}
+	n, err := a.store.Count(r.Context(), filter)
 	if err != nil {
 		proxy.WriteError(w, http.StatusInternalServerError, err)
 		return
