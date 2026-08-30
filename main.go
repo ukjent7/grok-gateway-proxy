@@ -41,7 +41,7 @@ func main() {
 	}
 	// Retention precedence: explicit --log-retention-days flag >
 	// GROK_PROXY_LOG_RETENTION_DAYS env var > config file value > built-in
-	// default (30 days). Only an explicitly provided value overrides the
+	// default (7 days). Only an explicitly provided value overrides the
 	// file, so a saved config.json is not silently shadowed.
 	var explicitRetention *int
 	if env := os.Getenv("GROK_PROXY_LOG_RETENTION_DAYS"); env != "" {
@@ -115,14 +115,15 @@ func main() {
 					logger.Info("pruned old logs", "count", pruned)
 				}
 			}
-			// VACUUM reclaims physical space from deleted rows. Only run when
-			// rows were actually pruned to avoid the overhead on idle hours.
+			// Reclaiming physical space costs a full rebuild of the database
+			// file, so only do it when rows were actually pruned.
 			if pruned > 0 {
-				if err := st.Vacuum(ctx); err != nil {
-					logger.Warn("VACUUM failed", "error", err)
+				if err := st.ReclaimSpace(ctx); err != nil {
+					logger.Warn("reclaiming space after prune failed", "error", err)
 				}
-			}
-			if err := st.CheckpointWAL(ctx); err != nil {
+			} else if err := st.CheckpointWAL(ctx); err != nil {
+				// Nothing to reclaim, but the WAL still has to be folded back
+				// so the -wal file does not grow unbounded.
 				logger.Warn("WAL checkpoint failed", "error", err)
 			}
 		}

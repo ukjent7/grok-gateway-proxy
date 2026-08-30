@@ -22,8 +22,11 @@ Grok Build 的 Responses 请求携带若干 xAI 私有扩展，标准上游可�
 请求方向（发往上游前剥离，其余字段——含 `reasoning.effort`——原样保留）：
 
 - `stream_tool_calls` — xAI 后端专用选项
-- `tools` 中标准词汇表之外的条目 — 如 `x_search`；`web_search` 若配置了
-  `excluded_domains`（标准协议无对应能力）则整个工具被移除，而非静默放宽搜索范围
+- `tools` 中标准词汇表之外的条目 — 如 `x_search`
+- `tools` 中 `web_search.filters.excluded_domains` 重命名为标准拼写
+  `blocked_domains`，工具本身保留 —— 两者是同一能力的不同名称
+  （标准协议见 `OpenAIResponsesTool`），移除工具会把调用方声明的排除范围
+  静默放宽为无限制搜索
 - `include` 中标准词汇表之外的值 — 如 `no_inline_citations`
 
 DeepSeek 网关（`/ds`）在此基础上额外处理其方言差异：
@@ -69,6 +72,10 @@ go build -ldflags "-s -w -X main.version=$(git describe --tags 2>/dev/null || ec
 - `GROK_PROXY_LISTEN` — 监听地址
 - `GROK_PROXY_DATA_DIR` — 数据目录
 - `GROK_PROXY_LOG_RETENTION_DAYS` — 日志保留天数
+
+`body_capture_limit_kb` 为 0 表示不截断，但仍受 64MB 安全上限约束（与请求体
+上限一致）：关闭截断不等于允许单个响应无限写入 SQLite。超过该上限时存储的
+报文会被截断并标记 `response_truncated`，客户端收到的始终是完整响应。
 
 旧配置中的 `oc` / `ve` 网关条目会被自动忽略并迁移为新的 `ds` / `std` 网关。
 
