@@ -7,23 +7,18 @@ import (
 	"io"
 )
 
-// compressedColumns are the text/blob columns that benefit from gzip
-// compression. Bodies are the dominant space consumers (JSON/SSE text
-// compresses 5-10x); headers are smaller but also highly compressible.
-var compressedColumns = []string{
-	"request_body", "upstream_body", "upstream_response_body", "response_body",
-	"request_headers", "upstream_headers", "upstream_response_headers", "response_headers",
-}
+var compressedTag = []byte("GZ")
+var legacyCompressedPrefix = []byte("\x1f\x8bGZ")
 
-const compressedMagic = "\x1f\x8bGZ" // gzip header (0x1f 0x8b) + "GZ" tag
+const gzipID1, gzipID2 = 0x1f, 0x8b
 
 func gzipBytes(data []byte) ([]byte, error) {
 	if len(data) == 0 {
 		return []byte{}, nil
 	}
 	var buf bytes.Buffer
-	buf.WriteString(compressedMagic)
 	gw := gzip.NewWriter(&buf)
+	gw.Extra = compressedTag
 	if _, err := gw.Write(data); err != nil {
 		return nil, err
 	}
@@ -33,11 +28,22 @@ func gzipBytes(data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+func compressedPayload(data []byte) ([]byte, bool) {
+	if len(data) < 2 || data[0] != gzipID1 || data[1] != gzipID2 {
+		return nil, false
+	}
+	if bytes.HasPrefix(data, legacyCompressedPrefix) {
+		return data[len(legacyCompressedPrefix):], true
+	}
+	return data, true
+}
+
 func gunzipBytes(data []byte) ([]byte, error) {
-	if len(data) == 0 || !bytes.HasPrefix(data, []byte(compressedMagic)) {
+	payload, compressed := compressedPayload(data)
+	if !compressed {
 		return data, nil
 	}
-	gr, err := gzip.NewReader(bytes.NewReader(data[len(compressedMagic):]))
+	gr, err := gzip.NewReader(bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("decompress: %w", err)
 	}
@@ -45,8 +51,6 @@ func gunzipBytes(data []byte) ([]byte, error) {
 	return io.ReadAll(gr)
 }
 
-// gzipString compresses a header JSON string. Returns empty bytes for empty
-// input so no compression overhead is added for missing fields.
 func gzipString(s string) ([]byte, error) {
 	if s == "" {
 		return []byte{}, nil
@@ -54,38 +58,30 @@ func gzipString(s string) ([]byte, error) {
 	return gzipBytes([]byte(s))
 }
 
-// gunzipString decompresses a header column. Returns "" for empty input;
-// passes through raw data that doesn't have the compression magic.
 func gunzipString(data []byte) string {
 	if len(data) == 0 {
 		return ""
 	}
 	decompressed, err := gunzipBytes(data)
 	if err != nil {
-		return string(data) // fallback to raw
+		return string(data)
 	}
 	return string(decompressed)
 }
 
-// decompressBody decompresses a body column, returning the original bytes.
-// Empty and non-compressed data pass through unchanged.
 func decompressBody(data []byte) []byte {
 	if len(data) == 0 {
 		return []byte{}
 	}
 	decompressed, err := gunzipBytes(data)
 	if err != nil {
-		return data // fallback to raw
+		return data
 	}
 	return decompressed
 }
 
-// compressExistingRows compresses all body and header columns for rows that
-// were written before transparent compression (schema_version < 3). A row is
-// only updated where compression actually saved space, so re-running this is a
-// no-op on already-compressed data.
 func (s *Store) compressExistingRows() error {
-	for _, column := range compressedColumns {
+	for _, column := range capturedColumns {
 		if err := s.compressColumn(column); err != nil {
 			return fmt.Errorf("compress column %s: %w", column, err)
 		}
@@ -100,8 +96,8 @@ func (s *Store) compressColumn(column string) error {
 		return err
 	}
 	return s.batchRewriteColumn(column, fmt.Sprintf(`AND length(%s) > 0`, column), func(raw []byte) ([]byte, bool, error) {
-		// Skip already-compressed rows (the magic prefix).
-		if bytes.HasPrefix(raw, []byte(compressedMagic)) {
+		// Skip already-compressed rows, in either on-disk form.
+		if _, compressed := compressedPayload(raw); compressed {
 			return nil, false, nil
 		}
 		compressed, err := gzipBytes(raw)

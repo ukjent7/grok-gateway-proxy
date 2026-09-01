@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"grok-gateway-proxy/internal/config"
@@ -15,9 +14,6 @@ import (
 	_ "modernc.org/sqlite" // pure-Go SQLite driver
 )
 
-// dbTimeFormat guarantees fixed-width (30 chars) UTC timestamps with 9-digit
-// nanosecond precision, making them lexicographically monotonic for SQLite
-// string comparisons (<, <=, >, >=) and ORDER BY.
 const dbTimeFormat = "2006-01-02T15:04:05.000000000Z"
 
 func formatTimestamp(t time.Time) string {
@@ -43,7 +39,6 @@ func parseTimestamp(s string) time.Time {
 	return time.Time{}
 }
 
-// Store is the SQLite-backed audit log.
 type Store struct {
 	db *sql.DB
 }
@@ -68,114 +63,123 @@ func OpenStore(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-var requestLogInsertColumns = []string{
+var requestLogColumns = []string{
 	"id", "started_at", "gateway_id", "gateway_name", "prefix", "ingress_protocol",
-	"upstream_protocol", "model", "request_path", "request_url", "upstream_url", "method",
-	"status_code", "client_response_status_code", "upstream_response_status_code",
-	"success", "stream", "duration_ms", "request_headers",
-	"request_body", "upstream_headers", "upstream_body",
-	"upstream_response_headers", "upstream_response_body",
-	"response_headers", "response_body", "response_truncated", "error",
+	"upstream_protocol", "model", "request_path", "upstream_url", "method",
+	"status_code", "success", "stream", "duration_ms", "error",
 	"input_tokens", "cache_read_tokens", "cache_write_tokens", "prompt_tokens",
 	"output_tokens", "reasoning_tokens", "cache_supported", "usage_present", "cache_source",
+	"request_url", "client_response_status_code", "upstream_response_status_code",
+	"response_truncated",
+	"request_headers", "request_body", "upstream_headers", "upstream_body",
+	"upstream_response_headers", "upstream_response_body",
+	"response_headers", "response_body",
 }
 
-var requestLogInsertSQL = buildRequestLogInsertSQL()
+var detailScalarColumns = []string{
+	"request_url", "client_response_status_code", "upstream_response_status_code",
+	"response_truncated",
+}
+
+var capturedColumns = []string{
+	"request_headers", "request_body", "upstream_headers", "upstream_body",
+	"upstream_response_headers", "upstream_response_body",
+	"response_headers", "response_body",
+}
+
+var summaryColumns = len(requestLogColumns) - len(detailScalarColumns) - len(capturedColumns)
+
+var (
+	requestLogSummaryColumns = strings.Join(requestLogColumns[:summaryColumns], ", ")
+	requestLogAllColumns     = strings.Join(requestLogColumns, ", ")
+	requestLogInsertSQL      = buildRequestLogInsertSQL()
+)
 
 func buildRequestLogInsertSQL() string {
-	placeholders := make([]string, len(requestLogInsertColumns))
-	for i := range placeholders {
-		placeholders[i] = "?"
-	}
-	return "INSERT INTO request_logs (" + strings.Join(requestLogInsertColumns, ", ") + ") VALUES (" + strings.Join(placeholders, ", ") + ")"
+	placeholders := strings.Repeat("?,", len(requestLogColumns))
+	return "INSERT INTO request_logs (" + strings.Join(requestLogColumns, ", ") +
+		") VALUES (" + strings.TrimSuffix(placeholders, ",") + ")"
 }
 
-// parallelCompressThreshold is the total captured size at which compressing
-// the columns concurrently starts to pay for itself. Below it, eight
-// goroutines plus eight gzip writers cost more than the compression itself —
-// which is the common case, since most requests carry small header blobs and
-// empty upstream/response fields.
-const parallelCompressThreshold = 32 << 10
+func insertValues(log RequestLog) (map[string]any, error) {
+	values := map[string]any{
+		"id":                            log.ID,
+		"started_at":                    formatTimestamp(log.StartedAt),
+		"gateway_id":                    log.GatewayID,
+		"gateway_name":                  log.GatewayName,
+		"prefix":                        log.Prefix,
+		"ingress_protocol":              string(log.IngressProtocol),
+		"upstream_protocol":             string(log.UpstreamProtocol),
+		"model":                         log.Model,
+		"request_path":                  log.RequestPath,
+		"request_url":                   log.RequestURL,
+		"upstream_url":                  log.UpstreamURL,
+		"method":                        log.Method,
+		"status_code":                   log.StatusCode,
+		"client_response_status_code":   log.ClientResponseStatusCode,
+		"upstream_response_status_code": log.UpstreamResponseStatusCode,
+		"success":                       boolInt(log.Success),
+		"stream":                        boolInt(log.Stream),
+		"duration_ms":                   log.DurationMS,
+		"error":                         log.Error,
+		"response_truncated":            boolInt(log.ResponseTruncated),
+		"input_tokens":                  log.Usage.InputTokens,
+		"cache_read_tokens":             log.Usage.CacheReadTokens,
+		"cache_write_tokens":            log.Usage.CacheWriteTokens,
+		"prompt_tokens":                 log.Usage.PromptTokens,
+		"output_tokens":                 log.Usage.OutputTokens,
+		"reasoning_tokens":              log.Usage.ReasoningTokens,
+		"cache_supported":               boolInt(log.Usage.CacheSupported),
+		"usage_present":                 boolInt(log.Usage.UsagePresent),
+		"cache_source":                  log.Usage.CacheSource,
+	}
+	for column, raw := range capturedValues(log) {
+		// Bodies are text and JSON: gzip takes them down 5-10x, and a stored
+		// payload is what makes an audit log of full prompts fit on a laptop.
+		compressed, err := gzipBytes(raw)
+		if err != nil {
+			return nil, fmt.Errorf("compress %s: %w", column, err)
+		}
+		values[column] = compressed
+	}
+	return values, nil
+}
 
-// compressibleColumns are the eight captured columns, in the order the insert
-// statement expects them.
-func compressibleColumns(log RequestLog) [8]struct {
-	name  string
-	value []byte
-} {
-	return [8]struct {
-		name  string
-		value []byte
-	}{
-		{"request_headers", []byte(log.RequestHeaders)},
-		{"upstream_headers", []byte(log.UpstreamHeaders)},
-		{"upstream_response_headers", []byte(log.UpstreamResponseHeaders)},
-		{"response_headers", []byte(log.ResponseHeaders)},
-		{"request_body", log.RequestBody},
-		{"upstream_body", log.UpstreamBody},
-		{"upstream_response_body", log.UpstreamResponseBody},
-		{"response_body", log.ResponseBody},
+// capturedValues returns the eight gzipped payloads as they arrive from the
+// caller, keyed by the column each belongs in.
+func capturedValues(log RequestLog) map[string][]byte {
+	return map[string][]byte{
+		"request_headers":           []byte(log.RequestHeaders),
+		"upstream_headers":          []byte(log.UpstreamHeaders),
+		"upstream_response_headers": []byte(log.UpstreamResponseHeaders),
+		"response_headers":          []byte(log.ResponseHeaders),
+		"request_body":              log.RequestBody,
+		"upstream_body":             log.UpstreamBody,
+		"upstream_response_body":    log.UpstreamResponseBody,
+		"response_body":             log.ResponseBody,
 	}
 }
 
 func (s *Store) Insert(ctx context.Context, log RequestLog) error {
-	type gzipResult struct {
-		data []byte
-		err  error
-	}
-	columns := compressibleColumns(log)
-	results := make([]gzipResult, len(columns))
-	compress := func(i int) {
-		results[i].data, results[i].err = gzipBytes(columns[i].value)
-	}
-
-	var total int
-	for i := range columns {
-		total += len(columns[i].value)
-	}
-	if total >= parallelCompressThreshold {
-		// Bodies are the dominant cost; compressing them concurrently cuts
-		// insert latency roughly 3x once there is real data to work on.
-		var wg sync.WaitGroup
-		wg.Add(len(columns))
-		for i := range columns {
-			go func(i int) {
-				defer wg.Done()
-				compress(i)
-			}(i)
-		}
-		wg.Wait()
-	} else {
-		for i := range columns {
-			compress(i)
-		}
+	values, err := insertValues(log)
+	if err != nil {
+		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	for i, r := range results {
-		if r.err != nil {
-			return fmt.Errorf("compress %s: %w", columns[i].name, r.err)
+	args := make([]any, len(requestLogColumns))
+	for i, column := range requestLogColumns {
+		value, ok := values[column]
+		if !ok {
+			// A column with no value is a missing entry in insertValues, and
+			// naming it is the whole diagnosis. The old check could only count
+			// arguments, which is why the order mattered so much.
+			return fmt.Errorf("request log insert has no value for column %q", column)
 		}
+		args[i] = value
 	}
-	compressedReqHeaders, compressedUpHeaders, compressedUpRespHeaders, compressedRespHeaders := results[0].data, results[1].data, results[2].data, results[3].data
-	compressedReqBody, compressedUpBody, compressedUpRespBody, compressedRespBody := results[4].data, results[5].data, results[6].data, results[7].data
-	args := []any{log.ID, formatTimestamp(log.StartedAt), log.GatewayID,
-		log.GatewayName, log.Prefix, log.IngressProtocol, log.UpstreamProtocol,
-		log.Model, log.RequestPath, log.RequestURL, log.UpstreamURL, log.Method, log.StatusCode,
-		log.ClientResponseStatusCode, log.UpstreamResponseStatusCode, boolInt(log.Success),
-		boolInt(log.Stream), log.DurationMS, compressedReqHeaders,
-		compressedReqBody, compressedUpHeaders,
-		compressedUpBody, compressedUpRespHeaders,
-		compressedUpRespBody, compressedRespHeaders,
-		compressedRespBody, boolInt(log.ResponseTruncated), log.Error, log.Usage.InputTokens, log.Usage.CacheReadTokens,
-		log.Usage.CacheWriteTokens, log.Usage.PromptTokens, log.Usage.OutputTokens,
-		log.Usage.ReasoningTokens, boolInt(log.Usage.CacheSupported),
-		boolInt(log.Usage.UsagePresent), log.Usage.CacheSource}
-	if len(args) != len(requestLogInsertColumns) {
-		return fmt.Errorf("request log insert has %d values for %d columns", len(args), len(requestLogInsertColumns))
-	}
-	_, err := s.db.ExecContext(ctx, requestLogInsertSQL, args...)
+	_, err = s.db.ExecContext(ctx, requestLogInsertSQL, args...)
 	return err
 }
 
@@ -183,11 +187,7 @@ func (s *Store) Insert(ctx context.Context, log RequestLog) error {
 // first. Summaries are enough for the log table; Get loads the full row.
 func (s *Store) List(ctx context.Context, filter LogFilter) ([]RequestLog, error) {
 	where, args := buildLogFilter(filter)
-	query := `SELECT id, started_at, gateway_id, gateway_name, prefix,
-ingress_protocol, upstream_protocol, model, request_path, upstream_url,
-method, status_code, success, stream, duration_ms, error,
-input_tokens, cache_read_tokens, cache_write_tokens, prompt_tokens,
-output_tokens, reasoning_tokens, cache_supported, usage_present, cache_source
+	query := `SELECT ` + requestLogSummaryColumns + `
 FROM request_logs` + where + ` ORDER BY started_at DESC LIMIT ? OFFSET ?`
 	args = append(args, filter.Limit, filter.Offset)
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -209,35 +209,83 @@ FROM request_logs` + where + ` ORDER BY started_at DESC LIMIT ? OFFSET ?`
 	return result, rows.Err()
 }
 
-func (s *Store) Get(ctx context.Context, id string) (RequestLog, error) {
-	row := s.db.QueryRowContext(ctx, `
-SELECT id, started_at, gateway_id, gateway_name, prefix, ingress_protocol,
-upstream_protocol, model, request_path, request_url, upstream_url, method, status_code,
-client_response_status_code, upstream_response_status_code, success, stream, duration_ms,
-request_headers, request_body, upstream_headers,
-upstream_body, upstream_response_headers, upstream_response_body,
-response_headers, response_body, response_truncated, error, input_tokens,
-cache_read_tokens, cache_write_tokens, prompt_tokens, output_tokens,
-reasoning_tokens, cache_supported, usage_present, cache_source
-FROM request_logs WHERE id = ?`, id)
-	return scanFull(row)
+// RecentByGateway returns up to perGateway of the newest summary rows for each
+// gateway that has any, in one query.
+//
+// The console used to ask for this per gateway — one /logs?gateway=X request
+// for every card on the overview — which turned a page refresh into a request
+// per configured gateway and made the board's cost grow with its own size. The
+// window function takes the whole thing back to a single pass, and a chatty
+// gateway can no longer crowd a quiet one out of the result, which a shared
+// `LIMIT` across all gateways would.
+func (s *Store) RecentByGateway(ctx context.Context, filter LogFilter, perGateway int) (map[string][]RequestLog, error) {
+	if perGateway <= 0 {
+		return map[string][]RequestLog{}, nil
+	}
+	where, args := buildLogFilter(filter)
+	query := `SELECT ` + requestLogSummaryColumns + ` FROM (
+SELECT ` + requestLogSummaryColumns + `,
+       ROW_NUMBER() OVER (PARTITION BY gateway_id ORDER BY started_at DESC) AS newest_first
+FROM request_logs` + where + `) WHERE newest_first <= ? ORDER BY gateway_id, newest_first`
+	args = append(args, perGateway)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := map[string][]RequestLog{}
+	for rows.Next() {
+		log, err := scanSummary(rows)
+		if err != nil {
+			return nil, err
+		}
+		result[log.GatewayID] = append(result[log.GatewayID], log)
+	}
+	return result, rows.Err()
 }
+
+func (s *Store) Get(ctx context.Context, id string) (RequestLog, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT `+requestLogAllColumns+` FROM request_logs WHERE id = ?`, id)
+	log, err := scanFull(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RequestLog{}, fmt.Errorf("%w %q", ErrLogNotFound, id)
+	}
+	return log, err
+}
+
+// ErrLogNotFound reports a log id with no stored row. Callers match it with
+// errors.Is to answer 404; any other Get error is a storage failure and must
+// not be reported as "not found", or a database problem reads as a record the
+// user somehow deleted.
+var ErrLogNotFound = errors.New("log not found")
+
+// metricsAggregates is the weighted aggregate both metrics queries select, one
+// entry per column in the order metricsAggregate.scanArgs fills. It is shared
+// because it has two callers: the single overview total and the per-gateway
+// breakdown. Duplicate it and the two drift the moment someone adds a column to
+// one — and the dashboard renders both side by side, so `by_gateway` would
+// visibly stop summing to `total` with no test to say so.
+var metricsAggregates = []string{
+	"COUNT(*)",
+	"COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0)",
+	"COALESCE(SUM(input_tokens), 0)",
+	"COALESCE(SUM(prompt_tokens), 0)",
+	"COALESCE(SUM(CASE WHEN cache_supported = 1 THEN prompt_tokens ELSE 0 END), 0)",
+	"COALESCE(SUM(CASE WHEN cache_supported = 1 THEN cache_read_tokens ELSE 0 END), 0)",
+	"COALESCE(SUM(CASE WHEN cache_supported = 1 THEN cache_write_tokens ELSE 0 END), 0)",
+	"COALESCE(SUM(output_tokens), 0)",
+	"COALESCE(SUM(reasoning_tokens), 0)",
+	"COALESCE(SUM(CASE WHEN cache_supported = 1 THEN 1 ELSE 0 END), 0)",
+	"COALESCE(SUM(CASE WHEN usage_present = 1 THEN 1 ELSE 0 END), 0)",
+}
+
+var metricsAggregateColumns = strings.Join(metricsAggregates, ", ")
 
 func (s *Store) Metrics(ctx context.Context, filter LogFilter) (Metrics, error) {
 	where, args := buildLogFilter(filter)
-	row := s.db.QueryRowContext(ctx, `
-SELECT COUNT(*),
-       COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0),
-       COALESCE(SUM(input_tokens), 0),
-       COALESCE(SUM(prompt_tokens), 0),
-       COALESCE(SUM(CASE WHEN cache_supported = 1 THEN prompt_tokens ELSE 0 END), 0),
-       COALESCE(SUM(CASE WHEN cache_supported = 1 THEN cache_read_tokens ELSE 0 END), 0),
-       COALESCE(SUM(CASE WHEN cache_supported = 1 THEN cache_write_tokens ELSE 0 END), 0),
-       COALESCE(SUM(output_tokens), 0),
-       COALESCE(SUM(reasoning_tokens), 0),
-       COALESCE(SUM(CASE WHEN cache_supported = 1 THEN 1 ELSE 0 END), 0),
-       COALESCE(SUM(CASE WHEN usage_present = 1 THEN 1 ELSE 0 END), 0)
-FROM request_logs`+where, args...)
+	row := s.db.QueryRowContext(ctx,
+		`SELECT `+metricsAggregateColumns+` FROM request_logs`+where, args...)
 	var aggregate metricsAggregate
 	if err := scanMetricsAggregate(row, &aggregate); err != nil {
 		return Metrics{}, err
@@ -308,20 +356,11 @@ func (a metricsAggregate) metrics() Metrics {
 
 func (s *Store) metricsByGateway(ctx context.Context, filter LogFilter) (map[string]Metrics, error) {
 	where, args := buildLogFilter(filter)
-	rows, err := s.db.QueryContext(ctx, `
-SELECT gateway_id,
-       COUNT(*),
-       COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0),
-       COALESCE(SUM(input_tokens), 0),
-       COALESCE(SUM(prompt_tokens), 0),
-       COALESCE(SUM(CASE WHEN cache_supported = 1 THEN prompt_tokens ELSE 0 END), 0),
-       COALESCE(SUM(CASE WHEN cache_supported = 1 THEN cache_read_tokens ELSE 0 END), 0),
-       COALESCE(SUM(CASE WHEN cache_supported = 1 THEN cache_write_tokens ELSE 0 END), 0),
-       COALESCE(SUM(output_tokens), 0),
-       COALESCE(SUM(reasoning_tokens), 0),
-       COALESCE(SUM(CASE WHEN cache_supported = 1 THEN 1 ELSE 0 END), 0),
-       COALESCE(SUM(CASE WHEN usage_present = 1 THEN 1 ELSE 0 END), 0)
-FROM request_logs`+where+` GROUP BY gateway_id ORDER BY gateway_id`, args...)
+	// The same aggregate the overview total runs, grouped — not a second copy of
+	// it, which is the whole point of metricsAggregates.
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT gateway_id, `+metricsAggregateColumns+` FROM request_logs`+where+
+			` GROUP BY gateway_id ORDER BY gateway_id`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -358,11 +397,23 @@ func (s *Store) PruneOlderThan(ctx context.Context, retention time.Duration) (in
 	return s.Delete(ctx, &cutoff)
 }
 
-// CheckpointWAL forces a WAL checkpoint and truncates the -wal file to keep
-// database files from growing unbounded. Safe to call periodically.
+// CheckpointWAL folds the WAL back into the main database file and truncates
+// the -wal file, keeping it from growing unbounded. Safe to call periodically.
+//
+// The pragma answers (busy, log, checkpointed). A busy result means another
+// connection held the database and nothing was folded back: the -wal file is
+// still as large as it was, so this reports an error rather than passing for a
+// checkpoint that did not happen.
 func (s *Store) CheckpointWAL(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
-	return err
+	var busy, log, checkpointed int
+	err := s.db.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &log, &checkpointed)
+	if err != nil {
+		return err
+	}
+	if busy != 0 {
+		return fmt.Errorf("wal checkpoint busy: %d pages still in the wal, %d not folded back", log, checkpointed)
+	}
+	return nil
 }
 
 // Vacuum rebuilds the database file, reclaiming space left behind by deleted
@@ -381,10 +432,17 @@ func (s *Store) Vacuum(ctx context.Context) error {
 	return err
 }
 
-// ReclaimSpace shrinks the database file after rows have been deleted:
-// CheckpointWAL folds the WAL back into the main file, then VACUUM returns the
-// freed pages to the filesystem. Both steps are needed — a checkpoint alone
-// leaves the pages on SQLite's free-list, and the .db file never shrinks.
+// ReclaimSpace shrinks the database file after rows have been deleted. Both
+// steps are needed, and the order matters.
+//
+// VACUUM is what returns the freed pages to the filesystem — a checkpoint
+// alone only folds the WAL in and leaves the pages on SQLite's free-list,
+// where the .db file never shrinks.
+//
+// The checkpoint comes second because in WAL mode VACUUM writes the rebuilt
+// database through the WAL: running it first would leave the new pages in the
+// -wal file and the main file no smaller than before. Checkpointing afterwards
+// is what moves them into the database and truncates the -wal.
 //
 // It holds the single pooled connection for the whole rebuild, so call it off
 // the request path and only when there is space worth reclaiming.
@@ -479,72 +537,109 @@ func buildLogFilter(filter LogFilter) (string, []any) {
 
 type scanner interface{ Scan(...any) error }
 
+// requestLogScan is one row's scan destinations, in requestLogColumns order.
+// Both reads share it: a summary is the first summaryColumns targets, the full
+// row is all of them. That is only sound because the column order puts every
+// detail-only column last, which TestRequestLogColumnLayout checks — the same
+// guarantee the insert relies on for its arguments.
+type requestLogScan struct {
+	log               RequestLog
+	started           string
+	ingress, upstream string
+	success           int
+	stream            int
+	cacheSupported    int
+	usagePresent      int
+	responseTruncated int
+	rawCaptured       [][]byte
+}
+
+// targets returns a destination per column in requestLogColumns, allocating the
+// payload slots fresh each time so a reused scan never carries rows over.
+func (s *requestLogScan) targets() []any {
+	s.rawCaptured = make([][]byte, len(capturedColumns))
+	targets := []any{
+		&s.log.ID, &s.started, &s.log.GatewayID, &s.log.GatewayName, &s.log.Prefix,
+		&s.ingress, &s.upstream, &s.log.Model, &s.log.RequestPath, &s.log.UpstreamURL,
+		&s.log.Method, &s.log.StatusCode, &s.success, &s.stream, &s.log.DurationMS,
+		&s.log.Error, &s.log.Usage.InputTokens, &s.log.Usage.CacheReadTokens,
+		&s.log.Usage.CacheWriteTokens, &s.log.Usage.PromptTokens,
+		&s.log.Usage.OutputTokens, &s.log.Usage.ReasoningTokens,
+		&s.cacheSupported, &s.usagePresent, &s.log.Usage.CacheSource,
+		&s.log.RequestURL, &s.log.ClientResponseStatusCode,
+		&s.log.UpstreamResponseStatusCode, &s.responseTruncated,
+	}
+	for i := range s.rawCaptured {
+		targets = append(targets, &s.rawCaptured[i])
+	}
+	return targets
+}
+
+var capturedIndex = func() map[string]int {
+	m := make(map[string]int, len(capturedColumns))
+	for i, c := range capturedColumns {
+		m[c] = i
+	}
+	return m
+}()
+
+// captured looks a payload column up by name rather than by position, so the
+// day someone reorders capturedColumns the payloads follow the list instead of
+// landing in the wrong field. Index is cached in capturedIndex; a name missing
+// from the list panics (loud, where a silent misread would not be).
+func (s *requestLogScan) captured(column string) []byte {
+	idx, ok := capturedIndex[column]
+	if !ok {
+		panic(fmt.Sprintf("unknown captured column %q", column))
+	}
+	return s.rawCaptured[idx]
+}
+
+// resolve decodes the columns both reads share. A summary never fills the
+// payload fields: it does not select those eight columns, and the log table has
+// no view that shows what is in them.
+func (s *requestLogScan) resolve() RequestLog {
+	log := s.log
+	log.StartedAt = parseTimestamp(s.started)
+	log.IngressProtocol = config.Protocol(s.ingress)
+	log.UpstreamProtocol = config.Protocol(s.upstream)
+	log.Success = s.success != 0
+	log.Stream = s.stream != 0
+	log.Usage.CacheSupported = s.cacheSupported != 0
+	log.Usage.UsagePresent = s.usagePresent != 0
+	log.ResponseTruncated = s.responseTruncated != 0
+	return log
+}
+
+// applyPayload decompresses the eight captured columns. Headers are text and
+// bodies stay bytes; both decoders pass plaintext through, so rows written
+// before transparent compression still read back whole.
+func (s *requestLogScan) applyPayload(log *RequestLog) {
+	log.RequestHeaders = gunzipString(s.captured("request_headers"))
+	log.UpstreamHeaders = gunzipString(s.captured("upstream_headers"))
+	log.UpstreamResponseHeaders = gunzipString(s.captured("upstream_response_headers"))
+	log.ResponseHeaders = gunzipString(s.captured("response_headers"))
+	log.RequestBody = decompressBody(s.captured("request_body"))
+	log.UpstreamBody = decompressBody(s.captured("upstream_body"))
+	log.UpstreamResponseBody = decompressBody(s.captured("upstream_response_body"))
+	log.ResponseBody = decompressBody(s.captured("response_body"))
+}
+
 func scanSummary(row scanner) (RequestLog, error) {
-	var log RequestLog
-	var started string
-	var success, stream, cacheSupported, usagePresent int
-	var ingress, upstream string
-	if err := row.Scan(&log.ID, &started, &log.GatewayID, &log.GatewayName,
-		&log.Prefix, &ingress, &upstream, &log.Model, &log.RequestPath,
-		&log.UpstreamURL, &log.Method, &log.StatusCode, &success, &stream,
-		&log.DurationMS, &log.Error, &log.Usage.InputTokens,
-		&log.Usage.CacheReadTokens, &log.Usage.CacheWriteTokens,
-		&log.Usage.PromptTokens, &log.Usage.OutputTokens,
-		&log.Usage.ReasoningTokens, &cacheSupported, &usagePresent,
-		&log.Usage.CacheSource); err != nil {
+	var s requestLogScan
+	if err := row.Scan(s.targets()[:summaryColumns]...); err != nil {
 		return RequestLog{}, err
 	}
-	log.StartedAt = parseTimestamp(started)
-	log.IngressProtocol = config.Protocol(ingress)
-	log.UpstreamProtocol = config.Protocol(upstream)
-	log.Success = success != 0
-	log.Stream = stream != 0
-	log.Usage.CacheSupported = cacheSupported != 0
-	log.Usage.UsagePresent = usagePresent != 0
-	return log, nil
+	return s.resolve(), nil
 }
 
 func scanFull(row scanner) (RequestLog, error) {
-	var log RequestLog
-	var started string
-	var success, stream, cacheSupported, usagePresent, responseTruncated int
-	var ingress, upstream string
-	var reqBody, upBody, upRespBody, respBody []byte
-	var reqHeaders, upHeaders, upRespHeaders, respHeaders []byte
-	if err := row.Scan(&log.ID, &started, &log.GatewayID, &log.GatewayName,
-		&log.Prefix, &ingress, &upstream, &log.Model, &log.RequestPath,
-		&log.RequestURL, &log.UpstreamURL, &log.Method, &log.StatusCode,
-		&log.ClientResponseStatusCode, &log.UpstreamResponseStatusCode, &success, &stream,
-		&log.DurationMS, &reqHeaders, &reqBody,
-		&upHeaders, &upBody,
-		&upRespHeaders,
-		&upRespBody, &respHeaders,
-		&respBody, &responseTruncated, &log.Error, &log.Usage.InputTokens,
-		&log.Usage.CacheReadTokens, &log.Usage.CacheWriteTokens,
-		&log.Usage.PromptTokens, &log.Usage.OutputTokens,
-		&log.Usage.ReasoningTokens, &cacheSupported, &usagePresent,
-		&log.Usage.CacheSource); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return RequestLog{}, fmt.Errorf("log not found: %w", err)
-		}
+	var s requestLogScan
+	if err := row.Scan(s.targets()...); err != nil {
 		return RequestLog{}, err
 	}
-	log.StartedAt = parseTimestamp(started)
-	log.IngressProtocol = config.Protocol(ingress)
-	log.UpstreamProtocol = config.Protocol(upstream)
-	log.Success = success != 0
-	log.Stream = stream != 0
-	log.Usage.CacheSupported = cacheSupported != 0
-	log.Usage.UsagePresent = usagePresent != 0
-	log.ResponseTruncated = responseTruncated != 0
-	log.RequestHeaders = gunzipString(reqHeaders)
-	log.UpstreamHeaders = gunzipString(upHeaders)
-	log.UpstreamResponseHeaders = gunzipString(upRespHeaders)
-	log.ResponseHeaders = gunzipString(respHeaders)
-	log.RequestBody = decompressBody(reqBody)
-	log.UpstreamBody = decompressBody(upBody)
-	log.UpstreamResponseBody = decompressBody(upRespBody)
-	log.ResponseBody = decompressBody(respBody)
+	log := s.resolve()
+	s.applyPayload(&log)
 	return log, nil
 }
 

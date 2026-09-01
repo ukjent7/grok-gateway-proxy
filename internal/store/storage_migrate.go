@@ -72,33 +72,11 @@ CREATE INDEX IF NOT EXISTS idx_request_logs_model ON request_logs(model);
 			return err
 		}
 	}
-	// One-time data migrations, guarded by a version marker so that the
-	// full-table scans only run when upgrading from an older build, not on
-	// every startup.
 	return s.migrateDataIfNeeded()
 }
 
 const currentSchemaVersion = 4
 
-// migrateDataIfNeeded runs one-time data migrations for existing databases:
-// backfilling columns added after the initial schema, and scrubbing
-// credentials that may have been stored before write-time header
-// sanitization existed. The schema_version marker in proxy_meta makes each
-// migration run exactly once per database.
-//
-// The steps below are deliberately NOT wrapped in a single transaction: some
-// of them rewrite the whole table in batches, and holding one write
-// transaction across every batch would block readers for the entire
-// migration. That makes each step's idempotence a load-bearing contract
-// rather than a nice-to-have:
-//
-//   - every step must be safe to re-run from scratch (each is a conditional
-//     UPDATE or a value-preserving rewrite, never an unconditional transform);
-//   - schema_version is stamped only after all steps have succeeded.
-//
-// Together these mean an interrupted migration (crash, kill, disk full) simply
-// re-runs from the beginning on the next startup and converges. If you add a
-// step here, preserve both properties and bump currentSchemaVersion.
 func (s *Store) migrateDataIfNeeded() error {
 	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS proxy_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`); err != nil {
 		return err
@@ -247,8 +225,15 @@ func (s *Store) rewriteColumnBatch(column, where, lastID string, batchSize int, 
 	return last, scanned < batchSize, nil
 }
 
+// normalizeTimestamps rewrites legacy rows into the fixed-width UTC format.
+// The predicate is "not exactly 30 chars" rather than "shorter than 30": a
+// nanosecond timestamp that carries a numeric offset
+// (2026-08-30T14:05:06.123456789+08:00, 35 chars) is *longer* than the target
+// format, and skipping it would leave it sorted and filtered as text against
+// UTC rows — a row whose local clock reads 20:00 is really 12:00Z, so an
+// eight-hour-skewed window would silently drop or keep it at random.
 func (s *Store) normalizeTimestamps() error {
-	return s.batchRewriteColumn("started_at", `AND length(started_at) < 30`, func(raw []byte) ([]byte, bool, error) {
+	return s.batchRewriteColumn("started_at", `AND length(started_at) != 30`, func(raw []byte) ([]byte, bool, error) {
 		t := parseTimestamp(string(raw))
 		if t.IsZero() {
 			return nil, false, nil

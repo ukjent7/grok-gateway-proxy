@@ -2,12 +2,16 @@ package store
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -325,11 +329,11 @@ CREATE TABLE request_logs (
 			defer store.Close()
 
 			var remaining int
-			if err := store.db.QueryRow(`SELECT COUNT(*) FROM request_logs WHERE length(started_at) < 30`).Scan(&remaining); err != nil {
+			if err := store.db.QueryRow(`SELECT COUNT(*) FROM request_logs WHERE length(started_at) != 30`).Scan(&remaining); err != nil {
 				t.Fatal(err)
 			}
 			if remaining != 0 {
-				t.Fatalf("%d rows were still in the narrow timestamp format after migration", remaining)
+				t.Fatalf("%d rows were still outside the fixed timestamp format after migration", remaining)
 			}
 			// Rewriting must not have lost or duplicated a row.
 			var total int
@@ -750,6 +754,108 @@ func TestStoreCompressedDataIsSmaller(t *testing.T) {
 	}
 }
 
+// A stored blob must be a valid gzip file on its own: the compression marker
+// rides in the gzip header's extra field, not in a prefix in front of the
+// stream. Prefixing it produced bytes that began like gzip and then failed
+// `gunzip`, leaving the stored bodies unreadable to anything but this code.
+func TestStoredBlobIsPlainGzip(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	payload := strings.Repeat(`{"role":"user","content":"round and round it goes. "}`, 40)
+	if err := store.Insert(context.Background(), RequestLog{
+		ID:          "plain-gzip",
+		StartedAt:   time.Now().UTC(),
+		GatewayID:   "oc",
+		RequestBody: []byte(payload),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stored []byte
+	if err := store.db.QueryRow(`SELECT request_body FROM request_logs WHERE id = 'plain-gzip'`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored[0] != 0x1f || stored[1] != 0x8b {
+		t.Fatalf("stored blob is not gzip: %x %x", stored[0], stored[1])
+	}
+	if stored[3]&0x04 == 0 {
+		t.Fatal("FEXTRA flag not set; the marker is not in the gzip header")
+	}
+	xlen := int(stored[10]) | int(stored[11])<<8
+	if string(stored[12:12+xlen]) != "GZ" {
+		t.Fatalf("extra field = %q, want %q", string(stored[12:12+xlen]), "GZ")
+	}
+
+	reader, err := gzip.NewReader(bytes.NewReader(stored))
+	if err != nil {
+		t.Fatalf("stored blob is not readable by gzip.NewReader: %v", err)
+	}
+	defer reader.Close()
+	decoded, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("decompress: %v", err)
+	}
+	if string(decoded) != payload {
+		t.Fatalf("decoded %d bytes, want %d", len(decoded), len(payload))
+	}
+}
+
+// Rows written by the build that used the five-byte prefix ahead of the gzip
+// stream must still read back. The prefix's third byte is 'G' where a real
+// gzip stream carries its compression method, so the two are told apart on
+// read and no migration is needed.
+func TestStoreReadsLegacyPrefixedBlob(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "proxy.db")
+	store, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := `{"model":"legacy-prefix","messages":[{"role":"user","content":"hello"}]}`
+	var blob bytes.Buffer
+	blob.WriteString("\x1f\x8bGZ")
+	writer := gzip.NewWriter(&blob)
+	if _, err := writer.Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	legacy, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`INSERT INTO request_logs (id, started_at, gateway_id, gateway_name, prefix, ingress_protocol, upstream_protocol, model, request_path, upstream_url, method, status_code, success, stream, duration_ms, request_headers, request_body, upstream_headers, upstream_body, response_headers, response_body, error, input_tokens, cache_read_tokens, cache_write_tokens, prompt_tokens, output_tokens, reasoning_tokens, cache_supported, usage_present, cache_source) VALUES (?, ?, 'oc', 'OpenCode Zen', '/oc', 'responses', 'responses', 'legacy', '/responses', 'https://example.test/v1/responses', 'POST', 200, 1, 1, 10, '{}', ?, '{}', X'7b7d', '{}', X'7b7d', '', 0, 0, 0, 0, 0, 0, 0, 0, '')`,
+		"legacy-prefix", time.Now().UTC().Format(time.RFC3339Nano), blob.Bytes())
+	if err != nil {
+		legacy.Close()
+		t.Fatal(err)
+	}
+	legacy.Close()
+
+	store, err = OpenStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	got, err := store.Get(context.Background(), "legacy-prefix")
+	if err != nil {
+		t.Fatalf("get legacy row: %v", err)
+	}
+	if string(got.RequestBody) != payload {
+		t.Fatalf("legacy body mismatch: got %q want %q", string(got.RequestBody), payload)
+	}
+}
+
 // Rows written by an older build (raw bytes, no compression magic) must be
 // readable after the store is opened — the Get path transparently passes
 // through data that lacks the gzip magic prefix.
@@ -885,5 +991,272 @@ func TestReclaimSpaceKeepsRemainingRows(t *testing.T) {
 	}
 	if len(logs) != 1 || logs[0].ID != "new" {
 		t.Fatalf("unexpected rows after reclaim: %+v", logs)
+	}
+}
+
+// A legacy row whose timestamp carries a numeric UTC offset is *longer* than
+// the fixed-width format (35 chars, not fewer). Selecting only the short ones
+// left such rows pinned to their local clock, so they sorted and filtered
+// wrongly against the UTC rows they sat next to.
+func TestMigrationNormalizesOffsetBearingTimestamp(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "proxy.db")
+	store, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Insert(context.Background(), RequestLog{
+		ID:        "legacy-offset",
+		StartedAt: time.Date(2026, 8, 30, 14, 5, 6, 123456789, time.UTC),
+		GatewayID: "ds",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	legacy, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacy.Close()
+	if _, err := legacy.Exec(`UPDATE request_logs SET started_at = '2026-08-30T22:05:06.123456789+08:00' WHERE id = 'legacy-offset'`); err != nil {
+		t.Fatal(err)
+	}
+	// Back the marker up so the timestamp step runs again.
+	if _, err := legacy.Exec(`UPDATE proxy_meta SET value = '3' WHERE key = 'schema_version'`); err != nil {
+		t.Fatal(err)
+	}
+
+	rewritten, err := OpenStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rewritten.Close()
+
+	var stored string
+	if err := rewritten.db.QueryRow(`SELECT started_at FROM request_logs WHERE id = 'legacy-offset'`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if want := formatTimestamp(time.Date(2026, 8, 30, 14, 5, 6, 123456789, time.UTC)); stored != want {
+		t.Fatalf("started_at = %q, want the UTC fixed-width %q", stored, want)
+	}
+}
+
+// openTestStore opens a throwaway database for one test.
+func openTestStore(t *testing.T) *Store {
+	t.Helper()
+	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	return store
+}
+
+// The overview board asks for the newest few rows of every gateway at once. A
+// shared LIMIT would let a busy gateway crowd a quiet one out of the answer,
+// which is why this is a per-gateway window rather than one filtered list.
+func TestRecentByGatewayTakesNewestPerGateway(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	base := time.Now().Add(-time.Hour)
+	insert := func(id, gateway string, at time.Time) {
+		if err := store.Insert(ctx, RequestLog{ID: id, GatewayID: gateway, StartedAt: at, Success: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 5; i++ {
+		insert(fmt.Sprintf("loud-%d", i), "loud", base.Add(time.Duration(i)*time.Minute))
+	}
+	insert("quiet-0", "quiet", base)
+
+	recent, err := store.RecentByGateway(ctx, LogFilter{Limit: 50}, 2)
+	if err != nil {
+		t.Fatalf("RecentByGateway: %v", err)
+	}
+	if len(recent) != 2 {
+		t.Fatalf("gateways = %d, want 2: %+v", len(recent), recent)
+	}
+	if len(recent["quiet"]) != 1 {
+		t.Fatalf("quiet gateway rows = %d, want 1", len(recent["quiet"]))
+	}
+	// Newest first, so the last two insertions rather than the first two.
+	if len(recent["loud"]) != 2 || recent["loud"][0].ID != "loud-4" || recent["loud"][1].ID != "loud-3" {
+		t.Fatalf("loud rows are not the newest two, newest first: %+v", recent["loud"])
+	}
+}
+
+// The window has to respect the same filters the list does, or the board would
+// show traffic the user had already filtered out.
+func TestRecentByGatewayHonoursFilters(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	cutoff := time.Now().Add(-time.Hour)
+	for _, log := range []RequestLog{
+		{ID: "old", GatewayID: "ds", StartedAt: cutoff.Add(-2 * time.Hour), Model: "m1"},
+		{ID: "new", GatewayID: "ds", StartedAt: cutoff, Model: "m1", Success: true},
+		{ID: "other-model", GatewayID: "ds", StartedAt: time.Now(), Model: "m2"},
+	} {
+		if err := store.Insert(ctx, log); err != nil {
+			t.Fatal(err)
+		}
+	}
+	from := cutoff.Add(-time.Minute)
+	recent, err := store.RecentByGateway(ctx, LogFilter{From: &from, Model: "m1"}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recent["ds"]) != 1 || recent["ds"][0].ID != "new" {
+		t.Fatalf("filters were ignored: %+v", recent["ds"])
+	}
+}
+
+// distinguishableRow has a different value in every stored column, so a read
+// that takes one column's bytes for another's cannot pass by accident.
+func distinguishableRow(id string) RequestLog {
+	return RequestLog{
+		ID: id, StartedAt: time.Now().UTC().Add(-3 * time.Second),
+		GatewayID: "st", GatewayName: "SenseNova", Prefix: "/st",
+		IngressProtocol: config.ProtocolChat, UpstreamProtocol: config.ProtocolResponses,
+		Model: "grok-4", RequestPath: "/st/chat/completions",
+		RequestURL:  "https://client.test/st/chat/completions?trace=1",
+		UpstreamURL: "https://upstream.test/v1/chat/completions",
+		Method:      "POST", StatusCode: 200, ClientResponseStatusCode: 201,
+		UpstreamResponseStatusCode: 202, Success: true, Stream: true, DurationMS: 42,
+		Error: "not empty", ResponseTruncated: true,
+		RequestHeaders:          `{"request-headers":"1"}`,
+		RequestBody:             []byte("request-body"),
+		UpstreamHeaders:         `{"upstream-headers":"2"}`,
+		UpstreamBody:            []byte("upstream-body"),
+		UpstreamResponseHeaders: `{"upstream-response-headers":"3"}`,
+		UpstreamResponseBody:    []byte("upstream-response-body"),
+		ResponseHeaders:         `{"response-headers":"4"}`,
+		ResponseBody:            []byte("response-body"),
+		Usage: UsageMetrics{InputTokens: 1, CacheReadTokens: 2, CacheWriteTokens: 3,
+			PromptTokens: 4, OutputTokens: 5, ReasoningTokens: 6,
+			CacheSupported: true, UsagePresent: true, CacheSource: "usage-source"},
+	}
+}
+
+// requestLogColumns is now the single order the insert, both reads and the
+// compression migration are derived from. These checks pin the properties that
+// derivation assumes: before it, the same order lived in four hand-written
+// places and the only mismatch anything could detect was the argument count — a
+// swap stored one column's bytes in another's and every test stayed green.
+func TestRequestLogColumnLayout(t *testing.T) {
+	seen := map[string]bool{}
+	for _, column := range requestLogColumns {
+		if seen[column] {
+			t.Fatalf("column %q appears twice, so no prefix of the full read is a valid summary", column)
+		}
+		seen[column] = true
+	}
+	if got := requestLogColumns[summaryColumns : summaryColumns+len(detailScalarColumns)]; !slices.Equal(got, detailScalarColumns) {
+		t.Fatalf("detail columns are not the block right after the summary prefix: %v", got)
+	}
+	if got := requestLogColumns[len(requestLogColumns)-len(capturedColumns):]; !slices.Equal(got, capturedColumns) {
+		t.Fatalf("gzipped payloads are not the tail of the column order: %v", got)
+	}
+	var scan requestLogScan
+	if got, want := len(scan.targets()), len(requestLogColumns); got != want {
+		t.Fatalf("scan targets = %d, want one per column (%d)", got, want)
+	}
+}
+
+// Insert fills its arguments by column name, so the compiler can no longer see
+// a missing value: it becomes a request-path error naming the column.
+func TestInsertValuesCoverEveryColumn(t *testing.T) {
+	values, err := insertValues(distinguishableRow("insert-values"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, column := range requestLogColumns {
+		if _, ok := values[column]; !ok {
+			t.Fatalf("insertValues has no value for %q", column)
+		}
+	}
+	if got, want := len(values), len(requestLogColumns); got != want {
+		t.Fatalf("insertValues returns %d columns, requestLogColumns stores %d", got, want)
+	}
+}
+
+// capturedValues is what the insert gzips and capturedColumns is what the
+// migration walks and a full read decompresses. If the two stop naming the same
+// columns, a payload is stored plaintext and read back as gzip garbage.
+func TestCapturedValuesKeyTheCapturedColumns(t *testing.T) {
+	values := capturedValues(distinguishableRow("captured-values"))
+	if got, want := len(values), len(capturedColumns); got != want {
+		t.Fatalf("capturedValues returns %d columns, capturedColumns has %d", got, want)
+	}
+	for _, column := range capturedColumns {
+		if _, ok := values[column]; !ok {
+			t.Fatalf("capturedColumns stores %q but capturedValues has no value for it", column)
+		}
+	}
+	for column := range values {
+		if !slices.Contains(capturedColumns, column) {
+			t.Fatalf("capturedValues writes %q, which is not a captured column", column)
+		}
+	}
+}
+
+// The shared aggregate and its scan destinations are two lists for one row. The
+// SELECT is built from the first, so a length mismatch mis-scans both metrics
+// queries the same way.
+func TestMetricsAggregateColumnsMatchScanTargets(t *testing.T) {
+	if got, want := len(metricsAggregates), len((&metricsAggregate{}).scanArgs()); got != want {
+		t.Fatalf("metrics SELECT has %d columns, scanArgs has %d destinations", got, want)
+	}
+}
+
+// The round trip all of the above protects: every column comes back where it
+// went, and a summary row is the full row minus the columns it never selected.
+func TestStoredRowRoundTripsByColumn(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	want := distinguishableRow("round-trip")
+	if err := store.Insert(ctx, want); err != nil {
+		t.Fatal(err)
+	}
+
+	full, err := store.Get(ctx, want.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !full.StartedAt.Equal(want.StartedAt) {
+		t.Fatalf("started_at round-tripped as %v, want %v", full.StartedAt, want.StartedAt)
+	}
+	full.StartedAt = want.StartedAt
+	if !reflect.DeepEqual(full, want) {
+		t.Fatalf("stored row did not round-trip by column:\n got=%+v\nwant=%+v", full, want)
+	}
+
+	summaries, err := store.List(ctx, LogFilter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("summaries = %d, want 1", len(summaries))
+	}
+	summary := summaries[0]
+	if summary.RequestBody != nil || summary.RequestHeaders != "" || summary.ResponseTruncated {
+		t.Fatalf("summary read selected detail columns: %+v", summary)
+	}
+	withoutDetail := full
+	withoutDetail.RequestURL = ""
+	withoutDetail.ClientResponseStatusCode = 0
+	withoutDetail.UpstreamResponseStatusCode = 0
+	withoutDetail.ResponseTruncated = false
+	withoutDetail.RequestHeaders = ""
+	withoutDetail.RequestBody = nil
+	withoutDetail.UpstreamHeaders = ""
+	withoutDetail.UpstreamBody = nil
+	withoutDetail.UpstreamResponseHeaders = ""
+	withoutDetail.UpstreamResponseBody = nil
+	withoutDetail.ResponseHeaders = ""
+	withoutDetail.ResponseBody = nil
+	if !reflect.DeepEqual(summary, withoutDetail) {
+		t.Fatalf("summary is not a strict prefix of the full read:\n summary=%+v\n full-as-summary=%+v", summary, withoutDetail)
 	}
 }
