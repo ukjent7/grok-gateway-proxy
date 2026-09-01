@@ -18,21 +18,21 @@ func newTestConfig(t *testing.T) *Config {
 // must not leave temp files behind for the next save to trip over.
 func TestSaveRoundTripsAndLeavesNoTempFiles(t *testing.T) {
 	cfg := newTestConfig(t)
-	cfg.ListenAddr = "127.0.0.1:9999"
-	cfg.UpstreamTimeout = 45 * time.Second
-	cfg.LogRetention = 72 * time.Hour
-	cfg.BodyCaptureLimitKB = 256
+	cfg.SetListenAddr("127.0.0.1:9999")
+	cfg.SetUpstreamTimeout(45 * time.Second)
+	cfg.SetLogRetention(72 * time.Hour)
+	cfg.SetBodyCaptureLimitKB(256)
 
 	if err := cfg.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
-	reloaded, err := LoadConfig(cfg.ConfigPath, nil)
+	reloaded, err := LoadConfig(cfg.ConfigPath(), nil)
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if reloaded.ListenAddr != "127.0.0.1:9999" {
-		t.Fatalf("ListenAddr = %q, want 127.0.0.1:9999", reloaded.ListenAddr)
+	if reloaded.ListenAddr() != "127.0.0.1:9999" {
+		t.Fatalf("ListenAddr = %q, want 127.0.0.1:9999", reloaded.ListenAddr())
 	}
 	if reloaded.GetUpstreamTimeout() != 45*time.Second {
 		t.Fatalf("UpstreamTimeout = %v, want 45s", reloaded.GetUpstreamTimeout())
@@ -44,7 +44,7 @@ func TestSaveRoundTripsAndLeavesNoTempFiles(t *testing.T) {
 		t.Fatalf("BodyCaptureLimitKB = %d, want 256", reloaded.GetBodyCaptureLimitKB())
 	}
 
-	entries, err := os.ReadDir(filepath.Dir(cfg.ConfigPath))
+	entries, err := os.ReadDir(filepath.Dir(cfg.ConfigPath()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,16 +60,16 @@ func TestSaveRejectsInvalidConfig(t *testing.T) {
 	if err := cfg.Save(); err != nil {
 		t.Fatalf("initial Save: %v", err)
 	}
-	before, err := os.ReadFile(cfg.ConfigPath)
+	before, err := os.ReadFile(cfg.ConfigPath())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	cfg.ListenAddr = " "
+	cfg.SetListenAddr(" ")
 	if err := cfg.Save(); err == nil {
 		t.Fatal("expected Save to reject an empty listen_addr")
 	}
-	after, err := os.ReadFile(cfg.ConfigPath)
+	after, err := os.ReadFile(cfg.ConfigPath())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,21 +237,19 @@ func TestValidateProxyURL(t *testing.T) {
 	}
 }
 
-// Zero and negative values are what a hand-edited or truncated config file
-// produces, so the getters must substitute the defaults rather than hand back
-// a nonsensical duration or limit.
+// A zero upstream timeout is what an absent config field leaves behind, so the
+// getter substitutes the default rather than handing back a deadline that would
+// cancel every request. The body capture limit's zero is a meaningful value
+// ("capture everything") and must pass through untouched; a negative never
+// reaches the getter at all, because setBodyCaptureLimit is the only writer and
+// it rejects them (see TestLoadConfigRejectsNegativeBodyCaptureLimit).
 func TestGettersSubstituteDefaultsForUnsetValues(t *testing.T) {
 	cfg := newTestConfig(t)
-	cfg.UpstreamTimeout = 0
+	cfg.SetUpstreamTimeout(0)
 	if got := cfg.GetUpstreamTimeout(); got != DefaultUpstreamTimeout {
 		t.Fatalf("GetUpstreamTimeout() = %v, want %v", got, DefaultUpstreamTimeout)
 	}
-	cfg.BodyCaptureLimitKB = -1
-	if got := cfg.GetBodyCaptureLimitKB(); got != DefaultBodyCaptureLimitKB {
-		t.Fatalf("GetBodyCaptureLimitKB() = %d, want %d", got, DefaultBodyCaptureLimitKB)
-	}
-	// Zero is a meaningful value here ("capture everything"), not "unset".
-	cfg.BodyCaptureLimitKB = 0
+	cfg.SetBodyCaptureLimitKB(0)
 	if got := cfg.GetBodyCaptureLimitKB(); got != 0 {
 		t.Fatalf("GetBodyCaptureLimitKB() = %d, want 0", got)
 	}
@@ -292,7 +290,7 @@ func TestSavedConfigKeepsExpectedFieldNames(t *testing.T) {
 	if err := cfg.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	raw, err := os.ReadFile(cfg.ConfigPath)
+	raw, err := os.ReadFile(cfg.ConfigPath())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +378,7 @@ func TestSaveReportsWriteFailure(t *testing.T) {
 	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg.ConfigPath = filepath.Join(blocker, "config.json")
+	cfg.SetConfigPath(filepath.Join(blocker, "config.json"))
 	if err := cfg.Save(); err == nil {
 		t.Fatal("expected Save to fail when the target directory cannot be created")
 	}
@@ -390,5 +388,96 @@ func TestGatewayConfigUnmarshalJSONRejectsBadLegacyValue(t *testing.T) {
 	var gateway GatewayConfig
 	if err := json.Unmarshal([]byte(`{"use_system_proxy":"yes"}`), &gateway); err == nil {
 		t.Fatal("expected a non-boolean use_system_proxy to be rejected")
+	}
+}
+
+// The loader never writes; it reports whether the file on disk already
+// describes what it produced. Starting up must not rewrite a config that is
+// already current (that made a read-only config directory fatal and persisted
+// per-process overrides), and must rewrite one that is missing or stale.
+func TestShouldPersistReportsMissingOrStaleConfig(t *testing.T) {
+	t.Run("no file yet", func(t *testing.T) {
+		cfg, err := LoadConfig(filepath.Join(t.TempDir(), "config.json"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.ShouldPersist() {
+			t.Fatal("a generated default config is not the same as a written one")
+		}
+	})
+
+	t.Run("current file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.json")
+		cfg, err := LoadConfig(path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cfg.Save(); err != nil {
+			t.Fatal(err)
+		}
+		reloaded, err := LoadConfig(path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reloaded.ShouldPersist() {
+			t.Fatal("a config loaded from the file the same build wrote still needs a rewrite")
+		}
+	})
+
+	t.Run("file carries an unsupported gateway", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.json")
+		body := `{"listen_addr":"127.0.0.1:8787","gateways":{` +
+			`"ds":{"id":"ds","prefix":"/ds","name":"DeepSeek","protocol":"responses","enabled":true,"user_agent_override":"ua","use_proxy":true},` +
+			`"st":{"id":"st","prefix":"/st","name":"SenseNova","base_url":"https://x.test/v1","protocol":"chat_completions","enabled":true,"user_agent_override":"ua","use_proxy":true},` +
+			`"std":{"id":"std","prefix":"/std","name":"Std","protocol":"responses","enabled":true,"user_agent_override":"ua","use_proxy":true},` +
+			`"oc":{"id":"oc","prefix":"/oc","name":"Legacy","protocol":"responses","enabled":true,"user_agent_override":"ua","use_proxy":true}}}`
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := LoadConfig(path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := cfg.Gateways["oc"]; ok {
+			t.Fatal("the unsupported gateway survived into the merged config")
+		}
+		if !cfg.ShouldPersist() {
+			t.Fatal("a file still listing a dropped gateway needs a rewrite")
+		}
+	})
+
+	t.Run("file predates a gateway", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(path, []byte(`{"listen_addr":"127.0.0.1:8787","gateways":{"ds":{"id":"ds","name":"DeepSeek"}}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := LoadConfig(path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.ShouldPersist() {
+			t.Fatal("gateways filled in from defaults are not on disk yet")
+		}
+	})
+}
+
+// Routing sits on every proxied request, so it must not rebuild the gateway
+// table to read one entry out of it. Snapshot deep-copies the map and every
+// ForwardHeaders slice; MatchGateway reads the live table under the lock and
+// copies nothing, and this is what keeps that true.
+func TestMatchGatewayDoesNotAllocate(t *testing.T) {
+	cfg := newTestConfig(t)
+	gateway := cfg.Gateways["ds"]
+	gateway.ForwardHeaders = []string{"X-One", "X-Two"}
+	cfg.Gateways["ds"] = gateway
+
+	allocs := testing.AllocsPerRun(100, func() {
+		matched, _, ok := cfg.MatchGateway("/ds/responses")
+		if !ok || matched.ID != "ds" {
+			t.Fatalf("MatchGateway did not resolve /ds/responses: %+v %v", matched, ok)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("MatchGateway allocated %v times per call, want 0", allocs)
 	}
 }

@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -20,11 +23,6 @@ const (
 )
 
 const DefaultUpstreamTimeout = 5 * time.Minute
-
-// DefaultBodyCaptureLimitKB bounds the per-column body capture size for audit
-// logging. Bodies larger than this are still forwarded to the client in full;
-// only the stored copy is truncated. 256KB covers most LLM payloads while
-// preventing a single large response from consuming disproportionate space.
 const DefaultBodyCaptureLimitKB = 256
 
 type GatewayConfig struct {
@@ -35,13 +33,27 @@ type GatewayConfig struct {
 	Protocol                 Protocol `json:"protocol"`
 	Enabled                  bool     `json:"enabled"`
 	ForwardHeaders           []string `json:"forward_headers,omitempty"`
+	SessionAffinity          string   `json:"session_affinity,omitempty"`
 	UserAgentOverrideEnabled bool     `json:"user_agent_override_enabled"`
 	UserAgentOverride        string   `json:"user_agent_override,omitempty"`
 	UseProxy                 bool     `json:"use_proxy"`
 }
 
-// UnmarshalJSON migrates the previous per-gateway proxy switch while keeping
-// newly created gateways enabled by default.
+const (
+	SessionAffinityOpenAI     = "openai"
+	SessionAffinityOpenRouter = "openrouter"
+	SessionAffinityOff        = "off"
+)
+
+var SessionAffinityModes = []string{SessionAffinityOpenAI, SessionAffinityOpenRouter, SessionAffinityOff}
+
+func (g GatewayConfig) EffectiveSessionAffinity() string {
+	if slices.Contains(SessionAffinityModes, g.SessionAffinity) {
+		return g.SessionAffinity
+	}
+	return SessionAffinityOpenAI
+}
+
 func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 	type gatewayConfig GatewayConfig
 	var decoded gatewayConfig
@@ -66,20 +78,58 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 }
 
 type Config struct {
-	ListenAddr         string                   `json:"listen_addr"`
+	listenAddr         string
 	proxyURL           string                   `json:"-"`
-	UpstreamTimeout    time.Duration            `json:"-"`
-	LogRetention       time.Duration            `json:"-"`
-	BodyCaptureLimitKB int                      `json:"-"`
-	ConfigPath         string                   `json:"-"`
+	upstreamTimeout    time.Duration            `json:"-"`
+	logRetention       time.Duration            `json:"-"`
+	bodyCaptureLimitKB int                      `json:"-"`
+	configPath         string                   `json:"-"`
 	Gateways           map[string]GatewayConfig `json:"gateways"`
+	persist            bool
 	mu                 sync.RWMutex
 }
 
-// DefaultGateways holds the fixed identity (prefix/protocol/name/base URL) for
-// each supported gateway. Built once and reused for validation and defaults
-// instead of allocating a fresh Config on every validation.
+func (c *Config) ShouldPersist() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.persist
+}
+
+var DefaultUserAgentOverride = "grok-gateway-proxy/dev"
+
+func SetProductVersion(version string) {
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return
+	}
+	DefaultUserAgentOverride = "grok-gateway-proxy/" + version
+	for id, gateway := range DefaultGateways {
+		gateway.UserAgentOverride = DefaultUserAgentOverride
+		DefaultGateways[id] = gateway
+	}
+}
+
+var customGatewayIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+var headerNamePattern = regexp.MustCompile(`^[!#$%&'*+\-.^_|~0-9A-Za-z]+$`)
+
+func CustomGatewayIDPattern() string { return customGatewayIDPattern.String() }
+
+func ReservedPrefixes() []string {
+	out := make([]string, 0, len(reservedPrefixes))
+	for _, prefix := range reservedPrefixes {
+		out = append(out, strings.TrimPrefix(prefix, "/"))
+	}
+	return out
+}
+
+var reservedPrefixes = []string{"/api", "/static", "/healthz", "/ui"}
+var legacyGatewayIDs = map[string]bool{"oc": true, "ve": true}
 var DefaultGateways = BuildDefaultGateways()
+
+func IsBuiltinGateway(id string) bool {
+	_, ok := DefaultGateways[id]
+	return ok
+}
 
 func BuildDefaultGateways() map[string]GatewayConfig {
 	return map[string]GatewayConfig{
@@ -90,7 +140,8 @@ func BuildDefaultGateways() map[string]GatewayConfig {
 			BaseURL:           "",
 			Protocol:          ProtocolResponses,
 			Enabled:           true,
-			UserAgentOverride: "grok-gateway-proxy/dev",
+			SessionAffinity:   SessionAffinityOpenAI,
+			UserAgentOverride: DefaultUserAgentOverride,
 			UseProxy:          true,
 		},
 		"st": {
@@ -100,7 +151,8 @@ func BuildDefaultGateways() map[string]GatewayConfig {
 			BaseURL:           "https://token.sensenova.cn/v1",
 			Protocol:          ProtocolChat,
 			Enabled:           true,
-			UserAgentOverride: "grok-gateway-proxy/dev",
+			SessionAffinity:   SessionAffinityOpenAI,
+			UserAgentOverride: DefaultUserAgentOverride,
 			UseProxy:          true,
 		},
 		"std": {
@@ -110,7 +162,8 @@ func BuildDefaultGateways() map[string]GatewayConfig {
 			BaseURL:           "",
 			Protocol:          ProtocolResponses,
 			Enabled:           true,
-			UserAgentOverride: "grok-gateway-proxy/dev",
+			SessionAffinity:   SessionAffinityOpenAI,
+			UserAgentOverride: DefaultUserAgentOverride,
 			UseProxy:          true,
 		},
 	}
@@ -118,27 +171,23 @@ func BuildDefaultGateways() map[string]GatewayConfig {
 
 func DefaultConfig(path string) *Config {
 	return &Config{
-		ListenAddr:         "127.0.0.1:8787",
-		UpstreamTimeout:    DefaultUpstreamTimeout,
-		LogRetention:       7 * 24 * time.Hour,
-		BodyCaptureLimitKB: DefaultBodyCaptureLimitKB,
-		ConfigPath:         path,
+		listenAddr:         "127.0.0.1:8787",
+		upstreamTimeout:    DefaultUpstreamTimeout,
+		logRetention:       7 * 24 * time.Hour,
+		bodyCaptureLimitKB: DefaultBodyCaptureLimitKB,
+		configPath:         path,
 		Gateways:           BuildDefaultGateways(),
 	}
 }
 
-// LoadConfig loads configuration from path. logRetentionDays is the explicit
-// retention (in days) supplied via the --log-retention-days flag or the
-// GROK_PROXY_LOG_RETENTION_DAYS env var; it is nil when neither was provided.
-//
-// Precedence (highest to lowest): explicit flag/env > config file value >
-// built-in default (7 days). Passing nil means "no explicit value", so the
-// file value (or the default) applies.
+// LoadConfig loads configuration from the specified path. If logRetentionDays
+// is non-nil, it overrides the value in the configuration.
 func LoadConfig(path string, logRetentionDays *int) (*Config, error) {
 	cfg := DefaultConfig(path)
 
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
+		cfg.persist = true
 		if logRetentionDays != nil {
 			if err := cfg.setLogRetention(*logRetentionDays); err != nil {
 				return nil, fmt.Errorf("invalid log retention: %w", err)
@@ -161,13 +210,12 @@ func LoadConfig(path string, logRetentionDays *int) (*Config, error) {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
 	if disk.ListenAddr != "" {
-		cfg.ListenAddr = disk.ListenAddr
+		cfg.listenAddr = disk.ListenAddr
 	}
 	cfg.proxyURL = strings.TrimSpace(disk.ProxyURL)
 	if disk.UpstreamTimeoutS > 0 {
-		cfg.UpstreamTimeout = time.Duration(disk.UpstreamTimeoutS) * time.Second
+		cfg.upstreamTimeout = time.Duration(disk.UpstreamTimeoutS) * time.Second
 	}
-	// Precedence: explicit flag/env (logRetentionDays) > file value > default.
 	if disk.LogRetentionDays != nil {
 		if err := cfg.setLogRetention(*disk.LogRetentionDays); err != nil {
 			return nil, fmt.Errorf("invalid config: %w", err)
@@ -193,11 +241,37 @@ func LoadConfig(path string, logRetentionDays *int) (*Config, error) {
 			if gateway.BaseURL == "" {
 				gateway.BaseURL = defaultGateway.BaseURL
 			}
-			if gateway.UserAgentOverride == "" {
+			if gateway.UserAgentOverride == "" || gateway.UserAgentOverride == "grok-gateway-proxy/dev" {
 				gateway.UserAgentOverride = defaultGateway.UserAgentOverride
 			}
 			gateway.ID = id
 			cfg.Gateways[id] = gateway
+			continue
+		}
+		gateway.ID = id
+		gateway.Prefix = "/" + id
+		gateway.Protocol = ProtocolResponses
+		if gateway.Name == "" {
+			gateway.Name = id
+		}
+		if gateway.UserAgentOverride == "" || gateway.UserAgentOverride == "grok-gateway-proxy/dev" {
+			gateway.UserAgentOverride = DefaultUserAgentOverride
+		}
+		if validateCustomGateway(id, gateway) != nil {
+			cfg.persist = true
+			continue
+		}
+		cfg.Gateways[id] = gateway
+	}
+	for id, gateway := range cfg.Gateways {
+		if strings.TrimSpace(gateway.SessionAffinity) == "" {
+			gateway.SessionAffinity = SessionAffinityOpenAI
+			cfg.Gateways[id] = gateway
+		}
+	}
+	for id := range DefaultGateways {
+		if _, ok := disk.Gateways[id]; !ok {
+			cfg.persist = true
 		}
 	}
 	if err := cfg.Validate(); err != nil {
@@ -206,46 +280,30 @@ func LoadConfig(path string, logRetentionDays *int) (*Config, error) {
 	return cfg, nil
 }
 
-// setLogRetention validates and applies a retention duration in days. Zero
-// means "keep forever"; negative values are rejected.
 func (c *Config) setLogRetention(days int) error {
 	if days < 0 {
 		return errors.New("log_retention_days must be >= 0")
 	}
-	c.LogRetention = time.Duration(days) * 24 * time.Hour
+	c.logRetention = time.Duration(days) * 24 * time.Hour
 	return nil
 }
 
-// setBodyCaptureLimit validates and applies the per-column body capture limit
-// in KB. Zero means "capture everything" (backward-compatible); negative
-// values are rejected.
 func (c *Config) setBodyCaptureLimit(kb int) error {
 	if kb < 0 {
 		return errors.New("body_capture_limit_kb must be >= 0")
 	}
-	c.BodyCaptureLimitKB = kb
+	c.bodyCaptureLimitKB = kb
 	return nil
 }
 
-// Save persists the config to disk. It takes the write lock, not a read one:
-// saveLocked serializes the in-memory config, and other goroutines mutate
-// those fields under the same write lock, so a read lock would allow a torn
-// snapshot (e.g. one gateway entry from before a concurrent edit).
+// Save persists the configuration to disk under a write lock.
 func (c *Config) Save() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.saveLocked()
 }
 
-// saveLocked persists the config to disk, writing to a uniquely named temp
-// file and renaming it into place so readers never observe a partially
-// written config. The caller must hold c.mu (write lock).
-//
-// The temp name is randomized rather than a fixed <path>.tmp: a fixed name is
-// shared state, so a concurrent writer (another Save, or an external tool)
-// could truncate it mid-write and leave the rename publishing someone else's
-// bytes. A unique name also means a crashed save leaves behind garbage that
-// the next save simply ignores, instead of a .tmp file the next save reuses.
+// saveLocked writes the configuration to a temporary file and atomically renames it.
 func (c *Config) saveLocked() error {
 	if err := c.validateLocked(); err != nil {
 		return err
@@ -258,22 +316,21 @@ func (c *Config) saveLocked() error {
 		BodyCaptureLimitKB     int                      `json:"body_capture_limit_kb"`
 		Gateways               map[string]GatewayConfig `json:"gateways"`
 	}{
-		ListenAddr:             c.ListenAddr,
+		ListenAddr:             c.listenAddr,
 		ProxyURL:               c.proxyURL,
-		UpstreamTimeoutSeconds: int(c.UpstreamTimeout / time.Second),
-		LogRetentionDays:       int(c.LogRetention / (24 * time.Hour)),
-		BodyCaptureLimitKB:     c.BodyCaptureLimitKB,
+		UpstreamTimeoutSeconds: int(c.upstreamTimeout / time.Second),
+		LogRetentionDays:       int(c.logRetention / (24 * time.Hour)),
+		BodyCaptureLimitKB:     c.bodyCaptureLimitKB,
 		Gateways:               c.Gateways,
 	}, "", "  ")
 	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(c.ConfigPath)
+	dir := filepath.Dir(c.configPath)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	// CreateTemp applies 0o600 to the file it creates.
-	tmp, err := os.CreateTemp(dir, filepath.Base(c.ConfigPath)+".*.tmp")
+	tmp, err := os.CreateTemp(dir, filepath.Base(c.configPath)+".*.tmp")
 	if err != nil {
 		return err
 	}
@@ -283,11 +340,16 @@ func (c *Config) saveLocked() error {
 		_ = os.Remove(tmpName)
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpName)
 		return err
 	}
-	if err := os.Rename(tmpName, c.ConfigPath); err != nil {
+	if err := os.Rename(tmpName, c.configPath); err != nil {
 		_ = os.Remove(tmpName)
 		return err
 	}
@@ -298,32 +360,124 @@ func ValidateConfig(listenAddr string, gateways map[string]GatewayConfig) error 
 	if strings.TrimSpace(listenAddr) == "" {
 		return errors.New("listen_addr is required")
 	}
+	owners := make(map[string]string, len(gateways))
 	for id, gateway := range gateways {
-		expected, ok := DefaultGateways[id]
-		if !ok {
-			return fmt.Errorf("gateway %q is not supported", id)
-		}
-		if gateway.ID != id {
-			return fmt.Errorf("gateway %q has mismatched id", id)
-		}
-		if gateway.Prefix != expected.Prefix {
-			return fmt.Errorf("gateway %q must use prefix %s", id, expected.Prefix)
-		}
-		if gateway.Protocol != expected.Protocol {
-			return fmt.Errorf("gateway %q must use protocol %q", id, expected.Protocol)
+		if IsBuiltinGateway(id) {
+			if err := validateBuiltinGateway(id, gateway); err != nil {
+				return err
+			}
+		} else if err := validateCustomGateway(id, gateway); err != nil {
+			return err
 		}
 		if gateway.UserAgentOverrideEnabled && strings.TrimSpace(gateway.UserAgentOverride) == "" {
 			return fmt.Errorf("gateway %q user_agent_override is required when the override is enabled", id)
 		}
+		// ForwardHeaders is user-editable, so each name has to be one the HTTP
+		// transport can actually put on the wire: a name with a colon, a
+		// space or a non-ASCII byte is either dropped or rejected at write
+		// time, which would leave the gateway silently forwarding nothing.
+		for _, name := range gateway.ForwardHeaders {
+			if !headerNamePattern.MatchString(strings.TrimSpace(name)) {
+				return fmt.Errorf("gateway %q forward_headers entry %q is not a valid HTTP header name", id, name)
+			}
+		}
+		if affinity := strings.TrimSpace(gateway.SessionAffinity); affinity != "" && !slices.Contains(SessionAffinityModes, affinity) {
+			return fmt.Errorf("gateway %q session_affinity %q must be one of %s", id, affinity, strings.Join(SessionAffinityModes, ", "))
+		}
 		// Base URL may be empty: the gateway stays unusable until a base URL
 		// is configured in the console, but the config itself is valid.
-		if strings.TrimSpace(gateway.BaseURL) == "" {
-			continue
+		if raw := strings.TrimSpace(gateway.BaseURL); raw != "" {
+			u, err := url.Parse(raw)
+			if err != nil || u.Scheme != "https" || u.Host == "" {
+				return fmt.Errorf("gateway %q base_url must be an HTTPS URL", id)
+			}
 		}
-		u, err := url.Parse(gateway.BaseURL)
-		if err != nil || u.Scheme != "https" || u.Host == "" {
-			return fmt.Errorf("gateway %q base_url must be an HTTPS URL", id)
+		for _, reserved := range reservedPrefixes {
+			if gateway.Prefix == reserved || strings.HasPrefix(gateway.Prefix, reserved+"/") {
+				return fmt.Errorf("gateway %q prefix %s is reserved by the console", id, gateway.Prefix)
+			}
 		}
+		if other, dup := owners[gateway.Prefix]; dup {
+			return fmt.Errorf("gateways %q and %q share prefix %s", other, id, gateway.Prefix)
+		}
+		owners[gateway.Prefix] = id
+	}
+	return nil
+}
+
+func validateBuiltinGateway(id string, gateway GatewayConfig) error {
+	expected := DefaultGateways[id]
+	if gateway.ID != id {
+		return fmt.Errorf("gateway %q has mismatched id", id)
+	}
+	if gateway.Prefix != expected.Prefix {
+		return fmt.Errorf("gateway %q must use prefix %s", id, expected.Prefix)
+	}
+	if gateway.Protocol != expected.Protocol {
+		return fmt.Errorf("gateway %q must use protocol %q", id, expected.Protocol)
+	}
+	return nil
+}
+
+func validateCustomGateway(id string, gateway GatewayConfig) error {
+	if !customGatewayIDPattern.MatchString(id) {
+		return fmt.Errorf("gateway id %q must match %s", id, customGatewayIDPattern.String())
+	}
+	if legacyGatewayIDs[id] {
+		return fmt.Errorf("gateway id %q was used by a gateway this build removed", id)
+	}
+	if gateway.ID != id {
+		return fmt.Errorf("gateway %q has mismatched id", id)
+	}
+	if gateway.Prefix != "/"+id {
+		return fmt.Errorf("gateway %q must use prefix /%s", id, id)
+	}
+	if gateway.Protocol != ProtocolResponses {
+		return fmt.Errorf("gateway %q must use protocol %q: custom gateways reuse the standard Responses adapter", id, ProtocolResponses)
+	}
+	if strings.TrimSpace(gateway.Name) == "" {
+		return fmt.Errorf("gateway %q requires a name", id)
+	}
+	return nil
+}
+
+func ModelKey(name, id string) string {
+	for _, candidate := range []string{name, id, "model"} {
+		if key := slug(candidate); key != "" {
+			return key + "-model"
+		}
+	}
+	return "model-model"
+}
+
+func slug(s string) string {
+	var out strings.Builder
+	pendingHyphen := false
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			if pendingHyphen && out.Len() > 0 {
+				out.WriteByte('-')
+			}
+			pendingHyphen = false
+			out.WriteRune(r)
+		default:
+			if out.Len() > 0 {
+				pendingHyphen = true
+			}
+		}
+	}
+	return out.String()
+}
+
+func ValidateGatewayModelKeys(gateways map[string]GatewayConfig) error {
+	owners := make(map[string]string, len(gateways))
+	for _, id := range slices.Sorted(maps.Keys(gateways)) {
+		key := ModelKey(gateways[id].Name, id)
+		if other, dup := owners[key]; dup {
+			return fmt.Errorf("gateways %q and %q both map to the client model key %q; rename one", other, id, key)
+		}
+		owners[key] = id
 	}
 	return nil
 }
@@ -332,7 +486,7 @@ func (c *Config) validateLocked() error {
 	if err := ValidateProxyURL(c.proxyURL); err != nil {
 		return err
 	}
-	return ValidateConfig(c.ListenAddr, c.Gateways)
+	return ValidateConfig(c.listenAddr, c.Gateways)
 }
 
 func ValidateProxyURL(raw string) error {
@@ -363,26 +517,117 @@ func (c *Config) Snapshot() map[string]GatewayConfig {
 	return result
 }
 
-// GatewayPatch contains the mutable gateway fields that can be updated
-// partially. Nil fields are left unchanged.
+func (c *Config) MatchGateway(path string) (GatewayConfig, string, bool) {
+	if c == nil {
+		return matchGatewayInMap(DefaultGateways, path)
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return matchGatewayInMap(c.Gateways, path)
+}
+
+func matchGatewayInMap(gateways map[string]GatewayConfig, path string) (GatewayConfig, string, bool) {
+	var (
+		best    GatewayConfig
+		bestLen = -1
+	)
+	for _, gateway := range gateways {
+		if path != gateway.Prefix && !strings.HasPrefix(path, gateway.Prefix+"/") {
+			continue
+		}
+		if len(gateway.Prefix) > bestLen || (len(gateway.Prefix) == bestLen && gateway.ID < best.ID) {
+			best, bestLen = gateway, len(gateway.Prefix)
+		}
+	}
+	if bestLen < 0 {
+		return GatewayConfig{}, "", false
+	}
+	return best, strings.TrimPrefix(path, best.Prefix), true
+}
+
 type GatewayPatch struct {
 	Name                     *string   `json:"name"`
 	BaseURL                  *string   `json:"base_url"`
 	Enabled                  *bool     `json:"enabled"`
 	ForwardHeaders           *[]string `json:"forward_headers"`
+	SessionAffinity          *string   `json:"session_affinity"`
 	UserAgentOverrideEnabled *bool     `json:"user_agent_override_enabled"`
 	UserAgentOverride        *string   `json:"user_agent_override"`
 	UseProxy                 *bool     `json:"use_proxy"`
 	LegacyUseSystemProxy     *bool     `json:"use_system_proxy"`
 }
 
-// ErrUnknownGateway reports a gateway id that has no configuration. Callers
-// match it with errors.Is to map the failure to a 404 instead of a string
-// comparison on the message.
 var ErrUnknownGateway = errors.New("unknown gateway")
+var ErrBuiltinGateway = errors.New("built-in gateway")
 
-// PatchGateway applies a partial update to a single gateway and persists the
-// result. Unknown ids and invalid candidate values are rejected.
+type NewGateway struct {
+	Prefix  string `json:"prefix"`
+	Name    string `json:"name"`
+	BaseURL string `json:"base_url"`
+}
+
+func (c *Config) AddGateway(req NewGateway) (GatewayConfig, error) {
+	id := strings.TrimPrefix(strings.TrimSpace(req.Prefix), "/")
+	if !customGatewayIDPattern.MatchString(id) {
+		return GatewayConfig{}, fmt.Errorf("gateway prefix %q must be a single segment matching %s", req.Prefix, customGatewayIDPattern.String())
+	}
+	if legacyGatewayIDs[id] {
+		return GatewayConfig{}, fmt.Errorf("gateway prefix %q was used by a gateway this build removed", req.Prefix)
+	}
+	if IsBuiltinGateway(id) {
+		return GatewayConfig{}, fmt.Errorf("%w %q", ErrBuiltinGateway, id)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.Gateways[id]; exists {
+		return GatewayConfig{}, fmt.Errorf("gateway %q already exists", id)
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = id
+	}
+	gateway := GatewayConfig{
+		ID:                id,
+		Prefix:            "/" + id,
+		Name:              name,
+		BaseURL:           strings.TrimSpace(req.BaseURL),
+		Protocol:          ProtocolResponses,
+		Enabled:           true,
+		SessionAffinity:   SessionAffinityOpenAI,
+		UserAgentOverride: DefaultUserAgentOverride,
+		UseProxy:          true,
+	}
+	updated := copyGateways(c.Gateways)
+	updated[id] = gateway
+	if err := c.commitLocked(updated); err != nil {
+		return GatewayConfig{}, err
+	}
+	return updated[id], nil
+}
+
+func (c *Config) DeleteGateway(id string) error {
+	if IsBuiltinGateway(id) {
+		return fmt.Errorf("%w %q", ErrBuiltinGateway, id)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.Gateways[id]; !ok {
+		return fmt.Errorf("%w %q", ErrUnknownGateway, id)
+	}
+	updated := copyGateways(c.Gateways)
+	delete(updated, id)
+	return c.commitLocked(updated)
+}
+
+func copyGateways(src map[string]GatewayConfig) map[string]GatewayConfig {
+	result := make(map[string]GatewayConfig, len(src))
+	for id, gateway := range src {
+		result[id] = gateway
+	}
+	return result
+}
+
 func (c *Config) PatchGateway(id string, patch GatewayPatch) (GatewayConfig, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -404,6 +649,9 @@ func (c *Config) PatchGateway(id string, patch GatewayPatch) (GatewayConfig, err
 	if patch.ForwardHeaders != nil {
 		gateway.ForwardHeaders = append([]string(nil), *patch.ForwardHeaders...)
 	}
+	if patch.SessionAffinity != nil {
+		gateway.SessionAffinity = strings.TrimSpace(*patch.SessionAffinity)
+	}
 	if patch.UserAgentOverrideEnabled != nil {
 		gateway.UserAgentOverrideEnabled = *patch.UserAgentOverrideEnabled
 	}
@@ -416,10 +664,7 @@ func (c *Config) PatchGateway(id string, patch GatewayPatch) (GatewayConfig, err
 		gateway.UseProxy = *patch.LegacyUseSystemProxy
 	}
 
-	updated := make(map[string]GatewayConfig, len(c.Gateways))
-	for k, v := range c.Gateways {
-		updated[k] = v
-	}
+	updated := copyGateways(c.Gateways)
 	updated[id] = normalizeGateway(id, current, gateway)
 	if err := c.commitLocked(updated); err != nil {
 		return GatewayConfig{}, err
@@ -427,9 +672,6 @@ func (c *Config) PatchGateway(id string, patch GatewayPatch) (GatewayConfig, err
 	return updated[id], nil
 }
 
-// normalizeGateway pins the immutable identity fields (id/prefix/protocol) to
-// the known gateway and falls back to the current name when the candidate
-// omits it.
 func normalizeGateway(id string, current, candidate GatewayConfig) GatewayConfig {
 	candidate.ID = id
 	candidate.Prefix = current.Prefix
@@ -440,11 +682,11 @@ func normalizeGateway(id string, current, candidate GatewayConfig) GatewayConfig
 	return candidate
 }
 
-// commitLocked validates and swaps in a candidate gateway map, persisting it.
-// The caller must hold c.mu (write lock). On persistence failure the previous
-// gateways are restored.
 func (c *Config) commitLocked(updated map[string]GatewayConfig) error {
-	if err := ValidateConfig(c.ListenAddr, updated); err != nil {
+	if err := ValidateConfig(c.listenAddr, updated); err != nil {
+		return err
+	}
+	if err := ValidateGatewayModelKeys(updated); err != nil {
 		return err
 	}
 	old := c.Gateways
@@ -456,7 +698,6 @@ func (c *Config) commitLocked(updated map[string]GatewayConfig) error {
 	return nil
 }
 
-// SetProxyURL atomically updates the global HTTP/HTTPS proxy address.
 func (c *Config) SetProxyURL(proxyURL string) error {
 	proxyURL = strings.TrimSpace(proxyURL)
 	if err := ValidateProxyURL(proxyURL); err != nil {
@@ -473,36 +714,71 @@ func (c *Config) SetProxyURL(proxyURL string) error {
 	return nil
 }
 
-// ProxyURL returns the current global HTTP/HTTPS proxy URL. Reads must go
-// through this accessor (rather than the proxyURL field directly) because the
-// value is mutated by SetProxyURL under c.mu while the HTTP server may read it
-// concurrently.
+func (c *Config) ListenAddr() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.listenAddr
+}
+
+func (c *Config) SetListenAddr(listenAddr string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.listenAddr = listenAddr
+}
+
 func (c *Config) ProxyURL() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.proxyURL
 }
 
+func (c *Config) ConfigPath() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.configPath
+}
+
+func (c *Config) SetConfigPath(path string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.configPath = path
+}
+
 func (c *Config) GetUpstreamTimeout() time.Duration {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if c.UpstreamTimeout <= 0 {
+	if c.upstreamTimeout <= 0 {
 		return DefaultUpstreamTimeout
 	}
-	return c.UpstreamTimeout
+	return c.upstreamTimeout
+}
+
+func (c *Config) SetUpstreamTimeout(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.upstreamTimeout = d
 }
 
 func (c *Config) GetLogRetention() time.Duration {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.LogRetention
+	return c.logRetention
+}
+
+func (c *Config) SetLogRetention(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.logRetention = d
 }
 
 func (c *Config) GetBodyCaptureLimitKB() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if c.BodyCaptureLimitKB < 0 {
-		return DefaultBodyCaptureLimitKB
-	}
-	return c.BodyCaptureLimitKB
+	return c.bodyCaptureLimitKB
+}
+
+func (c *Config) SetBodyCaptureLimitKB(kb int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.bodyCaptureLimitKB = kb
 }

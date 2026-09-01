@@ -93,8 +93,8 @@ func TestLoadConfigRetentionPrecedence(t *testing.T) {
 				t.Fatalf("LoadConfig: %v", err)
 			}
 			want := time.Duration(tc.wantDays) * 24 * time.Hour
-			if cfg.LogRetention != want {
-				t.Fatalf("LogRetention = %v, want %v", cfg.LogRetention, want)
+			if cfg.GetLogRetention() != want {
+				t.Fatalf("LogRetention = %v, want %v", cfg.GetLogRetention(), want)
 			}
 		})
 	}
@@ -122,8 +122,8 @@ func TestLoadConfigBodyCaptureLimit(t *testing.T) {
 			if err != nil {
 				t.Fatalf("LoadConfig: %v", err)
 			}
-			if cfg.BodyCaptureLimitKB != tc.want {
-				t.Fatalf("BodyCaptureLimitKB = %d, want %d", cfg.BodyCaptureLimitKB, tc.want)
+			if cfg.GetBodyCaptureLimitKB() != tc.want {
+				t.Fatalf("BodyCaptureLimitKB = %d, want %d", cfg.GetBodyCaptureLimitKB(), tc.want)
 			}
 		})
 	}
