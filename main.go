@@ -31,6 +31,7 @@ func main() {
 	shutdownTimeout := flag.Duration("shutdown-timeout", 30*time.Second, "优雅关闭等待在途请求的最长时间")
 	logLevel := flag.String("log-level", "info", "日志级别：debug / info / warn / error")
 	logRetentionDays := flag.Int("log-retention-days", 7, "日志保留天数（0 表示永久保留）；显式指定时优先于配置文件，未指定则读配置 log_retention_days（默认 7），GROK_PROXY_LOG_RETENTION_DAYS 可覆盖")
+	healthInterval := flag.Duration("health-check-interval", 30*time.Second, "上游连通性探测周期；每次探测都会向该网关已配置的 Base URL 发出 /models 请求（预置 Base URL 的网关在首次启动即会外发）。0 表示完全关闭探测，控制台的上游健康灯随之保持未知")
 	flag.Parse()
 
 	if env := os.Getenv("GROK_PROXY_LISTEN"); env != "" && *listen == "" {
@@ -39,10 +40,7 @@ func main() {
 	if env := os.Getenv("GROK_PROXY_DATA_DIR"); env != "" && *dataDir == "" {
 		*dataDir = env
 	}
-	// Retention precedence: explicit --log-retention-days flag >
-	// GROK_PROXY_LOG_RETENTION_DAYS env var > config file value > built-in
-	// default (7 days). Only an explicitly provided value overrides the
-	// file, so a saved config.json is not silently shadowed.
+	// Retention precedence: explicit flag > env var > config file > default (7 days).
 	var explicitRetention *int
 	if env := os.Getenv("GROK_PROXY_LOG_RETENTION_DAYS"); env != "" {
 		if days, err := strconv.Atoi(env); err == nil {
@@ -52,7 +50,6 @@ func main() {
 			fmt.Fprintf(os.Stderr, "GROK_PROXY_LOG_RETENTION_DAYS invalid, ignoring: %v\n", err)
 		}
 	}
-	// An explicitly passed flag outranks the env var.
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "log-retention-days" {
 			explicitRetention = logRetentionDays
@@ -67,27 +64,32 @@ func main() {
 		dataPath = defaultDataDir()
 	}
 
+	config.SetProductVersion(version)
+
 	cfg, err := config.LoadConfig(filepath.Join(dataPath, "config.json"), explicitRetention)
 	if err != nil {
 		logger.Error("加载配置失败", "error", err)
 		os.Exit(1)
 	}
 	if *listen != "" {
-		cfg.ListenAddr = *listen
+		cfg.SetListenAddr(*listen)
 	}
-	if !isLoopbackAddr(cfg.ListenAddr) {
+	listenAddr := cfg.ListenAddr()
+	if !isLoopbackAddr(listenAddr) {
 		logger.Warn(
-			"非回环监听地址：管理 API（/api/*）无鉴权，含改网关配置、读全部请求/响应体（含完整 prompt）、清日志等，切勿暴露到网络",
-			"addr", cfg.ListenAddr,
+			"非回环监听地址：管理 API（/api/*）无鉴权，切勿暴露到公共网络",
+			"addr", listenAddr,
 		)
 	}
 	if err := os.MkdirAll(dataPath, 0o700); err != nil {
 		logger.Error("create data directory", "error", err)
 		os.Exit(1)
 	}
-	if err := cfg.Save(); err != nil {
-		logger.Error("save configuration", "error", err)
-		os.Exit(1)
+	if cfg.ShouldPersist() {
+		if err := cfg.Save(); err != nil {
+			logger.Error("save configuration", "error", err)
+			os.Exit(1)
+		}
 	}
 
 	st, err := store.OpenStore(filepath.Join(dataPath, "proxy.db"))
@@ -100,34 +102,30 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// 启动时按保留策略清理过期日志，并周期性清理与 WAL checkpoint，避免数据库
-	// 与 -wal 文件无限增长。
-	go func() {
-		maintain := func() {
-			pruned := int64(0)
-			retention := cfg.GetLogRetention()
-			if retention > 0 {
-				var err error
-				pruned, err = st.PruneOlderThan(ctx, retention)
-				if err != nil {
-					logger.Warn("log pruning failed", "error", err)
-				} else if pruned > 0 {
-					logger.Info("pruned old logs", "count", pruned)
-				}
-			}
-			// Reclaiming physical space costs a full rebuild of the database
-			// file, so only do it when rows were actually pruned.
-			if pruned > 0 {
-				if err := st.ReclaimSpace(ctx); err != nil {
-					logger.Warn("reclaiming space after prune failed", "error", err)
-				}
-			} else if err := st.CheckpointWAL(ctx); err != nil {
-				// Nothing to reclaim, but the WAL still has to be folded back
-				// so the -wal file does not grow unbounded.
-				logger.Warn("WAL checkpoint failed", "error", err)
+	// Maintain log retention and WAL checkpoint.
+	maintain := func() {
+		pruned := int64(0)
+		retention := cfg.GetLogRetention()
+		if retention > 0 {
+			var err error
+			pruned, err = st.PruneOlderThan(ctx, retention)
+			if err != nil {
+				logger.Warn("log pruning failed", "error", err)
+			} else if pruned > 0 {
+				logger.Info("pruned old logs", "count", pruned)
 			}
 		}
-		maintain()
+		if pruned > 0 {
+			if err := st.ReclaimSpace(ctx); err != nil {
+				logger.Warn("reclaiming space after prune failed", "error", err)
+			}
+		} else if err := st.CheckpointWAL(ctx); err != nil {
+			logger.Warn("WAL checkpoint failed", "error", err)
+		}
+	}
+	maintain()
+
+	go func() {
 		ticker := time.NewTicker(time.Hour)
 		defer ticker.Stop()
 		for {
@@ -142,11 +140,14 @@ func main() {
 
 	app := web.NewApp(cfg, st, logger, version)
 
-	// 后台定期探测各启用网关的可达性，供 /healthz 报告真实上游健康状态。
-	go app.StartHealthCheck(ctx, 30*time.Second)
+	if *healthInterval > 0 {
+		go app.StartHealthCheck(ctx, *healthInterval)
+	} else {
+		logger.Info("upstream health checks disabled; /healthz reports no upstream status")
+	}
 
 	server := &http.Server{
-		Addr: cfg.ListenAddr,
+		Addr: listenAddr,
 		Handler: web.Chain(app,
 			web.RecoverMiddleware(logger),
 			web.SecurityHeadersMiddleware,
@@ -167,7 +168,7 @@ func main() {
 		}
 	}()
 
-	logger.Info("grok gateway proxy listening", "addr", cfg.ListenAddr, "data_dir", dataPath)
+	logger.Info("grok gateway proxy listening", "addr", listenAddr, "data_dir", dataPath)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("HTTP server", "error", err)
 		return

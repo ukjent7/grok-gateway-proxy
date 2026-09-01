@@ -19,4 +19,4 @@ run:
 	go run .
 
 clean:
-	rm -f grok-gateway-proxy
+	rm -f grok-gateway-proxy grok-gateway-proxy.exe

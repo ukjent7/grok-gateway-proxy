@@ -1,63 +1,39 @@
 # Grok Gateway Proxy
 
-本地代理工具，在 Grok Build 与上游网关之间做 Responses 协议对齐与可观测性记录。
-
+本地代理，在 Grok Build 与上游网关之间做 Responses 协议对齐与可观测性记录。
 
 ## 支持的网关
 
 | 前缀 | 网关 | 协议 | Base URL |
 |------|------|------|----------|
-| `/ds` | DeepSeek（Responses API） | Responses | 留空，建议 `https://api.deepseek.com` |
-| `/std` | 标准 Responses（任意标准上游） | Responses | 留空，按需填写 |
-| `/st` | SenseNova | Chat Completions | 预置 |
+| `/ds` | DeepSeek | Responses | 留空，建议 `https://api.deepseek.com` |
+| `/std` | 标准 Responses | Responses | 留空 |
+| `/st` | SenseNova | Chat Completions | 预置 `https://token.sensenova.cn/v1` |
+| 自定义 | 标准 Responses | Responses | 用户设置 |
 
-首次使用前在控制台（`http://127.0.0.1:8787`）填好各网关的 Base URL；
-Base URL 留空的网关收到请求时返回明确的 503 提示。
+控制台 `http://127.0.0.1:8787` 配置 Base URL，留空时请求返回 503。
 
-## Responses 协议对齐
+## 自定义网关
 
-Grok Build 的 Responses 请求携带若干 xAI 私有扩展，标准上游可能直接拒绝。
-代理在 Responses 协议网关（`/ds`、`/std`）上做双向对齐。
+控制台「网关配置」可新增，复用标准 Responses 逻辑，仅需 `前缀 / 名称 / Base URL`。上游路径固定为 `{base_url}/responses`。
 
-请求方向（发往上游前剥离，其余字段——含 `reasoning.effort`——原样保留）：
+- 前缀即路由：`base_url = http://127.0.0.1:8787/<前缀>`，规则 `^[a-z0-9][a-z0-9_-]{0,31}$`，`api/static/healthz/ui` 及 `ds/st/std` 保留
+- 内建可停用，自定义可删除；显示名称决定 `[model.<名称>]`，重名拒绝
 
-- `stream_tool_calls` — xAI 后端专用选项
-- `tools` 中标准词汇表之外的条目 — 如 `x_search`
-- `tools` 中 `web_search.filters.excluded_domains` 重命名为标准拼写
-  `blocked_domains`，工具本身保留 —— 两者是同一能力的不同名称
-  （标准协议见 `OpenAIResponsesTool`），移除工具会把调用方声明的排除范围
-  静默放宽为无限制搜索
-- `include` 中标准词汇表之外的值 — 如 `no_inline_citations`
+## 协议对齐
 
-DeepSeek 网关（`/ds`）在此基础上额外处理其方言差异：
+仅对 Responses 网关（`/ds`、`/std`、自定义）生效，无扩展请求逐字节透传。
 
-- `include` 整体移除（DeepSeek 不支持任何 include 值，思维链恒以明文返回）
-- 输入 `reasoning` 项剔除 `summary` / `encrypted_content`，明文 `content`
-  （即 DeepSeek 的 reasoning_content 载体）完整保留回传 —— 带 tools 的请求
-  必须回传思维链，否则 DeepSeek 返回 400
-- `reasoning.effort` 原样透传，由 DeepSeek 自行映射（low/medium/high/xhigh →
-  low/high/max，none 关闭思考模式）
-
-响应方向（转发给客户端前清洗为 Grok Build 可解析的词汇表）：
-
-- 旧版事件名 `response.reasoning.delta` / `.done` 重命名为标准的
-  `response.reasoning_text.delta` / `.done`（载荷字段完全一致）
-- ping 保活事件被丢弃
-- 客户端事件词汇表之外的 SSE 事件类型被丢弃 — 一帧无法反序列化的事件会让
-  整个流失败，因此丢弃而非透传
-- DeepSeek 的事件序列没有 `data: [DONE]` 哨兵，客户端按 EOF 收尾，代理原样透传
-
-无扩展的请求逐字节透传；行为由 `internal/proxy/responsesanitize.go` 与
-`internal/proxy/adapter_deepseek.go` 的白名单驱动。
+- **请求**：剥离 `stream_tool_calls`、非标准 `tools`（如 `x_search`）、非标准 `include`；`web_search.filters.excluded_domains` 重命名为 `blocked_domains`；DeepSeek 额外移除 `include`、清理 `reasoning` 的 `summary/encrypted_content`
+- **响应**：`response.reasoning.delta/done` → `response.reasoning_text.delta/done`，丢弃 `ping` 与未知事件类型，`[DONE]` 按上游原样透传
 
 ## 运行
 
 ```bash
-go run .
-# 监听 127.0.0.1:8787，数据目录 ./data
+go run .  # 127.0.0.1:8787，数据目录 ./data
 ```
 
-浏览器打开 `http://127.0.0.1:8787` 进入控制台。
+浏览器打开 `http://127.0.0.1:8787`。后台周期探测已配置 Base URL 的 `/models` 用于健康灯，`--health-check-interval 0` 可关闭。
 
 ## 构建
 
@@ -67,21 +43,14 @@ go build -ldflags "-s -w -X main.version=$(git describe --tags 2>/dev/null || ec
 
 ## 配置
 
-配置文件位于 `data/config.json`，首次运行自动生成。支持的环境变量：
+文件 `data/config.json`。环境变量：`GROK_PROXY_LISTEN`、`GROK_PROXY_DATA_DIR`、`GROK_PROXY_LOG_RETENTION_DAYS`。
 
-- `GROK_PROXY_LISTEN` — 监听地址
-- `GROK_PROXY_DATA_DIR` — 数据目录
-- `GROK_PROXY_LOG_RETENTION_DAYS` — 日志保留天数
-
-`body_capture_limit_kb` 为 0 表示不截断，但仍受 64MB 安全上限约束（与请求体
-上限一致）：关闭截断不等于允许单个响应无限写入 SQLite。超过该上限时存储的
-报文会被截断并标记 `response_truncated`，客户端收到的始终是完整响应。
-
-旧配置中的 `oc` / `ve` 网关条目会被自动忽略并迁移为新的 `ds` / `std` 网关。
+- `body_capture_limit_kb=0` 不截断但受 32MB 上限约束，超限标记 `response_truncated`，客户端仍收完整响应
+- 并发请求体预算 64MB，超限排队 30s 后 503 + `Retry-After`
 
 ## 开发
 
 ```bash
-go test ./...      # 测试
-go vet ./...       # 静态检查
+go test ./...
+go vet ./...
 ```
