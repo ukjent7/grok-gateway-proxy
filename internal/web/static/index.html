@@ -3,21 +3,12 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' https://fonts.googleapis.com https://fonts.gstatic.com; connect-src 'self';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self';">
 <title>Grok Gateway · 本地代理控制台</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2306b6d4'/%3E%3Cpath d='M8 16h4l2-5 4 10 2-5h4' stroke='%23ffffff' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-
-<!-- 动态氛围背景 -->
-<div class="ambient" aria-hidden="true">
-  <div class="ambient-aurora"></div>
-  <div class="ambient-grid"></div>
-</div>
 
 <div class="mobile-rail-overlay" id="mobileRailOverlay"></div>
 
@@ -135,93 +126,62 @@
             <p>实时监控请求吞吐、缓存命中率、Token 消耗与网关健康指标</p>
           </div>
           <div class="head-actions">
-            <div class="range-picker" id="rangePicker">
-              <button type="button" data-range="15m">15分钟</button>
-              <button type="button" data-range="1h" class="is-active">1小时</button>
-              <button type="button" data-range="24h">24小时</button>
-              <button type="button" data-range="7d">7天</button>
-              <button type="button" data-range="all">全部</button>
+            <div class="range-picker" id="rangePicker" role="group" aria-label="统计时间范围">
+              <button type="button" data-range="15m" aria-pressed="false">15分钟</button>
+              <button type="button" data-range="1h" class="is-active" aria-pressed="true">1小时</button>
+              <button type="button" data-range="24h" aria-pressed="false">24小时</button>
+              <button type="button" data-range="7d" aria-pressed="false">7天</button>
+              <button type="button" data-range="all" aria-pressed="false">全部</button>
             </div>
           </div>
         </div>
 
-        <!-- 6 大核心指标卡片 -->
-        <div class="stat-grid">
-          <article class="stat-card">
-            <div class="stat-card-head">
-              <span class="stat-label">总请求数</span>
-              <span class="stat-icon"><svg viewBox="0 0 16 16" width="13" height="13" fill="none"><path d="M1.5 8h2.6l1.5-3.8 2.6 7.6 1.5-3.8h4.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
-            </div>
-            <div class="stat-value" id="statRequests">—</div>
-            <div class="stat-sub" id="statRequestsSub">—</div>
-            <svg class="stat-spark" data-stat="requests" viewBox="0 0 120 32" preserveAspectRatio="none" aria-hidden="true"></svg>
-          </article>
-
-          <article class="stat-card">
-            <div class="stat-card-head">
-              <span class="stat-label">服务成功率</span>
-              <span class="stat-icon"><svg viewBox="0 0 16 16" width="13" height="13" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.4"/><path d="m5.4 8.2 1.8 1.8 3.4-3.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
-            </div>
-            <div class="stat-body">
-              <div class="stat-main">
-                <div class="stat-value" id="statSuccess">—</div>
-                <div class="stat-sub" id="statSuccessSub">—</div>
-              </div>
-              <div class="stat-gauge" id="gaugeSuccess" aria-hidden="true"></div>
-            </div>
-            <svg class="stat-spark" data-stat="success" viewBox="0 0 120 32" preserveAspectRatio="none" aria-hidden="true"></svg>
-          </article>
-
-          <article class="stat-card">
-            <div class="stat-card-head">
-              <span class="stat-label">缓存命中率</span>
-              <span class="stat-icon"><svg viewBox="0 0 16 16" width="13" height="13" fill="none"><path d="M8.7 1.5 3.5 9h3.2l-.7 5.5L11.5 7H8.3l.4-5.5Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg></span>
-            </div>
-            <div class="stat-body">
-              <div class="stat-main">
-                <div class="stat-value" id="statCacheHit">—</div>
-                <div class="stat-sub" id="statCacheHitSub">—</div>
-              </div>
-              <div class="stat-gauge" id="gaugeCacheHit" aria-hidden="true"></div>
-            </div>
-            <svg class="stat-spark" data-stat="cacheHit" viewBox="0 0 120 32" preserveAspectRatio="none" aria-hidden="true"></svg>
-          </article>
-
-          <article class="stat-card">
-            <div class="stat-card-head">
-              <span class="stat-label">缓存协议覆盖率</span>
-              <span class="stat-icon"><svg viewBox="0 0 16 16" width="13" height="13" fill="none"><path d="m8 2 6 3-6 3-6-3 6-3Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="m2 8.5 6 3 6-3M2 11.5l6 3 6-3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
-            </div>
-            <div class="stat-body">
-              <div class="stat-main">
-                <div class="stat-value" id="statCacheCoverage">—</div>
-                <div class="stat-sub" id="statCacheCoverageSub">—</div>
-              </div>
-              <div class="stat-gauge" id="gaugeCoverage" aria-hidden="true"></div>
-            </div>
-            <svg class="stat-spark" data-stat="cacheCoverage" viewBox="0 0 120 32" preserveAspectRatio="none" aria-hidden="true"></svg>
-          </article>
-
-          <article class="stat-card">
-            <div class="stat-card-head">
-              <span class="stat-label">Prompt / Output Token</span>
-              <span class="stat-icon"><svg viewBox="0 0 16 16" width="13" height="13" fill="none"><path d="M5.5 2 3.5 8l2 6M10.5 2l2 6-2 6M2 6h12M2 10h12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
-            </div>
-            <div class="stat-value" id="statTokens">—</div>
-            <div class="stat-sub" id="statTokensSub">—</div>
-            <svg class="stat-spark" data-stat="tokens" viewBox="0 0 120 32" preserveAspectRatio="none" aria-hidden="true"></svg>
-          </article>
-
-          <article class="stat-card">
-            <div class="stat-card-head">
-              <span class="stat-label">推理 Token (Reasoning)</span>
-              <span class="stat-icon"><svg viewBox="0 0 16 16" width="13" height="13" fill="none"><rect x="4" y="4" width="8" height="8" rx="1.6" stroke="currentColor" stroke-width="1.3"/><path d="M6.5 1.5v2M9.5 1.5v2M6.5 12.5v2M9.5 12.5v2M1.5 6.5h2M1.5 9.5h2M12.5 6.5h2M12.5 9.5h2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg></span>
-            </div>
-            <div class="stat-value" id="statReasoning">—</div>
-            <div class="stat-sub" id="statReasoningSub">—</div>
-            <svg class="stat-spark" data-stat="reasoning" viewBox="0 0 120 32" preserveAspectRatio="none" aria-hidden="true"></svg>
-          </article>
+        <!-- 指标条：一行读完。卡片、图标衬底、环形仪表与无坐标波形都不承载
+             额外信息，只会把可操作内容推出首屏，故全部撤除。 -->
+        <div class="kpi-strip">
+          <div class="kpi">
+            <span class="kpi-label">总请求数</span>
+            <span class="kpi-value" id="statRequests">—</span>
+            <span class="kpi-note" id="statRequestsSub">—</span>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">成功率</span>
+            <span class="kpi-value" id="statSuccess">—</span>
+            <span class="kpi-note" id="statSuccessSub">—</span>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">缓存命中</span>
+            <span class="kpi-value" id="statCacheHit">—</span>
+            <span class="kpi-note" id="statCacheHitSub">—</span>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">缓存覆盖</span>
+            <span class="kpi-value" id="statCacheCoverage">—</span>
+            <span class="kpi-note" id="statCacheCoverageSub">—</span>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">Token 消耗</span>
+            <span class="kpi-value" id="statTokens">—</span>
+            <span class="kpi-note" id="statTokensSub">—</span>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">推理 Token</span>
+            <span class="kpi-value" id="statReasoning">—</span>
+            <span class="kpi-note" id="statReasoningSub">—</span>
+          </div>
         </div>
+
+        <!-- 异常优先：首屏直接给出"现在该看什么"，每行可点进报文对比 -->
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>需要确认</h2>
+              <span class="muted">失败请求、超出本窗口 p90 的慢请求、不可达网关</span>
+            </div>
+            <span class="addr-chip" id="attentionRange">1小时</span>
+          </div>
+          <div class="attention-list" id="attentionList"></div>
+        </section>
 
         <!-- 网关缓存命中率分解 -->
         <section class="panel">
@@ -240,7 +200,7 @@
             <div class="panel-head">
               <div>
                 <h2>网关调用信号流</h2>
-                <span class="muted">最近 40 次调用刻度 · 高度反映耗时 · 绿色成功 / 橙色慢响应 / 红色异常</span>
+                <span class="muted">最近 40 次调用刻度 · 高度反映耗时 · 绿=成功 · 琥珀=超出本窗口 p90 · 红=失败</span>
               </div>
               <span class="addr-chip" id="pulseRange">1小时</span>
             </div>
@@ -397,6 +357,43 @@
           <div class="field-error" id="proxyUrlError" hidden style="margin-top: 6px;"></div>
         </section>
 
+        <!-- 新增自定义网关：协议逻辑复用标准 Responses，用户只决定前缀、名称与上游地址。
+             客户端会在 base_url 之后固定追加 /responses（见 grok-build sampler 的
+             url_for_path），所以前缀是唯一的路由旋钮，这里不给出入站路径输入。 -->
+        <section class="panel add-gateway-panel">
+          <div class="panel-head add-gateway-head">
+            <div>
+              <h2>新增网关</h2>
+              <span class="muted">复用标准 Responses 协议逻辑，上游只需实现 <code>POST {base_url}/responses</code></span>
+            </div>
+          </div>
+          <div class="add-gateway-form">
+            <label class="field">
+              <span class="field-label">调用前缀</span>
+              <span class="prefix-input">
+                <span class="prefix-slash" aria-hidden="true">/</span>
+                <input id="newGwPrefix" class="input-modern" type="text" placeholder="mygate" autocomplete="off" spellcheck="false" aria-label="网关调用前缀">
+              </span>
+              <span class="field-hint">小写字母或数字开头，可含 - 与 _</span>
+            </label>
+            <label class="field">
+              <span class="field-label">显示名称</span>
+              <input id="newGwName" class="input-modern" type="text" placeholder="我的网关" autocomplete="off" aria-label="网关显示名称">
+              <span class="field-hint">用于客户端配置里的 model 段名</span>
+            </label>
+            <label class="field">
+              <span class="field-label">上游 Base URL</span>
+              <input id="newGwBaseURL" class="input-modern" type="text" placeholder="https://api.example.com/v1" autocomplete="off" spellcheck="false" aria-label="上游 Base URL">
+              <span class="field-hint">可留空稍后配置；仅支持 https://</span>
+            </label>
+          </div>
+          <div class="add-gateway-foot">
+            <code class="add-gateway-preview" id="newGwPreview" title="客户端 base_url（其后会追加 /responses）">—</code>
+            <button type="button" id="newGwCreateBtn" class="btn-primary">创建网关</button>
+          </div>
+          <div class="field-error" id="newGwError" hidden></div>
+        </section>
+
         <!-- 网关卡片网格 -->
         <div class="gw-config-grid" id="gatewayCards"></div>
       </section>
@@ -458,14 +455,23 @@
 
   <div class="drawer-meta" id="drawerMeta"></div>
 
-  <div class="drawer-tabs" id="drawerTabs" role="tablist">
-    <button type="button" class="drawer-tab is-active" data-tab="request-compare" role="tab" aria-selected="true">请求 Diff 对比</button>
-    <button type="button" class="drawer-tab" data-tab="response-compare" role="tab" aria-selected="false">响应 Diff 对比</button>
-    <button type="button" class="drawer-tab" data-tab="request" role="tab" aria-selected="false">客户端原始请求</button>
-    <button type="button" class="drawer-tab" data-tab="upstream" role="tab" aria-selected="false">代理上游请求</button>
-    <button type="button" class="drawer-tab" data-tab="upstream-response" role="tab" aria-selected="false">上游原始响应</button>
-    <button type="button" class="drawer-tab" data-tab="response" role="tab" aria-selected="false">最终客户端响应</button>
-    <button type="button" class="drawer-tab" data-tab="headers" role="tab" aria-selected="false">全量标头对比</button>
+  <!-- Three orthogonal axes, revealed one at a time. The previous seven flat
+        tabs flattened them into overlapping nouns: 「客户端原始请求」 and
+        「请求 Diff 对比」 are the same section in a different form. -->
+  <div class="drawer-nav" id="drawerNav">
+    <div class="seg-group" role="tablist" aria-label="报文分区">
+      <button type="button" class="seg is-active" data-section="request" role="tab" aria-selected="true">请求</button>
+      <button type="button" class="seg" data-section="response" role="tab" aria-selected="false">响应</button>
+    </div>
+    <div class="seg-group" role="tablist" aria-label="查看形态">
+      <button type="button" class="seg is-active" data-mode="diff" role="tab" aria-selected="true">对比</button>
+      <button type="button" class="seg" data-mode="raw" role="tab" aria-selected="false">原文</button>
+      <button type="button" class="seg" data-mode="headers" role="tab" aria-selected="false">标头</button>
+    </div>
+    <div class="seg-group" id="drawerSideGroup" role="tablist" aria-label="报文侧别" hidden>
+      <button type="button" class="seg is-active" data-side="client" role="tab" aria-selected="true">客户端侧</button>
+      <button type="button" class="seg" data-side="upstream" role="tab" aria-selected="false">上游侧</button>
+    </div>
   </div>
 
   <div class="drawer-body">
