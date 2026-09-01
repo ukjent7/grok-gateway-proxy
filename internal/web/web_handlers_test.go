@@ -62,24 +62,54 @@ func TestListLogsReturnsStoredEntries(t *testing.T) {
 	}
 }
 
-func TestCountLogsMatchesListFilters(t *testing.T) {
+func TestListLogsTotalCountsTheWholeMatchNotThePage(t *testing.T) {
 	app, st := newTestApp(t)
 	seedLog(t, st, "req-count-1")
 	seedLog(t, st, "req-count-2")
+	seedLog(t, st, "req-count-3")
 
-	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/api/logs/count", nil)
-	recorder := httptest.NewRecorder()
-	app.ServeHTTP(recorder, req)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	// One row of a three-row match: the pager needs the 3, because len(items)
+	// is what made "载入更多记录" impossible.
+	body := getJSON(t, app, "http://127.0.0.1:8787/api/logs?limit=1")
+	var page struct {
+		Items []struct {
+			ID string `json:"id"`
+		} `json:"items"`
+		Total int64 `json:"total"`
 	}
-	var body map[string]any
-	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+	if err := json.Unmarshal(body, &page); err != nil {
 		t.Fatal(err)
 	}
-	if count, ok := body["count"].(float64); !ok || count != 2 {
-		t.Fatalf("expected count 2, got %+v", body)
+	if len(page.Items) != 1 {
+		t.Fatalf("expected the page to honour limit=1, got %d rows", len(page.Items))
 	}
+	if page.Total != 3 {
+		t.Fatalf("expected total 3 for the whole match, got %d", page.Total)
+	}
+
+	// The count is answered under the same filter as the list: a gateway that
+	// has no rows must report zero rather than the table's size.
+	filtered := getJSON(t, app, "http://127.0.0.1:8787/api/logs?gateway=nosuchgateway")
+	var empty struct {
+		Items []json.RawMessage `json:"items"`
+		Total int64             `json:"total"`
+	}
+	if err := json.Unmarshal(filtered, &empty); err != nil {
+		t.Fatal(err)
+	}
+	if len(empty.Items) != 0 || empty.Total != 0 {
+		t.Fatalf("expected an empty match to report no rows and total 0, got %d rows, total %d", len(empty.Items), empty.Total)
+	}
+}
+
+func getJSON(t *testing.T, app *App, target string) []byte {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	app.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, target, nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200 from %s, got %d: %s", target, recorder.Code, recorder.Body.String())
+	}
+	return recorder.Body.Bytes()
 }
 
 func TestGetLogByID(t *testing.T) {
@@ -205,7 +235,7 @@ func TestHandleSetupRendersASnippetPerGateway(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
 	}
-	var snippets map[string]string
+	var snippets map[string]setupSnippet
 	if err := json.Unmarshal(recorder.Body.Bytes(), &snippets); err != nil {
 		t.Fatal(err)
 	}
@@ -214,9 +244,36 @@ func TestHandleSetupRendersASnippetPerGateway(t *testing.T) {
 		if !ok {
 			t.Fatalf("no snippet for gateway %q: %+v", id, snippets)
 		}
-		if !strings.Contains(snippet, gateway.Prefix) {
-			t.Fatalf("snippet for %q does not mention its prefix %q: %s", id, gateway.Prefix, snippet)
+		if !strings.Contains(snippet.Snippet, gateway.Prefix) {
+			t.Fatalf("snippet for %q does not mention its prefix %q: %s", id, gateway.Prefix, snippet.Snippet)
 		}
+		if !strings.Contains(snippet.Snippet, string(gateway.Protocol)) {
+			t.Fatalf("snippet for %q does not declare its api_backend %q: %s", id, gateway.Protocol, snippet.Snippet)
+		}
+		// The key the console's other snippets are built from must be the very
+		// one the TOML block defines, or copying both gives a client a model
+		// the config does not declare.
+		if snippet.ModelKey == "" {
+			t.Fatalf("snippet for %q carries no model key", id)
+		}
+		if !strings.Contains(snippet.Snippet, "[model."+snippet.ModelKey+"]") {
+			t.Fatalf("snippet for %q does not declare its model key %q: %s", id, snippet.ModelKey, snippet.Snippet)
+		}
+	}
+}
+
+// A storage failure must not be reported as "no such log": the user would read
+// a database problem as a record they somehow deleted.
+func TestGetLogByIDReportsStorageFailureAsServerError(t *testing.T) {
+	app, st := newTestApp(t)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/api/logs/req-anything", nil)
+	recorder := httptest.NewRecorder()
+	app.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 from a closed store, got %d: %s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -364,5 +421,45 @@ func TestStartHealthCheckReportsUnconfiguredAndReachableUpstreams(t *testing.T) 
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("StartHealthCheck did not stop when its context was cancelled")
+	}
+}
+
+// The overview board renders every gateway's ticks from one request. Answering
+// it per gateway was one /logs call per card, so the page's cost grew with the
+// number of gateways it was drawing.
+func TestPulseGroupsRecentRowsByGateway(t *testing.T) {
+	app, st := newTestApp(t)
+	ctx := context.Background()
+	base := time.Now().Add(-time.Hour)
+	for _, log := range []store.RequestLog{
+		{ID: "ds-1", GatewayID: "ds", StartedAt: base, Success: true},
+		{ID: "ds-2", GatewayID: "ds", StartedAt: base.Add(time.Minute), Success: true},
+		{ID: "st-1", GatewayID: "st", StartedAt: base, Model: "sense-model"},
+	} {
+		if err := st.Insert(ctx, log); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	recorder := httptest.NewRecorder()
+	app.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/api/pulse?limit=1&gateway=ds", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Gateways map[string][]store.RequestLog `json:"gateways"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	// Every gateway in the window, not just the one a filter named.
+	if len(response.Gateways) != 2 {
+		t.Fatalf("gateways = %d, want 2: %s", len(response.Gateways), recorder.Body.String())
+	}
+	if len(response.Gateways["ds"]) != 1 || response.Gateways["ds"][0].ID != "ds-2" {
+		t.Fatalf("ds rows = %+v, want the single newest one", response.Gateways["ds"])
+	}
+	if len(response.Gateways["st"]) != 1 {
+		t.Fatalf("st rows = %+v, want one", response.Gateways["st"])
 	}
 }

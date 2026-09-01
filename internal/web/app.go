@@ -38,8 +38,11 @@ type App struct {
 	reclaimMu  sync.Mutex
 	reclaiming bool
 
-	apiMux     *http.ServeMux
-	apiMuxOnce sync.Once
+	apiHandler     http.Handler
+	apiHandlerOnce sync.Once
+
+	gatewayHandler     http.Handler
+	gatewayHandlerOnce sync.Once
 }
 
 func NewApp(cfg *config.Config, st *store.Store, logger *slog.Logger, version string) *App {
@@ -51,51 +54,53 @@ func NewApp(cfg *config.Config, st *store.Store, logger *slog.Logger, version st
 		proxy:     proxy.NewProxy(cfg, st, logger),
 		upstreams: make(map[string]upstreamHealth),
 	}
-	app.apiMux = app.buildAPIRoutes()
+	app.apiHandler = app.buildAPIRoutes()
+	app.gatewayHandler = sameOriginGuard(http.HandlerFunc(app.proxy.ServeHTTP))
 	return app
 }
 
-// StartHealthCheck exposes the background health checker for main to launch.
 func (a *App) StartHealthCheck(ctx context.Context, interval time.Duration) {
 	a.startHealthCheck(ctx, interval)
 }
 
-// buildAPIRoutes registers all management API routes on a ServeMux using
-// Go 1.22+ method+pattern matching. Returns the configured mux.
-func (a *App) buildAPIRoutes() *http.ServeMux {
+func (a *App) buildAPIRoutes() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/config", a.handleGetConfig)
 	mux.HandleFunc("PATCH /api/proxy", a.patchProxy)
+	mux.HandleFunc("POST /api/gateways", a.handleCreateGateway)
 	mux.HandleFunc("PATCH /api/gateways/{id}", a.patchGatewayFromPath)
+	mux.HandleFunc("DELETE /api/gateways/{id}", a.handleDeleteGateway)
+	mux.HandleFunc("POST /api/gateways/{id}/test", a.handleTestGateway)
 	mux.HandleFunc("GET /api/metrics", a.handleMetrics)
+	mux.HandleFunc("GET /api/pulse", a.handlePulse)
 	mux.HandleFunc("GET /api/logs", a.listLogs)
 	mux.HandleFunc("DELETE /api/logs", a.deleteLogs)
-	mux.HandleFunc("GET /api/logs/count", a.countLogs)
 	mux.HandleFunc("GET /api/logs/{id}", a.getLogByID)
 	mux.HandleFunc("GET /api/setup", a.handleSetup)
 
-	return mux
+	return Chain(mux, sameOriginGuard)
 }
 
-// handleHealth reports liveness plus the most recent reachability probe for
-// every configured gateway. Probes run in the background; this handler only
-// reads the cached result so it stays fast and never blocks on upstreams.
 func (a *App) handleHealth(w http.ResponseWriter, r *http.Request) {
 	a.healthMu.RLock()
 	upstreams := make(map[string]any, len(a.upstreams))
 	for id, h := range a.upstreams {
-		entry := map[string]any{"reachable": h.Reachable, "error": h.Err}
-		if h.Status != 0 {
-			entry["status"] = h.Status
-		}
-		if !h.CheckedAt.IsZero() {
-			entry["checked_at"] = h.CheckedAt.UTC().Format(time.RFC3339)
-		}
-		upstreams[id] = entry
+		upstreams[id] = healthEntry(h)
 	}
 	a.healthMu.RUnlock()
 	proxy.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok", "upstreams": upstreams})
+}
+
+func healthEntry(h upstreamHealth) map[string]any {
+	entry := map[string]any{"reachable": h.Reachable, "error": h.Err}
+	if h.Status != 0 {
+		entry["status"] = h.Status
+	}
+	if !h.CheckedAt.IsZero() {
+		entry["checked_at"] = h.CheckedAt.UTC().Format(time.RFC3339)
+	}
+	return entry
 }
 
 // startHealthCheck probes each enabled gateway's /models endpoint in the
@@ -123,23 +128,27 @@ func (a *App) startHealthCheck(ctx context.Context, interval time.Duration) {
 	}
 }
 
-func (a *App) probeUpstream(id string, gateway config.GatewayConfig) {
+// probeUpstream measures one gateway and caches the answer for /healthz. It
+// returns what it recorded so the on-demand endpoint can report this probe
+// rather than whatever a concurrent background sweep last wrote.
+func (a *App) probeUpstream(id string, gateway config.GatewayConfig) upstreamHealth {
+	return a.setHealth(id, a.checkUpstream(gateway))
+}
+
+func (a *App) checkUpstream(gateway config.GatewayConfig) upstreamHealth {
 	if strings.TrimSpace(gateway.BaseURL) == "" {
-		a.setHealth(id, upstreamHealth{Err: "base URL 未配置"})
-		return
+		return upstreamHealth{Err: "base URL 未配置"}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(gateway.BaseURL, "/")+"/models", nil)
 	if err != nil {
-		a.setHealth(id, upstreamHealth{Err: err.Error()})
-		return
+		return upstreamHealth{Err: err.Error()}
 	}
-	req.Header.Set("User-Agent", "grok-gateway-proxy/healthz")
+	req.Header.Set("User-Agent", fmt.Sprintf("grok-gateway-proxy/%s healthz", a.version))
 	resp, err := a.proxy.ClientFor(gateway, false).Do(req)
 	if err != nil {
-		a.setHealth(id, upstreamHealth{Err: err.Error()})
-		return
+		return upstreamHealth{Err: err.Error()}
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
@@ -147,20 +156,43 @@ func (a *App) probeUpstream(id string, gateway config.GatewayConfig) {
 	// credentials: reporting that as plain reachability would light the
 	// dashboard green for a gateway no request can succeed on.
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		a.setHealth(id, upstreamHealth{
+		return upstreamHealth{
 			Status: resp.StatusCode,
 			Err:    fmt.Sprintf("upstream rejected authentication (HTTP %d)", resp.StatusCode),
-		})
-		return
+		}
 	}
-	a.setHealth(id, upstreamHealth{Reachable: resp.StatusCode < 500, Status: resp.StatusCode})
+	return upstreamHealth{Reachable: resp.StatusCode < 500, Status: resp.StatusCode}
 }
 
-func (a *App) setHealth(id string, h upstreamHealth) {
+// handleTestGateway probes one gateway on demand. The console's "测试连通"
+// button needs an answer about the configuration as it stands, and /healthz
+// only ever reports what the last background sweep measured — which for a
+// freshly saved or edited gateway can be minutes stale, or about a base URL
+// that no longer exists.
+func (a *App) handleTestGateway(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" || strings.ContainsAny(id, "/") {
+		proxy.WriteError(w, http.StatusBadRequest, fmt.Errorf("invalid gateway id"))
+		return
+	}
+	gateway, ok := a.config.Snapshot()[id]
+	if !ok {
+		proxy.WriteError(w, http.StatusNotFound, fmt.Errorf("unknown gateway %q", id))
+		return
+	}
+	// Deliberately not r.Context(): a client that gives up while the upstream is
+	// still thinking would cancel the probe and blank the cached entry the
+	// background sweep and the next caller both read.
+	health := a.probeUpstream(id, gateway)
+	proxy.WriteJSON(w, http.StatusOK, healthEntry(health))
+}
+
+func (a *App) setHealth(id string, h upstreamHealth) upstreamHealth {
 	h.CheckedAt = time.Now()
 	a.healthMu.Lock()
 	a.upstreams[id] = h
 	a.healthMu.Unlock()
+	return h
 }
 
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -171,54 +203,141 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasPrefix(path, "/api/") || path == "/api" {
-		// NewApp builds the mux eagerly; this covers Apps built as bare struct
-		// literals. Either way the build must be once-only: concurrent requests
-		// would otherwise race on the field.
-		a.apiMuxOnce.Do(func() {
-			if a.apiMux == nil {
-				a.apiMux = a.buildAPIRoutes()
+		// NewApp builds the handler eagerly; this covers Apps built as bare
+		// struct literals. Either way the build must be once-only: concurrent
+		// requests would otherwise race on the field.
+		a.apiHandlerOnce.Do(func() {
+			if a.apiHandler == nil {
+				a.apiHandler = a.buildAPIRoutes()
 			}
 		})
-		a.apiMux.ServeHTTP(w, r)
+		a.apiHandler.ServeHTTP(w, r)
 		return
 	}
-	if isGatewayPath(path) {
-		a.proxy.ServeHTTP(w, r)
-		return
+	if a.routeIsGateway(path) {
+		// NewApp builds the handler eagerly; this covers Apps built as bare
+		// struct literals. Either way the build must be once-only.
+		a.gatewayHandlerOnce.Do(func() {
+			if a.gatewayHandler == nil && a.proxy != nil {
+				a.gatewayHandler = sameOriginGuard(http.HandlerFunc(a.proxy.ServeHTTP))
+			}
+		})
+		if a.gatewayHandler != nil {
+			a.gatewayHandler.ServeHTTP(w, r)
+			return
+		}
 	}
 	a.handleUI(w, r)
 }
 
-// isGatewayPath reports whether the path targets a known gateway prefix.
-// The prefixes are read from config.DefaultGateways so that adding a gateway
-// does not require editing this file; config.ValidateConfig already rejects a
-// configured gateway whose prefix differs from its default, so the defaults
-// are also the live prefixes.
+// routeIsGateway reports whether the path targets a configured gateway.
 //
-// Matching is path-component aware (not string HasPrefix) so /static/ is never
-// mistaken for /st/.
-func isGatewayPath(path string) bool {
-	for _, gateway := range config.DefaultGateways {
-		if hasPathPrefix(path, gateway.Prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-func hasPathPrefix(path, prefix string) bool {
-	return path == prefix || strings.HasPrefix(path, prefix+"/")
+// This reads live config rather than config.DefaultGateways: a gateway created
+// at runtime would otherwise fall through to the UI handler and 404 behind its
+// own prefix. A bare App without a config (tests construct those) falls back to
+// the built-in table, so the answer is never "no gateway" by omission. The same
+// route table the proxy matches against decides, so the console can never
+// dispatch a path the proxy would not serve.
+func (a *App) routeIsGateway(path string) bool {
+	_, _, ok := a.config.MatchGateway(path)
+	return ok
 }
 
 // --- API handlers ---
 
 func (a *App) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	proxy.WriteJSON(w, http.StatusOK, map[string]any{
-		"listen_addr": a.config.ListenAddr,
+		"listen_addr": a.config.ListenAddr(),
 		"proxy_url":   a.config.ProxyURL(),
 		"version":     a.version,
-		"gateways":    a.config.Snapshot(),
+		"gateways":    gatewayViews(a.config.Snapshot()),
+		// The rules the config layer enforces, so the console validates
+		// against them instead of a copy that drifts the moment one changes.
+		"gateway_rules": map[string]any{
+			"prefix_pattern":    config.CustomGatewayIDPattern(),
+			"reserved_prefixes": config.ReservedPrefixes(),
+		},
+		"session_affinity_modes": config.SessionAffinityModes,
 	})
+}
+
+// gatewayView is a gateway as the console sees it. `custom` is computed here:
+// the built-in list belongs to config, and a second copy of it in JavaScript
+// would be wrong the first time a gateway is added to the build.
+type gatewayView struct {
+	config.GatewayConfig
+	Custom bool `json:"custom"`
+}
+
+func gatewayViewOf(gateway config.GatewayConfig) gatewayView {
+	return gatewayView{
+		GatewayConfig: gateway,
+		Custom:        !config.IsBuiltinGateway(gateway.ID),
+	}
+}
+
+func gatewayViews(gateways map[string]config.GatewayConfig) map[string]gatewayView {
+	result := make(map[string]gatewayView, len(gateways))
+	for id, gateway := range gateways {
+		result[id] = gatewayViewOf(gateway)
+	}
+	return result
+}
+
+// handleCreateGateway adds a user-defined gateway. It reuses the standard
+// Responses adapter; only the route prefix, the display name and the upstream
+// base URL are the caller's to choose.
+//
+// Every rejection — a taken prefix, a display name whose client model key
+// collides with another gateway's — is decided by the config layer under its
+// write lock, before anything is written. The handler only maps the error to a
+// status: checking here and undoing after a save would leave a window in which
+// two concurrent creates both believed they were the only holder of a name,
+// and a failed rollback would leave a gateway the caller was told never
+// existed.
+func (a *App) handleCreateGateway(w http.ResponseWriter, r *http.Request) {
+	var request config.NewGateway
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxAPIBodySize)).Decode(&request); err != nil {
+		proxy.WriteError(w, http.StatusBadRequest, err)
+		return
+	}
+	gateway, err := a.config.AddGateway(request)
+	if err != nil {
+		proxy.WriteError(w, gatewayStatusError(err), err)
+		return
+	}
+	proxy.WriteJSON(w, http.StatusCreated, map[string]any{"gateway": gatewayViewOf(gateway)})
+}
+
+// handleDeleteGateway removes a custom gateway. Built-in gateways are disabled
+// instead of deleted, so the request is answered with 400 and the reason.
+func (a *App) handleDeleteGateway(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" || strings.ContainsAny(id, "/") {
+		proxy.WriteError(w, http.StatusBadRequest, fmt.Errorf("invalid gateway id"))
+		return
+	}
+	if err := a.config.DeleteGateway(id); err != nil {
+		proxy.WriteError(w, gatewayStatusError(err), err)
+		return
+	}
+	proxy.WriteJSON(w, http.StatusOK, map[string]any{"deleted": id})
+}
+
+// gatewayStatusError maps the config layer's sentinels onto HTTP statuses, so a
+// missing gateway reads as 404 and a rejected value as 400 rather than both
+// being an opaque 500.
+func gatewayStatusError(err error) int {
+	switch {
+	case errors.Is(err, config.ErrUnknownGateway):
+		return http.StatusNotFound
+	case errors.Is(err, config.ErrBuiltinGateway):
+		// Not a malformed request: the id is well-formed and belongs to a
+		// gateway that ships with the build.
+		return http.StatusConflict
+	default:
+		return http.StatusBadRequest
+	}
 }
 
 func (a *App) handleMetrics(w http.ResponseWriter, r *http.Request) {
@@ -235,8 +354,31 @@ func (a *App) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	proxy.WriteJSON(w, http.StatusOK, metrics)
 }
 
+// handlePulse returns the newest few requests for every gateway in one
+// response, grouped by gateway id. The overview's ticker board used to ask for
+// each gateway separately — one /logs request per card, so a refresh cost grew
+// with the number of gateways the page was drawing.
+//
+// A gateway= filter is dropped rather than honoured: the point of this endpoint
+// is every gateway at once, and answering a single-gateway pulse with a
+// single gateway's rows would leave the rest of the board stale.
+func (a *App) handlePulse(w http.ResponseWriter, r *http.Request) {
+	filter, err := parseFilter(r)
+	if err != nil {
+		proxy.WriteError(w, http.StatusBadRequest, err)
+		return
+	}
+	filter.GatewayID = ""
+	recent, err := a.store.RecentByGateway(r.Context(), filter, filter.Limit)
+	if err != nil {
+		proxy.WriteError(w, http.StatusInternalServerError, err)
+		return
+	}
+	proxy.WriteJSON(w, http.StatusOK, map[string]any{"gateways": recent})
+}
+
 func (a *App) handleSetup(w http.ResponseWriter, r *http.Request) {
-	proxy.WriteJSON(w, http.StatusOK, setupSnippets(a.config.ListenAddr, a.config.Snapshot()))
+	proxy.WriteJSON(w, http.StatusOK, setupSnippets(a.config.ListenAddr(), a.config.Snapshot()))
 }
 
 func (a *App) getLogByID(w http.ResponseWriter, r *http.Request) {
@@ -247,7 +389,11 @@ func (a *App) getLogByID(w http.ResponseWriter, r *http.Request) {
 	}
 	log, err := a.store.Get(r.Context(), id)
 	if err != nil {
-		proxy.WriteError(w, http.StatusNotFound, err)
+		if errors.Is(err, store.ErrLogNotFound) {
+			proxy.WriteError(w, http.StatusNotFound, err)
+			return
+		}
+		proxy.WriteError(w, http.StatusInternalServerError, err)
 		return
 	}
 	proxy.WriteJSON(w, http.StatusOK, log)
@@ -295,6 +441,9 @@ func (a *App) patchGateway(w http.ResponseWriter, r *http.Request, id string) {
 		proxy.WriteError(w, http.StatusBadRequest, err)
 		return
 	}
+	// A rename can collide on the client model key just like a create; PatchGateway
+	// validates the whole candidate table under the config's write lock, so the
+	// rejected patch never reaches disk.
 	gateway, err := a.config.PatchGateway(id, patch)
 	if err != nil {
 		status := http.StatusBadRequest
@@ -304,7 +453,7 @@ func (a *App) patchGateway(w http.ResponseWriter, r *http.Request, id string) {
 		proxy.WriteError(w, status, err)
 		return
 	}
-	proxy.WriteJSON(w, http.StatusOK, map[string]any{"gateway": gateway})
+	proxy.WriteJSON(w, http.StatusOK, map[string]any{"gateway": gatewayViewOf(gateway)})
 }
 
 func (a *App) listLogs(w http.ResponseWriter, r *http.Request) {
@@ -318,7 +467,16 @@ func (a *App) listLogs(w http.ResponseWriter, r *http.Request) {
 		proxy.WriteError(w, http.StatusInternalServerError, err)
 		return
 	}
-	proxy.WriteJSON(w, http.StatusOK, map[string]any{"items": logs})
+	// Counted with the same filter the page was selected by, so the console's
+	// total cannot describe a different query than the rows under it. Count
+	// ignores the page window, so this is the size of the whole match — which is
+	// what a pager needs, and not what `len(logs)` would have been.
+	total, err := a.store.Count(r.Context(), filter)
+	if err != nil {
+		proxy.WriteError(w, http.StatusInternalServerError, err)
+		return
+	}
+	proxy.WriteJSON(w, http.StatusOK, map[string]any{"items": logs, "total": total})
 }
 
 func (a *App) deleteLogs(w http.ResponseWriter, r *http.Request) {
@@ -371,20 +529,4 @@ func (a *App) reclaimSpaceAsync() {
 			a.logger.Warn("reclaiming space after delete logs failed", "error", err)
 		}
 	}()
-}
-
-// countLogs reports how many logs match the same filters as /api/logs,
-// letting the dashboard render total counts without fetching every row.
-func (a *App) countLogs(w http.ResponseWriter, r *http.Request) {
-	filter, err := parseFilter(r)
-	if err != nil {
-		proxy.WriteError(w, http.StatusBadRequest, err)
-		return
-	}
-	n, err := a.store.Count(r.Context(), filter)
-	if err != nil {
-		proxy.WriteError(w, http.StatusInternalServerError, err)
-		return
-	}
-	proxy.WriteJSON(w, http.StatusOK, map[string]any{"count": n})
 }

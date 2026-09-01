@@ -40,10 +40,6 @@ func (a *App) handleUI(w http.ResponseWriter, r *http.Request) {
 	http.StripPrefix("/static/", http.FileServer(http.FS(root))).ServeHTTP(w, r)
 }
 
-// parseFilter builds the log filter from query parameters. An unparsable
-// from/to is an error rather than a silently dropped bound: the caller believes
-// it is looking at a time window, and answering with every row would corrupt
-// counts and totals.
 func parseFilter(r *http.Request) (store.LogFilter, error) {
 	query := r.URL.Query()
 	filter := store.LogFilter{
@@ -75,40 +71,43 @@ func parseFilter(r *http.Request) (store.LogFilter, error) {
 	return filter, nil
 }
 
-// setupSnippets renders per-gateway client config snippets. The base URL uses
-// the proxy's actual listen address so the snippets stay correct when the
-// proxy is not on the default 127.0.0.1:8787.
-func setupSnippets(listenAddr string, gateways map[string]config.GatewayConfig) map[string]string {
+type setupSnippet struct {
+	ModelKey string `json:"model_key"`
+	Snippet  string `json:"snippet"`
+}
+
+func setupSnippets(listenAddr string, gateways map[string]config.GatewayConfig) map[string]setupSnippet {
 	base := normalizeListenAddr(listenAddr)
-	result := make(map[string]string, len(gateways))
+	result := make(map[string]setupSnippet, len(gateways))
 	for id, gateway := range gateways {
-		modelName := strings.ReplaceAll(gateway.Name, " ", "-")
-		modelName = strings.ToLower(modelName)
-		result[id] = fmt.Sprintf(`[model.%s-model]
+		key := config.ModelKey(gateway.Name, id)
+		result[id] = setupSnippet{
+			ModelKey: key,
+			Snippet: fmt.Sprintf(`[model.%s]
 model = "..."
 base_url = "%s%s"
 api_backend = "%s"
-`, modelName, base, gateway.Prefix, gateway.Protocol)
+`, key, base, gateway.Prefix, gateway.Protocol),
+		}
 	}
 	return result
 }
 
-// normalizeListenAddr turns a listen address into a usable base URL, adding a
-// default host when the address is hostless. A wildcard host (0.0.0.0 / ::)
-// is rewritten to the loopback: the snippet is meant to be opened by a browser
-// on this machine, and no browser can connect to 0.0.0.0.
 func normalizeListenAddr(listenAddr string) string {
 	addr := strings.TrimSpace(listenAddr)
 	if addr == "" {
 		return "http://127.0.0.1:8787"
 	}
+	// The outer guard already proved there is no scheme, and no branch below
+	// adds one before the http:// default, so the cases are exhaustive.
 	if !strings.Contains(addr, "://") {
-		if strings.HasPrefix(addr, ":") {
-			addr = "127.0.0.1" + addr
-		}
-		if strings.HasPrefix(addr, "/") {
+		switch {
+		case strings.HasPrefix(addr, ":"):
+			addr = "http://127.0.0.1" + addr
+		case strings.HasPrefix(addr, "/"):
+			// A unix socket path: localhost is as far as a browser can go.
 			addr = "http://localhost" + addr
-		} else if !strings.Contains(addr, "://") {
+		default:
 			addr = "http://" + addr
 		}
 	}

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"grok-gateway-proxy/internal/proxy"
 )
@@ -51,4 +53,36 @@ func SecurityHeadersMiddleware(next http.Handler) http.Handler {
 		h.Set("X-Frame-Options", "DENY")
 		next.ServeHTTP(w, r)
 	})
+}
+
+// sameOriginGuard is browser-CSRF mitigation, not gateway authentication.
+// It blocks cross-site POST/PATCH/DELETE to /api/* when the browser sends
+// Origin or Sec-Fetch-Site. Non-browser clients (Grok Build, curl) send
+// neither header and therefore pass — do not rely on this for authorization.
+func sameOriginGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if isCrossSite(r) {
+			proxy.WriteError(w, http.StatusForbidden, fmt.Errorf("cross-site requests to the management API are not allowed"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isCrossSite(r *http.Request) bool {
+	if origin := r.Header.Get("Origin"); origin != "" {
+		parsed, err := url.Parse(origin)
+		if err != nil || parsed.Host != r.Host {
+			return true
+		}
+	}
+	switch strings.ToLower(r.Header.Get("Sec-Fetch-Site")) {
+	case "cross-site", "cross-origin":
+		return true
+	}
+	return false
 }

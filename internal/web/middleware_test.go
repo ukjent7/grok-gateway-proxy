@@ -183,3 +183,89 @@ func TestFullChainConcurrentSafety(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestSameOriginGuardRejectsSimpleRequestCSRF pins the hole the guard exists
+// for: a fetch() with a string body is a "simple request" — the browser sends
+// it without a CORS preflight, so nothing but this check stops an unrelated
+// page from adding a gateway that this proxy then forwards Authorization to.
+func TestSameOriginGuardRejectsSimpleRequestCSRF(t *testing.T) {
+	app, cfg := newTestAppWithConfig(t)
+
+	rec := serveAPI(http.MethodPost, "http://127.0.0.1:8787/api/gateways",
+		`{"prefix":"evil","name":"evil","base_url":"https://attacker.test/v1"}`, app)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected a marker-free client to be allowed, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = serveAPI(http.MethodPost, "http://127.0.0.1:8787/api/gateways",
+		`{"prefix":"attacker","name":"attacker","base_url":"https://attacker.test/v1"}`, app,
+		"Origin", "http://evil.example", "Content-Type", "text/plain;charset=UTF-8")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a cross-site create, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if _, found := cfg.Snapshot()["attacker"]; found {
+		t.Fatal("the rejected request still created a gateway")
+	}
+}
+
+// The body-less mutations are equally reachable and say nothing in a
+// Content-Type, so the guard cannot rest on one: DELETE /api/logs wipes the
+// audit table from a page the user merely visited.
+func TestSameOriginGuardRejectsBodylessMutation(t *testing.T) {
+	app, _ := newTestAppWithConfig(t)
+
+	rec := serveAPI(http.MethodDelete, "http://127.0.0.1:8787/api/logs", "", app,
+		"Origin", "http://evil.example")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a cross-site delete, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// Sec-Fetch-Site alone, which is what a browser sends when the request
+	// carries no Origin.
+	rec = serveAPI(http.MethodDelete, "http://127.0.0.1:8787/api/logs", "", app,
+		"Sec-Fetch-Site", "cross-site")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a cross-site fetch, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// The console itself must keep working: same-origin traffic from the browser
+// it is served by, and a request whose Origin simply matches this host.
+func TestSameOriginGuardAllowsSameOriginAndBrowsers(t *testing.T) {
+	app, _ := newTestAppWithConfig(t)
+
+	rec := serveAPI(http.MethodPatch, "http://127.0.0.1:8787/api/gateways/st", `{"enabled":false}`, app,
+		"Origin", "http://127.0.0.1:8787", "Content-Type", "application/json", "Sec-Fetch-Site", "same-origin")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected the console's own PATCH to succeed, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// Reads are not the threat: they cannot mutate anything, and no cross-origin
+// page can read the response without CORS headers this server never sends.
+func TestSameOriginGuardLeavesReadsAlone(t *testing.T) {
+	app, _ := newTestAppWithConfig(t)
+
+	rec := serveAPI(http.MethodGet, "http://127.0.0.1:8787/api/config", "", app,
+		"Origin", "http://evil.example", "Sec-Fetch-Site", "cross-site")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected GET to pass the guard, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func newTestAppWithConfig(t *testing.T) (*App, *config.Config) {
+	t.Helper()
+	app, _ := newTestApp(t)
+	return app, app.config
+}
+
+// serveAPI sends one request through the app, setting any header pairs given
+// as trailing arguments.
+func serveAPI(method, target, body string, app *App, headers ...string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, target, strings.NewReader(body))
+	for i := 0; i+1 < len(headers); i += 2 {
+		req.Header.Set(headers[i], headers[i+1])
+	}
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	return rec
+}

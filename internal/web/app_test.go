@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,23 +30,6 @@ func TestStaticAssetsAreNotMatchedAsGatewayPaths(t *testing.T) {
 		}
 		if strings.TrimSpace(recorder.Body.String()) == "" {
 			t.Fatalf("%s: expected embedded asset body", path)
-		}
-	}
-}
-
-func TestHasPathPrefixUsesPathBoundary(t *testing.T) {
-	for _, test := range []struct {
-		path   string
-		prefix string
-		want   bool
-	}{
-		{path: "/st", prefix: "/st", want: true},
-		{path: "/st/chat/completions", prefix: "/st", want: true},
-		{path: "/static/app.js", prefix: "/st", want: false},
-		{path: "/status", prefix: "/st", want: false},
-	} {
-		if got := hasPathPrefix(test.path, test.prefix); got != test.want {
-			t.Errorf("hasPathPrefix(%q, %q) = %v, want %v", test.path, test.prefix, got, test.want)
 		}
 	}
 }
@@ -167,6 +151,74 @@ func TestProbeUpstreamMarksAuthenticationRejection(t *testing.T) {
 	}
 	if health.Err == "" {
 		t.Fatal("authentication rejection must carry an explanatory error")
+	}
+}
+
+// The console's "测试连通" button is a measurement, not a re-read of the
+// background sweep: a freshly saved base URL has to be probed now, or the
+// answer describes a gateway the user just stopped configuring. The shape it
+// returns is the same entry /healthz publishes per gateway, because the card
+// renders both with one piece of code.
+func TestTestGatewayProbesOnDemand(t *testing.T) {
+	var probes atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probes.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := config.DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
+	gw := cfg.Gateways["std"]
+	gw.BaseURL = upstream.URL
+	cfg.Gateways["std"] = gw
+	app := NewApp(cfg, nil, slog.Default(), "test")
+	app.proxy.Client = upstream.Client()
+
+	recorder := serveAPI(http.MethodPost, "http://127.0.0.1:8787/api/gateways/std/test", "", app,
+		"Origin", "http://127.0.0.1:8787", "Sec-Fetch-Site", "same-origin")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &entry); err != nil {
+		t.Fatal(err)
+	}
+	if probes.Load() != 1 {
+		t.Fatalf("the endpoint answered from cache: %d upstream requests seen", probes.Load())
+	}
+	if entry["reachable"] != true || entry["status"] != float64(200) {
+		t.Fatalf("unexpected probe answer: %+v", entry)
+	}
+	if _, ok := entry["checked_at"].(string); !ok {
+		t.Fatalf("probe answer must say when it measured: %+v", entry)
+	}
+
+	// /healthz reports the same measurement under the same keys.
+	health := map[string]any{}
+	if err := json.Unmarshal(serveAPI(http.MethodGet, "http://127.0.0.1:8787/healthz", "", app).Body.Bytes(), &health); err != nil {
+		t.Fatal(err)
+	}
+	cached, ok := health["upstreams"].(map[string]any)["std"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected std in /healthz upstreams, got %v", health["upstreams"])
+	}
+	for key := range cached {
+		if _, shared := entry[key]; !shared {
+			t.Fatalf("/healthz reports %q, which the probe endpoint does not", key)
+		}
+	}
+	if cached["reachable"] != entry["reachable"] || cached["status"] != entry["status"] {
+		t.Fatalf("/healthz and the probe disagree: %+v vs %+v", cached, entry)
+	}
+
+	// An id with no gateway is a 404, not a probe of nothing reported as a
+	// failure the user would read as an upstream problem.
+	missing := serveAPI(http.MethodPost, "http://127.0.0.1:8787/api/gateways/nosuch/test", "", app)
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for an unknown gateway, got %d: %s", missing.Code, missing.Body.String())
+	}
+	if probes.Load() != 1 {
+		t.Fatalf("an unknown gateway id still reached the upstream %d times", probes.Load())
 	}
 }
 
@@ -444,5 +496,56 @@ func TestDeleteLogsReclaimsSpace(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("expected 0 logs remaining, got %d", count)
+	}
+}
+
+// A gateway route takes a POST that reaches a third-party upstream, so the
+// same cross-site guard as the management API covers it. A native client
+// (grok-build, curl) sends neither marker and is unaffected.
+func TestGatewayRouteRejectsCrossSitePOST(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","status":"completed","output":[]}`))
+	}))
+	defer upstream.Close()
+
+	st, err := store.OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	cfg := config.DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
+	gateway := cfg.Gateways["std"]
+	gateway.BaseURL = upstream.URL
+	cfg.Gateways["std"] = gateway
+	app := NewApp(cfg, st, slog.Default(), "test")
+
+	post := func(origin, fetchSite string) int {
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/std/responses",
+			strings.NewReader(`{"model":"m","input":"hi"}`))
+		req.Header.Set("Content-Type", "application/json")
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		if fetchSite != "" {
+			req.Header.Set("Sec-Fetch-Site", fetchSite)
+		}
+		recorder := httptest.NewRecorder()
+		app.ServeHTTP(recorder, req)
+		return recorder.Code
+	}
+
+	if code := post("", ""); code != http.StatusOK {
+		t.Fatalf("native client: got %d, want 200", code)
+	}
+	if code := post("http://evil.example", ""); code != http.StatusForbidden {
+		t.Fatalf("foreign Origin: got %d, want 403", code)
+	}
+	if code := post("", "cross-site"); code != http.StatusForbidden {
+		t.Fatalf("Sec-Fetch-Site cross-site: got %d, want 403", code)
+	}
+	if code := post("http://127.0.0.1:8787", "same-origin"); code != http.StatusOK {
+		t.Fatalf("same-origin console: got %d, want 200", code)
 	}
 }
