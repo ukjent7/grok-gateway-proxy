@@ -1402,12 +1402,12 @@ func TestProxyDoesNotOverwriteExistingPromptCacheKey(t *testing.T) {
 }
 
 func TestProxyEnsuresStandardDefaults(t *testing.T) {
-	var gotUA, gotAccept, gotAuth, gotApiKey string
+	var gotUA, gotAccept, gotAuth, gotAPIKey string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotUA = r.Header.Get("User-Agent")
 		gotAccept = r.Header.Get("Accept")
 		gotAuth = r.Header.Get("Authorization")
-		gotApiKey = r.Header.Get("X-Api-Key")
+		gotAPIKey = r.Header.Get("X-Api-Key")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"resp","object":"response","model":"m","status":"completed","output":[]}`))
 	}))
@@ -1441,7 +1441,7 @@ func TestProxyEnsuresStandardDefaults(t *testing.T) {
 	if gotAuth != "Bearer secret" {
 		t.Fatalf("Authorization not ensured despite restrictive allowlist: %q", gotAuth)
 	}
-	if gotApiKey != "key-123" {
-		t.Fatalf("X-Api-Key not ensured: %q", gotApiKey)
+	if gotAPIKey != "key-123" {
+		t.Fatalf("X-Api-Key not ensured: %q", gotAPIKey)
 	}
 }

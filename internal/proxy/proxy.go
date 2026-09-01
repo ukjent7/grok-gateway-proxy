@@ -21,12 +21,12 @@ import (
 )
 
 const (
-	maxBodyBytes            int64         = 32 << 20
-	inFlightBodyBudget      int64         = 64 << 20
-	bodyAdmissionTimeout                  = 30 * time.Second
-	defaultResponseBodySize int64         = 256 << 10
-	maxUpstreamTimeout                    = 30 * time.Minute
-	auditWriteTimeout                     = 15 * time.Second
+	maxBodyBytes            int64 = 32 << 20
+	inFlightBodyBudget      int64 = 64 << 20
+	bodyAdmissionTimeout          = 30 * time.Second
+	defaultResponseBodySize int64 = 256 << 10
+	maxUpstreamTimeout            = 30 * time.Minute
+	auditWriteTimeout             = 15 * time.Second
 )
 
 type Proxy struct {
