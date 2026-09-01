@@ -55,17 +55,39 @@ func TestDeepSeekKeepsReasoningContentButStripsUnsupportedFields(t *testing.T) {
 	}
 }
 
-// reasoning.effort 原样透传（none/minimal/low/medium/high/xhigh/max 均不改写）。
-func TestDeepSeekPassesReasoningEffortThroughUntouched(t *testing.T) {
-	for _, effort := range []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"} {
+// reasoning.effort 由 DeepSeek 自行映射：其文档映射表覆盖的取值
+// （none/low/medium/high/xhigh/max）逐字节原样透传；DeepSeek 未定义的
+// minimal 收敛为它支持的最低档 low，而不是丢给上游一个没有定义的拼写。
+func TestDeepSeekPassesKnownEffortsAndClampsUnknownTier(t *testing.T) {
+	for _, effort := range []string{"none", "low", "medium", "high", "xhigh", "max"} {
 		body := []byte(`{"model":"deepseek-v4-pro","reasoning":{"effort":"` + effort + `"},"input":"hi"}`)
 		out, err := DeepSeekResponsesAdapter{}.TransformRequestBody(body)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(string(out), `"effort":"`+effort+`"`) {
+		if string(out) != string(body) {
 			t.Fatalf("effort %q was rewritten: %s", effort, out)
 		}
+	}
+
+	body := []byte(`{"model":"deepseek-v4-pro","reasoning":{"effort":"minimal"},"input":"hi"}`)
+	out, err := DeepSeekResponsesAdapter{}.TransformRequestBody(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), `"effort":"low"`) {
+		t.Fatalf("minimal was not clamped to low: %s", out)
+	}
+
+	// The clamp is a table, not a fallback: a value neither spec defines is
+	// left for the upstream to judge, exactly as an unmapped but known tier is.
+	unknown := []byte(`{"model":"deepseek-v4-pro","reasoning":{"effort":"ultra"},"input":"hi"}`)
+	out, err = DeepSeekResponsesAdapter{}.TransformRequestBody(unknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != string(unknown) {
+		t.Fatalf("unrecognised effort was rewritten: %s", out)
 	}
 }
 

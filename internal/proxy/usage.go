@@ -7,16 +7,9 @@ import (
 	"strings"
 
 	"grok-gateway-proxy/internal/config"
-	"grok-gateway-proxy/internal/numutil"
 	"grok-gateway-proxy/internal/store"
 )
 
-// ExtractUsage reads usage metrics from either a single JSON response body or
-// an SSE stream. For streams, usage may be carried by several events (e.g. the
-// Responses API emits `response.created` with an all-zero usage object before
-// the terminal event), so the last usage-bearing event wins: intermediate
-// events are zeroed placeholders, while the terminal event holds the
-// cumulative totals the client would bill on.
 func ExtractUsage(body []byte, protocol config.Protocol) store.UsageMetrics {
 	var root map[string]any
 	if json.Unmarshal(body, &root) == nil {
@@ -36,11 +29,6 @@ func ExtractUsage(body []byte, protocol config.Protocol) store.UsageMetrics {
 		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
 			continue
 		}
-		// Each event needs a fresh map. encoding/json merges into a non-nil
-		// map instead of clearing it, so reusing one across iterations keeps
-		// top-level keys the later event omits. That resurrects an earlier
-		// event's `response` envelope, and since extractUsageFromRoot checks
-		// it before the root-level `usage`, the stale figures win.
 		var event map[string]any
 		if json.Unmarshal(data, &event) == nil {
 			if metrics := extractUsageFromRoot(event, protocol); metrics.UsagePresent {
@@ -51,18 +39,19 @@ func ExtractUsage(body []byte, protocol config.Protocol) store.UsageMetrics {
 	return last
 }
 
-// usageTracker accumulates usage metrics from an SSE stream chunk by chunk as
-// the bytes are forwarded, rather than re-scanning a buffer after the fact.
-// The buffered approach reported zero tokens whenever the terminal
-// usage-bearing event fell outside the capture window (the capture is capped)
-// or whenever a single `data:` line exceeded bufio.Scanner's 1 MiB line limit,
-// which stopped the scan outright. Neither can happen here: the terminal event
-// is seen as it flows past, and an incomplete line is carried in tail until
-// the rest arrives, so there is no line-length limit.
+// maxUsageTailBytes caps the fragment held between observe() calls while
+// waiting for a newline. It is deliberately independent of maxBodyBytes
+// (32 MiB) and the per-column capture limit (256 KiB): it guards the
+// streaming line splitter, not audit storage. A single SSE data line larger
+// than 4 MiB cannot be a usage event (usage JSON is < 2 KiB); holding more
+// would pin arbitrary upstream payload. Must stay < maxBodyBytes.
+const maxUsageTailBytes = 4 << 20
+
 type usageTracker struct {
 	protocol config.Protocol
 	tail     []byte
 	last     store.UsageMetrics
+	skipping bool
 }
 
 func newUsageTracker(protocol config.Protocol) *usageTracker {
@@ -82,12 +71,25 @@ func (t *usageTracker) observe(chunk []byte) {
 		if index < 0 {
 			break
 		}
-		t.observeLine(buf[consumed : consumed+index])
+		if !t.skipping {
+			t.observeLine(buf[consumed : consumed+index])
+		}
+		t.skipping = false
 		consumed += index + 1
+	}
+	remaining := buf[consumed:]
+	if len(remaining) > maxUsageTailBytes {
+		// A fragment this far past the cap has no newline in sight, so drop
+		// it and skip to the end of the line it belongs to. A single frame
+		// that large cannot carry a usage object anyone can act on, and
+		// skipping only that line leaves the rest of the stream metered —
+		// bailing out for good would silently zero an otherwise fine request.
+		remaining = nil
+		t.skipping = true
 	}
 	// Carry the trailing fragment. buf may alias t.tail here; append writes
 	// forward through copy, which tolerates the overlap.
-	t.tail = append(t.tail[:0], buf[consumed:]...)
+	t.tail = append(t.tail[:0], remaining...)
 }
 
 func (t *usageTracker) observeLine(line []byte) {
@@ -212,12 +214,38 @@ func extractResponsesUsage(usage map[string]any, result store.UsageMetrics) stor
 	return result
 }
 
+// firstNumber returns the first numeric value found under the given keys, or
+// zero when none of them carries one.
 func firstNumber(m map[string]any, keys ...string) int64 {
-	return numutil.FirstNumber(m, keys...)
+	n, _ := firstNumberOK(m, keys...)
+	return n
 }
 
+// firstNumberOK returns the first present numeric value and whether it was
+// found. It accepts float64 (the default json numbers), json.Number, int and
+// int64 so callers do not need to handle type switches themselves.
 func firstNumberOK(m map[string]any, keys ...string) (int64, bool) {
-	return numutil.FirstNumberOK(m, keys...)
+	for _, key := range keys {
+		value, ok := m[key]
+		if !ok {
+			continue
+		}
+		switch n := value.(type) {
+		case float64:
+			return int64(n), true
+		case json.Number:
+			// A fractional or out-of-range json.Number is skipped rather than
+			// truncated, so the search falls through to the next candidate key.
+			if parsed, err := n.Int64(); err == nil {
+				return parsed, true
+			}
+		case int64:
+			return n, true
+		case int:
+			return int64(n), true
+		}
+	}
+	return 0, false
 }
 
 func firstNestedNumber(m map[string]any, parent, key string) int64 {

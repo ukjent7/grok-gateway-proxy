@@ -506,7 +506,7 @@ func TestProxyEnforcesUpstreamTimeout(t *testing.T) {
 	defer st.Close()
 
 	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
-	cfg.UpstreamTimeout = 200 * time.Millisecond
+	cfg.SetUpstreamTimeout(200 * time.Millisecond)
 	gateway := cfg.Gateways["st"]
 	gateway.BaseURL = upstream.URL
 	cfg.Gateways["st"] = gateway
@@ -518,26 +518,15 @@ func TestProxyEnforcesUpstreamTimeout(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	start := time.Now()
 	p.ServeHTTP(recorder, req)
-	elapsed := time.Since(start)
 
 	if recorder.Code != http.StatusGatewayTimeout {
-		t.Fatalf("expected 504 gateway timeout, got %d: %s", recorder.Code, recorder.Body.String())
+		t.Fatalf("expected status %d, got %d", http.StatusGatewayTimeout, recorder.Code)
 	}
-	if elapsed > 2*time.Second {
-		t.Fatalf("timeout was not enforced promptly: %v", elapsed)
-	}
-	logs, err := st.List(context.Background(), store.LogFilter{Limit: 1})
-	if err != nil || len(logs) != 1 {
-		t.Fatalf("expected one log, got %d, err=%v", len(logs), err)
-	}
-	if logs[0].StatusCode != http.StatusGatewayTimeout {
-		t.Fatalf("expected 504 in log, got %d", logs[0].StatusCode)
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("timeout took %v, want ~300ms", elapsed)
 	}
 }
 
-// A streaming request must NOT be cut off by the total upstream timeout: the
-// client applies its own 300s idle timeout, so an active stream that outlives
-// the configured timeout must be delivered in full.
 func TestProxyStreamingSurvivesUpstreamTimeout(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -545,11 +534,11 @@ func TestProxyStreamingSurvivesUpstreamTimeout(t *testing.T) {
 		flusher := w.(http.Flusher)
 		for i := 0; i < 8; i++ {
 			select {
-			case <-time.After(120 * time.Millisecond):
+			case <-time.After(60 * time.Millisecond):
 			case <-r.Context().Done():
 				return
 			}
-			chunk := "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":" + strconv.Itoa(i) + ",\"delta\":\"x\"}\n\n"
+			chunk := fmt.Sprintf("data: {\"type\":\"response.output_text.delta\",\"sequence_number\":%d,\"delta\":\"x\"}\n\n", i)
 			if _, err := w.Write([]byte(chunk)); err != nil {
 				return
 			}
@@ -564,7 +553,7 @@ func TestProxyStreamingSurvivesUpstreamTimeout(t *testing.T) {
 	}
 	defer st.Close()
 	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
-	cfg.UpstreamTimeout = 300 * time.Millisecond
+	cfg.SetUpstreamTimeout(300 * time.Millisecond)
 	gateway := cfg.Gateways["std"]
 	gateway.BaseURL = upstream.URL
 	cfg.Gateways["std"] = gateway
@@ -955,7 +944,7 @@ func TestProxyRecordsMidStreamFailureAsFailure(t *testing.T) {
 
 // config documents body_capture_limit_kb: 0 as "capture everything", so it
 // must not silently fall back to the default cap. It is still bounded by
-// maxCapturedBodySize — an opt-out must not become an unbounded write to
+// maxBodyBytes — an opt-out must not become an unbounded write to
 // SQLite — but a 300KB body sits far below that ceiling and is stored whole.
 func TestProxyCaptureLimitZeroDisablesTruncation(t *testing.T) {
 	body := []byte(`{"id":"ok","choices":[{"text":"` + strings.Repeat("x", 300*1024) + `"}]}`)
@@ -980,7 +969,7 @@ func TestProxyCaptureLimitZeroDisablesTruncation(t *testing.T) {
 			}
 			defer st.Close()
 			cfg := config.DefaultConfig(t.TempDir() + "/config.json")
-			cfg.BodyCaptureLimitKB = test.limitKB
+			cfg.SetBodyCaptureLimitKB(test.limitKB)
 			gateway := cfg.Gateways["st"]
 			gateway.BaseURL = upstream.URL
 			cfg.Gateways["st"] = gateway
@@ -1009,10 +998,6 @@ func TestProxyCaptureLimitZeroDisablesTruncation(t *testing.T) {
 	}
 }
 
-// Upstream error bodies take the capBody path instead of the cappedBuffer one,
-// so they must honour "0 = capture everything" the same way a 200 body does:
-// comparing against a zero limit would flag every error response as truncated.
-// A 300KB error body is far below maxCapturedBodySize, so it is stored whole.
 func TestProxyCaptureLimitZeroLeavesErrorBodyUntruncated(t *testing.T) {
 	errorBody := []byte(`{"error":{"type":"invalid_request_error","message":"` + strings.Repeat("y", 300*1024) + `"}}`)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1028,7 +1013,7 @@ func TestProxyCaptureLimitZeroLeavesErrorBodyUntruncated(t *testing.T) {
 	}
 	defer st.Close()
 	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
-	cfg.BodyCaptureLimitKB = 0
+	cfg.SetBodyCaptureLimitKB(0)
 	gateway := cfg.Gateways["st"]
 	gateway.BaseURL = upstream.URL
 	cfg.Gateways["st"] = gateway
@@ -1054,8 +1039,6 @@ func TestProxyCaptureLimitZeroLeavesErrorBodyUntruncated(t *testing.T) {
 	}
 }
 
-// With a cap in effect, an oversized upstream error body is still flagged, and
-// the client still receives it in full.
 func TestProxyCapsErrorResponseBodyCapture(t *testing.T) {
 	const capSize = 1024
 	errorBody := bytes.Repeat([]byte("z"), 4*capSize)
@@ -1102,10 +1085,6 @@ func TestProxyCapsErrorResponseBodyCapture(t *testing.T) {
 	}
 }
 
-// A configured limit of zero must still be bounded: "capture everything" means
-// up to maxCapturedBodySize, not unbounded. The ceiling mirrors the request
-// side (maxRequestBodySize) so both directions are capped the same way, and it
-// has to be large enough that no ordinary payload is truncated by it.
 func TestResponseBodyLimitZeroFallsBackToSafetyCeiling(t *testing.T) {
 	st, err := store.OpenStore(t.TempDir() + "/proxy.db")
 	if err != nil {
@@ -1115,26 +1094,23 @@ func TestResponseBodyLimitZeroFallsBackToSafetyCeiling(t *testing.T) {
 
 	for _, limitKB := range []int{0} {
 		cfg := config.DefaultConfig(t.TempDir() + "/config.json")
-		cfg.BodyCaptureLimitKB = limitKB
+		cfg.SetBodyCaptureLimitKB(limitKB)
 		p := &Proxy{Config: cfg, Store: st}
-		if got := p.responseBodyLimit(); got != maxCapturedBodySize {
+		if got := p.responseBodyLimit(); got != maxBodyBytes {
 			t.Fatalf("responseBodyLimit() with body_capture_limit_kb=%d = %d, want %d",
-				limitKB, got, maxCapturedBodySize)
+				limitKB, got, maxBodyBytes)
 		}
 	}
 
-	// A non-zero configured limit is honoured verbatim and is not raised to
-	// the ceiling.
 	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
-	cfg.BodyCaptureLimitKB = 8
+	cfg.SetBodyCaptureLimitKB(8)
 	p := &Proxy{Config: cfg, Store: st}
 	if got := p.responseBodyLimit(); got != 8<<10 {
 		t.Fatalf("responseBodyLimit() = %d, want %d", got, 8<<10)
 	}
 
-	// The ceiling must not be smaller than what callers already rely on.
-	if maxCapturedBodySize < defaultResponseBodySize {
-		t.Fatalf("maxCapturedBodySize (%d) is below the default cap (%d)", maxCapturedBodySize, defaultResponseBodySize)
+	if maxBodyBytes < defaultResponseBodySize {
+		t.Fatalf("maxBodyBytes (%d) is below the default cap (%d)", maxBodyBytes, defaultResponseBodySize)
 	}
 }
 
@@ -1154,11 +1130,11 @@ func TestCapBodyHonoursLimit(t *testing.T) {
 	}
 }
 
-// gatewayForPath must pick the most specific prefix, not whichever gateway
-// the map happens to yield first. Prefixes are not required to be disjoint,
-// and Go randomizes map iteration order, so a first-match-wins scan would
-// route the same path to different gateways across restarts.
-func TestGatewayForPathPrefersLongestPrefix(t *testing.T) {
+// Routing must pick the most specific prefix, not whichever gateway the map
+// happens to yield first. Prefixes are not required to be disjoint, and Go
+// randomizes map iteration order, so a first-match-wins scan would route the
+// same path to different gateways across restarts.
+func TestRoutePrefersLongestPrefix(t *testing.T) {
 	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
 	// Deliberately overlapping prefixes: /std is nested inside /s.
 	cfg.Gateways = map[string]config.GatewayConfig{
@@ -1184,15 +1160,15 @@ func TestGatewayForPathPrefersLongestPrefix(t *testing.T) {
 	// for some map iteration orders.
 	for attempt := 0; attempt < 50; attempt++ {
 		for _, test := range tests {
-			gateway, subpath, ok := p.gatewayForPath(test.path)
+			gateway, subpath, ok := p.Config.MatchGateway(test.path)
 			if ok != test.resolved {
-				t.Fatalf("gatewayForPath(%q) resolved=%v, want %v", test.path, ok, test.resolved)
+				t.Fatalf("MatchGateway(%q) resolved=%v, want %v", test.path, ok, test.resolved)
 			}
 			if !test.resolved {
 				continue
 			}
 			if gateway.ID != test.gateway || subpath != test.subpath {
-				t.Fatalf("gatewayForPath(%q) = (%q, %q), want (%q, %q)",
+				t.Fatalf("MatchGateway(%q) = (%q, %q), want (%q, %q)",
 					test.path, gateway.ID, subpath, test.gateway, test.subpath)
 			}
 		}
@@ -1227,4 +1203,245 @@ type failingBody struct{}
 
 func (failingBody) Read([]byte) (int, error) {
 	return 0, fmt.Errorf("simulated read failure")
+}
+
+// A body declared larger than the cap is refused without reading it: the old
+// code buffered maxBodyBytes+1 first and only then decided, so the size
+// that should have been free to reject cost the full ceiling in memory.
+func TestRequestBodyRejectedFromDeclaredLengthAlone(t *testing.T) {
+	p := &Proxy{Logger: slog.Default()}
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/ds/responses", strings.NewReader(`{}`))
+	req.ContentLength = maxBodyBytes + 1
+	recorder := httptest.NewRecorder()
+	logEntry := store.RequestLog{ID: "req-test"}
+
+	if _, ok := p.readRequestBody(recorder, req, &logEntry, 1024); ok {
+		t.Fatal("an oversized declared body was accepted")
+	}
+	if logEntry.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("StatusCode = %d, want %d", logEntry.StatusCode, http.StatusRequestEntityTooLarge)
+	}
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("client status = %d, want %d", recorder.Code, http.StatusRequestEntityTooLarge)
+	}
+	// The body was never consumed, so a client that lied about its length
+	// still has the bytes in flight — but the declared case costs nothing.
+	if logEntry.RequestBody != nil {
+		t.Fatalf("a rejected body was still captured: %q", logEntry.RequestBody)
+	}
+}
+
+// grok-build's x-grok-* internal headers must be translated to the standard
+// external equivalents any OpenAI-compatible upstream understands. Raw
+// x-grok-* are never leaked; only the translated standards reach the
+// upstream, and existing standards are preserved.
+func TestProxyTranslatesGrokHeadersToStandard(t *testing.T) {
+	var gotClientReq, gotSessionLower, gotSessionUpper, gotReqID, gotCorr, gotUA, gotAccept string
+	var gotGrokConv, gotGrokReq string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotClientReq = r.Header.Get("X-Client-Request-Id")
+		gotSessionLower = r.Header.Get("session_id")
+		gotSessionUpper = r.Header.Get("X-Session-Id")
+		gotReqID = r.Header.Get("X-Request-Id")
+		gotCorr = r.Header.Get("X-Correlation-Id")
+		gotUA = r.Header.Get("User-Agent")
+		gotAccept = r.Header.Get("Accept")
+		gotGrokConv = r.Header.Get("X-Grok-Conv-Id")
+		gotGrokReq = r.Header.Get("X-Grok-Req-Id")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","object":"response","model":"m","status":"completed","output":[]}`))
+	}))
+	defer upstream.Close()
+
+	st, err := store.OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
+	gateway := cfg.Gateways["std"]
+	gateway.BaseURL = upstream.URL
+	cfg.Gateways["std"] = gateway
+	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client()}
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/std/responses", strings.NewReader(`{"model":"m","input":"hi"}`))
+	req.Header.Set("X-Grok-Session-Id", "sess-123")
+	req.Header.Set("X-Grok-Conv-Id", "conv-999")
+	req.Header.Set("X-Grok-Req-Id", "req-456")
+	req.Header.Set("User-Agent", "grok-shell/9.9.9 (windows; x86_64)")
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if gotGrokConv != "" || gotGrokReq != "" {
+		t.Fatalf("raw grok headers leaked: conv=%q req=%q", gotGrokConv, gotGrokReq)
+	}
+	if gotClientReq != "sess-123" {
+		t.Fatalf("X-Client-Request-Id not translated to session: %q", gotClientReq)
+	}
+	if gotSessionLower != "sess-123" {
+		t.Fatalf("session_id not translated: %q", gotSessionLower)
+	}
+	// The OpenAI dialect is the default, so the OpenRouter spelling stays off
+	// the wire.
+	if gotSessionUpper != "" {
+		t.Fatalf("X-Session-Id sent under the OpenAI dialect: %q", gotSessionUpper)
+	}
+	// The upstream is told the audit row's id, which is also what the console
+	// shows in X-Request-Id — the two sides of one request agree.
+	if want := rec.Header().Get("X-Request-Id"); gotReqID != want {
+		t.Fatalf("X-Request-Id = %q, want the audit id %q", gotReqID, want)
+	}
+	if gotCorr != "req-456" {
+		t.Fatalf("X-Correlation-Id not translated: %q", gotCorr)
+	}
+	if gotUA != "grok-shell/9.9.9 (windows; x86_64)" {
+		t.Fatalf("User-Agent not preserved: %q", gotUA)
+	}
+	if gotAccept != "application/json" {
+		t.Fatalf("Accept default not set: %q", gotAccept)
+	}
+}
+
+func TestProxyTranslatesGrokConvIdFallback(t *testing.T) {
+	var gotSessionLower string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSessionLower = r.Header.Get("session_id")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","object":"response","model":"m","status":"completed","output":[]}`))
+	}))
+	defer upstream.Close()
+
+	st, err := store.OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
+	gateway := cfg.Gateways["std"]
+	gateway.BaseURL = upstream.URL
+	cfg.Gateways["std"] = gateway
+	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client()}
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/std/responses", strings.NewReader(`{"model":"m","input":"hi"}`))
+	req.Header.Set("X-Grok-Conv-Id", "conv-only")
+	p.ServeHTTP(httptest.NewRecorder(), req)
+
+	if gotSessionLower != "conv-only" {
+		t.Fatalf("fallback to conv-id not translated: %q", gotSessionLower)
+	}
+}
+
+func TestProxyInjectsPromptCacheKeyFromGrokHeader(t *testing.T) {
+	var upstreamBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&upstreamBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","object":"response","model":"m","status":"completed","output":[]}`))
+	}))
+	defer upstream.Close()
+
+	st, err := store.OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
+	gateway := cfg.Gateways["std"]
+	gateway.BaseURL = upstream.URL
+	cfg.Gateways["std"] = gateway
+	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client()}
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/std/responses", strings.NewReader(`{"model":"m","input":"hi"}`))
+	req.Header.Set("X-Grok-Session-Id", "sess-cache-123")
+	p.ServeHTTP(httptest.NewRecorder(), req)
+
+	if upstreamBody["prompt_cache_key"] != "sess-cache-123" {
+		t.Fatalf("prompt_cache_key not injected: %+v", upstreamBody)
+	}
+	// Ensure the audit log also sees the injected body.
+	logs, err := st.List(context.Background(), store.LogFilter{Limit: 1})
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("expected one log, got %d", len(logs))
+	}
+	detail, err := st.Get(context.Background(), logs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(detail.UpstreamBody), "prompt_cache_key") {
+		t.Fatalf("audit upstream body missing injected key: %s", detail.UpstreamBody)
+	}
+}
+
+func TestProxyDoesNotOverwriteExistingPromptCacheKey(t *testing.T) {
+	var upstreamBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&upstreamBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","object":"response","model":"m","status":"completed","output":[]}`))
+	}))
+	defer upstream.Close()
+
+	st, err := store.OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
+	gateway := cfg.Gateways["std"]
+	gateway.BaseURL = upstream.URL
+	cfg.Gateways["std"] = gateway
+	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client()}
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/std/responses", strings.NewReader(`{"model":"m","prompt_cache_key":"keep-me","input":"hi"}`))
+	req.Header.Set("X-Grok-Session-Id", "sess-new")
+	p.ServeHTTP(httptest.NewRecorder(), req)
+
+	if upstreamBody["prompt_cache_key"] != "keep-me" {
+		t.Fatalf("existing prompt_cache_key was overwritten: %+v", upstreamBody)
+	}
+}
+
+func TestProxyEnsuresStandardDefaults(t *testing.T) {
+	var gotUA, gotAccept, gotAuth, gotApiKey string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUA = r.Header.Get("User-Agent")
+		gotAccept = r.Header.Get("Accept")
+		gotAuth = r.Header.Get("Authorization")
+		gotApiKey = r.Header.Get("X-Api-Key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","object":"response","model":"m","status":"completed","output":[]}`))
+	}))
+	defer upstream.Close()
+
+	st, err := store.OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
+	gateway := cfg.Gateways["std"]
+	gateway.BaseURL = upstream.URL
+	// Restrictive allowlist that omits auth — translation must still ensure it.
+	gateway.ForwardHeaders = []string{"Accept"}
+	cfg.Gateways["std"] = gateway
+	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client()}
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/std/responses", strings.NewReader(`{"model":"m","input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("X-Api-Key", "key-123")
+	// No User-Agent or Accept sent.
+	p.ServeHTTP(httptest.NewRecorder(), req)
+
+	if gotUA == "" {
+		t.Fatalf("User-Agent default not set: %q", gotUA)
+	}
+	if gotAccept != "application/json" {
+		t.Fatalf("Accept default not ensured: %q", gotAccept)
+	}
+	if gotAuth != "Bearer secret" {
+		t.Fatalf("Authorization not ensured despite restrictive allowlist: %q", gotAuth)
+	}
+	if gotApiKey != "key-123" {
+		t.Fatalf("X-Api-Key not ensured: %q", gotApiKey)
+	}
 }

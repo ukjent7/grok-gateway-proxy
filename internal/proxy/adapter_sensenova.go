@@ -7,39 +7,28 @@ import (
 	"grok-gateway-proxy/internal/config"
 )
 
-// SenseNovaChatAdapter handles the SenseNova gateway (Chat Completions protocol).
-// It normalizes tool-call types between the client-facing Chat Completions
-// format (function) and SenseNova's internal representation (function_call).
 type SenseNovaChatAdapter struct{}
 
-func (SenseNovaChatAdapter) ID() string                { return "SenseNovaChatAdapter" }
 func (SenseNovaChatAdapter) Protocol() config.Protocol { return config.ProtocolChat }
 func (SenseNovaChatAdapter) EndpointPath() string      { return "/chat/completions" }
 func (a SenseNovaChatAdapter) AcceptsPath(path string) bool {
 	return path == a.EndpointPath()
 }
 func (a SenseNovaChatAdapter) RejectMessage(path string) string {
-	return fmt.Sprintf("%s accepts only %s, got %s", a.ID(), a.EndpointPath(), path)
+	return fmt.Sprintf("this gateway accepts only %s, got %s", a.EndpointPath(), path)
 }
 func (SenseNovaChatAdapter) ValidateRequest(body []byte) error {
 	return validateJSONRequest(body, "SenseNova Chat Completions")
 }
 
-// SenseNova's tool-call history decoder uses function_call for the tool call
-// variant, while the client-facing Chat Completions format uses function.
-// Keep the conversion scoped to tool_calls so tools[].type remains function.
 func (SenseNovaChatAdapter) TransformRequestBody(body []byte) ([]byte, error) {
-	transformed, err := transformToolCallType(body, "function", "function_call")
-	if err != nil {
-		return nil, err
-	}
-	return sanitizeSenseNovaToolCallHistory(transformed)
+	return sanitizeSenseNovaToolCallHistory(transformToolCallType(body, "function", "function_call"))
 }
 
 func (SenseNovaChatAdapter) TransformResponseBody(body []byte) ([]byte, error) {
-	return transformSenseNovaResponseBody(body)
+	return transformSenseNovaResponseBody(body), nil
 }
 
 func (SenseNovaChatAdapter) TransformSSE(reader io.Reader) io.Reader {
-	return newSSELineTransformer(reader, transformSenseNovaSSELine, nil, nil)
+	return newSSELineTransformer(reader, transformSenseNovaSSELine, nil, nil, nil)
 }

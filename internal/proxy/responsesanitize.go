@@ -3,54 +3,11 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
-	"sync/atomic"
 )
 
-// responsesanitize.go aligns Grok Build's xAI-flavored Responses traffic with
-// the standard OpenAI Responses protocol. Grok Build serializes typed request
-// fields from an enum of standard vocabulary, but adds xAI-only extensions on
-// top: the backend-only `stream_tool_calls` option, raw-JSON hosted tools
-// (`x_search`), and extra `include` values such as `no_inline_citations`. None
-// of these exist in the standard protocol, so a conformant upstream can reject
-// the request outright.
-//
-// `web_search.filters.excluded_domains` is deliberately not in that list: the
-// standard protocol spells the same capability `blocked_domains`
-// (openai-4.0.51/package/src/responses/openai-responses-api.ts#OpenAIResponsesTool),
-// so the key is renamed instead of dropped, which keeps the caller's intended
-// search scope intact for an upstream that implements it.
-//
-// The request sanitizer strips exactly those extensions and returns the body
-// byte-for-byte when nothing offending is present. The SSE filter drops
-// events outside Grok Build's typed event vocabulary (keepalive pings and
-// newer standard event types its parser cannot deserialize — an unparseable
-// frame fails the whole stream client-side).
-//
-// Whitelists in this file are derived from the canonical specs:
-//   - Tool types: openai-4.0.51/package/src/responses/openai-responses-api.ts#OpenAIResponsesTool
-//                 + async-openai/src/types/responses/response.rs#Tool
-//   - Include values: openai-4.0.51/package/src/responses/openai-responses-api.ts#OpenAIResponsesIncludeValue
-//                 = async-openai/src/types/responses/response.rs#IncludeEnum
-//   - Stream events: async-openai/src/types/responses/stream.rs#ResponseStreamEvent
-//   - Client-intercepted events: crates/codegen/xai-grok-sampler/src/client.rs
-//     (raw-JSON hooks that run before typed deserialization)
-//
-// These lists are hand-maintained against the sources above; there is no
-// generator. Two things to know when bumping dependencies:
-//
-//   - grok-build resolves async-openai from a fork (our-forks/async-openai.git
-//     pinned by Cargo.lock), not from the upstream checkout these paths refer
-//     to. If the fork adds event variants, they belong in
-//     responsesStreamEventTypes.
-//   - The two specs drift apart over time. The tool list is the union of both;
-//     the include and stream-event lists have matched exactly so far. Re-diff
-//     rather than assuming.
-
-// standardResponsesToolTypes is the tool `type` vocabulary of the standard
-// Responses protocol (mirroring the Tool enum Grok Build itself serializes
-// from). Entries with any other type are xAI-only and are stripped.
 var standardResponsesToolTypes = map[string]bool{
 	"function":                      true,
 	"file_search":                   true,
@@ -160,35 +117,32 @@ var responsesClientInterceptedEventTypes = map[string]bool{
 	"response.doom_loop_check": true,
 }
 
-// Observability counters for SSE filtering - exported for metrics.
-var (
-	droppedUnknownEventCount atomic.Int64
-	droppedPingCount         atomic.Int64
-	renamedLegacyEventCount  atomic.Int64
-)
-
-// sanitizeMetrics returns snapshot of filtering counters for observability.
-func sanitizeMetrics() map[string]int64 {
-	return map[string]int64{
-		"dropped_unknown_events": droppedUnknownEventCount.Load(),
-		"dropped_pings":          droppedPingCount.Load(),
-		"renamed_legacy_events":  renamedLegacyEventCount.Load(),
-	}
+// sseFilterStats counts what one stream's filter dropped or renamed. The
+// counters live per stream on purpose: package-wide atomics made two
+// concurrent streams attribute each other's drops, so the only thing the
+// process totals could answer was "something has been filtered at some point".
+// A single goroutine reads one stream, so these need no synchronisation.
+type sseFilterStats struct {
+	droppedUnknown int
+	droppedPings   int
+	renamedLegacy  int
 }
 
-// sanitizeMetricsDelta reports what accumulated since `before`. The counters
-// are process-wide, so per-stream observability has to diff them: logging the
-// raw snapshots would print a forever-growing total on every stream once
-// anything had ever been filtered. Counters that did not move are omitted.
-func sanitizeMetricsDelta(before map[string]int64) map[string]int64 {
-	after := sanitizeMetrics()
-	delta := make(map[string]int64, len(after))
-	for key, value := range after {
-		if moved := value - before[key]; moved > 0 {
-			delta[key] = moved
-		}
-	}
-	return delta
+// isZero reports whether the stream's filter touched nothing worth logging.
+func (s sseFilterStats) isZero() bool {
+	return s.droppedUnknown == 0 && s.droppedPings == 0 && s.renamedLegacy == 0
+}
+
+func (s sseFilterStats) String() string {
+	return fmt.Sprintf("dropped_unknown=%d dropped_pings=%d renamed_legacy=%d",
+		s.droppedUnknown, s.droppedPings, s.renamedLegacy)
+}
+
+// streamStatsReporter is implemented by the readers that filter with an
+// sseFilterStats, so the request handler can log what *this* stream removed
+// once the stream is done.
+type streamStatsReporter interface {
+	stats() sseFilterStats
 }
 
 // sanitizeResponsesRequest strips xAI-only extensions from a Responses
@@ -269,7 +223,18 @@ func sanitizeResponsesTools(raw json.RawMessage) (json.RawMessage, bool) {
 	changed := false
 	for _, entry := range entries {
 		var probe toolTypeProbe
-		if err := json.Unmarshal(entry, &probe); err != nil || !standardResponsesToolTypes[probe.Type] {
+		if err := json.Unmarshal(entry, &probe); err != nil {
+			// Valid JSON that is not shaped like a typed tool object — the
+			// `"tools": ["web_search"]` shorthand, a `filters` value that is
+			// not an object — is forwarded untouched. Only a `type` we can
+			// actually read is matched against the vocabulary; dropping what
+			// the probe cannot read would silently delete a capability the
+			// caller declared, which is exactly what the excluded_domains
+			// rename below exists to avoid.
+			kept = append(kept, entry)
+			continue
+		}
+		if !standardResponsesToolTypes[probe.Type] {
 			changed = true
 			continue
 		}
@@ -404,30 +369,33 @@ func isUnknownResponsesEventPayload(payload []byte) bool {
 // newResponsesSSEFilter translates the upstream stream into the event
 // vocabulary Grok Build's parser understands: legacy reasoning event names
 // are renamed to their standard reasoning_text equivalents, keepalive pings
-// are dropped, and events outside the known vocabulary are dropped.
+// are dropped, and events outside the known vocabulary are dropped. The
+// transformer keeps a per-stream tally of what it removed.
 func newResponsesSSEFilter(reader io.Reader) io.Reader {
-	return newSSELineTransformer(reader, rewriteLegacyReasoningEventNames, isVercelPing, dropUnknownResponsesEvent)
+	stats := &sseFilterStats{}
+	return newSSELineTransformer(reader, func(line []byte) []byte {
+		renamed := rewriteLegacyReasoningEventNames(line)
+		// Counted here because this is where the rename happens. Only the
+		// `data:` payload is the event — its `event:` line names the same
+		// thing, and counting both would report every renamed event twice.
+		if !bytes.Equal(renamed, line) && dataLinePayload(bytes.TrimRight(line, "\r\n")) != nil {
+			stats.renamedLegacy++
+		}
+		return renamed
+	}, stats, stats.isPingPayload, stats.dropUnknownResponsesEvent)
 }
 
-// dropUnknownResponsesEvent decides on the renamed payload so the legacy
-// reasoning event names pass the vocabulary check that follows the rename.
-// The rename is idempotent, so applying it here and again at write time is
-// safe. An empty `data:` frame is dropped as well: it cannot be parsed by
-// the client and would fail the whole stream.
-func dropUnknownResponsesEvent(payload []byte) bool {
+// dropUnknownResponsesEvent reports whether a payload would fail the client's
+// deserializer: an empty frame, or a type outside both known vocabularies. It
+// is pure: counting is done by the caller (sseLineTransformer) via filterStats.
+// Logging stays here because the payload preview is most useful at the decision point.
+func (s *sseFilterStats) dropUnknownResponsesEvent(payload []byte) bool {
 	trimmed := bytes.TrimSpace(payload)
 	if len(trimmed) == 0 {
-		droppedUnknownEventCount.Add(1)
 		slog.Debug("dropping empty SSE payload")
 		return true
 	}
-	// Single Unmarshal path: rename first so legacy events pass.
-	renamed := rewriteLegacyReasoningEventNames(payload)
-	if !bytes.Equal(renamed, payload) {
-		renamedLegacyEventCount.Add(1)
-	}
-	if isUnknownResponsesEventPayload(renamed) {
-		droppedUnknownEventCount.Add(1)
+	if isUnknownResponsesEventPayload(trimmed) {
 		preview := trimmed
 		if len(preview) > 200 {
 			preview = preview[:200]

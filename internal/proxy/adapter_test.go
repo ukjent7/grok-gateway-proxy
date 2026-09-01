@@ -229,12 +229,12 @@ func TestStandardPassesResponsesStreamThroughUnchanged(t *testing.T) {
 	}
 }
 
-// TestVercelRenameHandlesSpacedAndNestedSerialization verifies the structured
-// type-field rewrite copes with serialization variants the old byte-replace
-// approach missed: extra whitespace around the colon, and the legacy event
-// name appearing as the value of a different key (e.g. "delta" text) where it
-// must survive untouched. Only "type" properties whose value is the legacy
-// event name are renamed; other string values are left intact.
+// TestStandardRenameHandlesSpacedAndNestedSerialization verifies the type-field
+// rewrite copes with serialization variants a naive byte replace would miss:
+// extra whitespace around the colon, and the legacy event name appearing as the
+// value of a different key (e.g. "delta" text) where it must survive untouched.
+// Only "type" properties whose value is the legacy event name are renamed;
+// other string values are left intact.
 func TestStandardRenameHandlesSpacedAndNestedSerialization(t *testing.T) {
 	adapter := StandardResponsesAdapter{}
 	// Extra spaces around the colon; the legacy name also appears as a "delta"
@@ -330,36 +330,6 @@ func TestSenseNovaSpacedToolCallContinuationKeepsIdentity(t *testing.T) {
 	}
 }
 
-// hasEmptyJSONStringField is the parse pre-filter: it must tolerate
-// whitespace between JSON tokens, including none at all.
-func TestHasEmptyJSONStringField(t *testing.T) {
-	tests := []struct {
-		name  string
-		body  string
-		key   string
-		found bool
-	}{
-		{"compact", `{"id":"","name":"x"}`, "id", true},
-		{"spaced after colon", `{"id": "","name":"x"}`, "id", true},
-		{"spaced around colon", `{"id" : "","name":"x"}`, "id", true},
-		{"newline separated", "{\n  \"id\":\n  \"\",\n  \"name\": \"x\"\n}", "id", true},
-		{"non-empty value", `{"id":"call-1"}`, "id", false},
-		{"missing key", `{"name":""}`, "id", false},
-		{"key as substring", `{"parent_id":""}`, "id", false},
-		{"key not a member", `{"values":["id"]}`, "id", false},
-		{"empty body", ``, "id", false},
-		{"truncated after key", `{"id"`, "id", false},
-		{"second occurrence empty", `{"id":"a","id": ""}`, "id", true},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := hasEmptyJSONStringField([]byte(test.body), test.key); got != test.found {
-				t.Fatalf("hasEmptyJSONStringField(%q, %q) = %v, want %v", test.body, test.key, got, test.found)
-			}
-		})
-	}
-}
-
 // Every Responses request sent upstream must conform to the standard
 // protocol: xAI-only extensions are stripped regardless of model, while
 // everything else survives untouched.
@@ -449,6 +419,27 @@ func TestStandardFiltersPingsAndUnknownEvents(t *testing.T) {
 		}
 		if string(body) != want {
 			t.Fatalf("stream was not aligned for %q:\nwant: %q\ngot:  %q", model, want, body)
+		}
+	}
+}
+
+// The request rewrite walks a decoded document, so numbers that have nothing
+// to do with the rewrite still have to leave the way they arrived. Decoding
+// into a generic value without UseNumber silently turns 9007199254740993 into
+// 9007199254740992 and 1.0 into 1.
+func TestSenseNovaRequestRewritePreservesNumberLiterals(t *testing.T) {
+	body := []byte(`{"model":"m","seq":9007199254740993,"ratio":1.0,"sci":1e3,` +
+		`"messages":[{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]}]}`)
+	out, err := SenseNovaChatAdapter{}.TransformRequestBody(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), `"type":"function_call"`) {
+		t.Fatalf("tool call type was not rewritten: %s", out)
+	}
+	for _, literal := range []string{"9007199254740993", `"ratio":1.0`, `"sci":1e3`} {
+		if !strings.Contains(string(out), literal) {
+			t.Fatalf("number literal %s did not survive the rewrite: %s", literal, out)
 		}
 	}
 }

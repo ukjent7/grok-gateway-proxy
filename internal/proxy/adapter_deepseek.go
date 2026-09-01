@@ -3,52 +3,15 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
-
-	"grok-gateway-proxy/internal/config"
 )
 
-// DeepSeekResponsesAdapter targets DeepSeek's Responses API
-// (https://api.deepseek.com, per the official "使用 Responses API" and
-// "思考模式" docs).
-//
-// DeepSeek's Responses dialect is close to the standard: the stream event
-// names (response.created, response.reasoning_text.delta,
-// response.output_text.delta, response.function_call_arguments.delta, ...)
-// and terminal events all fall inside Grok Build's typed event vocabulary,
-// the stream carries no `data: [DONE]` sentinel (the client terminates on
-// EOF), and unsupported top-level parameters are silently ignored. The
-// request direction therefore only needs targeted cleanups on top of the
-// shared standard-protocol sanitization:
-//
-//   - `include` is dropped entirely: DeepSeek does not support any include
-//     value (reasoning content is always returned as plaintext).
-//   - input `reasoning` items keep their plaintext `content` (what DeepSeek
-//     merges back into the adjacent assistant message and what its tool-call
-//     loop requires: a request carrying tools must replay the reasoning
-//     content verbatim or the API returns 400), while `summary` and
-//     `encrypted_content`, which DeepSeek does not support, are stripped.
-//   - `reasoning.effort` passes through untouched.
 type DeepSeekResponsesAdapter struct{ baseResponsesAdapter }
 
-func (DeepSeekResponsesAdapter) ID() string { return "DeepSeekResponsesAdapter" }
-func (a DeepSeekResponsesAdapter) Protocol() config.Protocol {
-	return a.baseResponsesAdapter.Protocol()
-}
-func (a DeepSeekResponsesAdapter) EndpointPath() string { return a.baseResponsesAdapter.EndpointPath() }
-func (a DeepSeekResponsesAdapter) AcceptsPath(path string) bool {
-	return a.baseResponsesAdapter.AcceptsPath(path)
-}
-func (a DeepSeekResponsesAdapter) RejectMessage(path string) string {
-	return fmt.Sprintf("%s accepts only %s, got %s", a.ID(), a.EndpointPath(), path)
-}
 func (DeepSeekResponsesAdapter) ValidateRequest(body []byte) error {
 	return validateJSONRequest(body, "DeepSeek Responses")
 }
 
-// TransformRequestBody sanitizes the request to the standard Responses
-// vocabulary and then applies the DeepSeek-specific cleanups.
 func (DeepSeekResponsesAdapter) TransformRequestBody(body []byte) ([]byte, error) {
 	sanitized, err := sanitizeResponsesRequest(body)
 	if err != nil {
@@ -57,24 +20,14 @@ func (DeepSeekResponsesAdapter) TransformRequestBody(body []byte) ([]byte, error
 	return adaptResponsesRequestForDeepSeek(sanitized)
 }
 
-// TransformResponseBody is a pass-through; the response object matches the
-// OpenAI Responses structure.
 func (DeepSeekResponsesAdapter) TransformResponseBody(body []byte) ([]byte, error) {
 	return body, nil
 }
 
-// TransformSSE translates the reply stream into the event vocabulary Grok
-// Build's parser understands (DeepSeek's event names are already inside it;
-// the filter guards against pings and future event types).
 func (DeepSeekResponsesAdapter) TransformSSE(reader io.Reader) io.Reader {
 	return newResponsesSSEFilter(reader)
 }
 
-// adaptResponsesRequestForDeepSeek applies the DeepSeek-specific request
-// cleanups. Bodies with none of the affected fields are returned
-// byte-for-byte.
-// Optimization 1&3: fast-path byte checks to avoid JSON parsing when body
-// contains none of the DeepSeek-specific fields.
 func adaptResponsesRequestForDeepSeek(body []byte) ([]byte, error) {
 	hasInclude := bytes.Contains(body, []byte(`"include"`))
 	hasReasoning := bytes.Contains(body, []byte(`"reasoning"`))
@@ -93,6 +46,12 @@ func adaptResponsesRequestForDeepSeek(body []byte) ([]byte, error) {
 		}
 	}
 	if hasReasoning {
+		if raw, ok := payload["reasoning"]; ok {
+			if mapped, effortChanged := mapDeepSeekReasoningEffort(raw); effortChanged {
+				payload["reasoning"] = mapped
+				changed = true
+			}
+		}
 		if raw, ok := payload["input"]; ok {
 			if cleaned, inputChanged := stripUnsupportedReasoningFields(raw); inputChanged {
 				payload["input"] = cleaned
@@ -106,9 +65,39 @@ func adaptResponsesRequestForDeepSeek(body []byte) ([]byte, error) {
 	return marshalJSONNoEscape(payload)
 }
 
-// stripUnsupportedReasoningFields removes `summary` and `encrypted_content`
-// from input reasoning items, keeping the plaintext `content` that DeepSeek
-// merges into the adjacent assistant message.
+var deepSeekEffortClamps = map[string]string{
+	"minimal": "low",
+}
+
+func mapDeepSeekReasoningEffort(raw json.RawMessage) (json.RawMessage, bool) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return raw, false
+	}
+	effortRaw, ok := fields["effort"]
+	if !ok {
+		return raw, false
+	}
+	var effort string
+	if err := json.Unmarshal(effortRaw, &effort); err != nil {
+		return raw, false
+	}
+	clamped, ok := deepSeekEffortClamps[effort]
+	if !ok {
+		return raw, false
+	}
+	encoded, err := json.Marshal(clamped)
+	if err != nil {
+		return raw, false
+	}
+	fields["effort"] = encoded
+	out, err := marshalJSONNoEscape(fields)
+	if err != nil {
+		return raw, false
+	}
+	return out, true
+}
+
 func stripUnsupportedReasoningFields(raw json.RawMessage) (json.RawMessage, bool) {
 	var items []json.RawMessage
 	if err := json.Unmarshal(raw, &items); err != nil {

@@ -3,8 +3,11 @@ package proxy
 import (
 	"bytes"
 	"io"
+	"net/http"
 	"strings"
 	"testing"
+
+	"grok-gateway-proxy/internal/config"
 )
 
 // Dropping an event must not swallow the blank line that terminates a *kept*
@@ -321,5 +324,138 @@ func TestSanitizeResponsesRequestStripsStreamToolCallsWhenSpaced(t *testing.T) {
 	}
 	if bytes.Contains(got, []byte("stream_tool_calls")) {
 		t.Fatalf("stream_tool_calls survived: %s", got)
+	}
+}
+
+// A tool entry the probe cannot read is not evidence of a non-standard type.
+// Dropping it would delete a capability the caller declared — the exact
+// failure the excluded_domains rename above exists to avoid — so anything that
+// cannot be classified is forwarded and left for the upstream to judge.
+func TestSanitizeResponsesRequestKeepsToolEntriesItCannotParse(t *testing.T) {
+	for _, body := range []string{
+		`{"model":"m","tools":["web_search"]}`,
+		`{"model":"m","tools":[{"type":"web_search","filters":"none"}]}`,
+	} {
+		got, err := sanitizeResponsesRequest([]byte(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(got, []byte("web_search")) {
+			t.Fatalf("declared tool was silently dropped: %s -> %s", body, got)
+		}
+	}
+
+	// A type the vocabulary really does not list is still stripped.
+	got, err := sanitizeResponsesRequest([]byte(`{"model":"m","tools":[{"type":"x_search"},{"type":"function","name":"f"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(got, []byte("x_search")) {
+		t.Fatalf("non-standard tool survived: %s", got)
+	}
+	if !bytes.Contains(got, []byte(`"name":"f"`)) {
+		t.Fatalf("function tool was lost: %s", got)
+	}
+}
+
+// What a stream's filter removed is attributed to that stream. Process-wide
+// counters could only report a total that any concurrent stream might have
+// moved, so two streams finishing near each other each logged the other's
+// drops.
+func TestSSEFilterStatsArePerStream(t *testing.T) {
+	stream := "data: ping\n\n" +
+		"event: response.reasoning.delta\ndata: {\"type\":\"response.reasoning.delta\",\"delta\":\"x\"}\n\n" +
+		"data: {\"type\":\"response.not_a_real_event\"}\n\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"y\"}\n\n"
+
+	counts := func() sseFilterStats {
+		reader := newResponsesSSEFilter(strings.NewReader(stream))
+		filter, ok := reader.(streamStatsReporter)
+		if !ok {
+			t.Fatal("responses SSE filter reports no per-stream stats")
+		}
+		out, err := io.ReadAll(reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(out, []byte("response.not_a_real_event")) {
+			t.Fatalf("unknown event survived: %s", out)
+		}
+		return filter.stats()
+	}
+
+	first := counts()
+	if first.droppedPings != 1 || first.droppedUnknown != 1 || first.renamedLegacy != 1 {
+		t.Fatalf("unexpected first-stream tally: %+v", first)
+	}
+	if second := counts(); second != first {
+		t.Fatalf("a new stream inherited earlier counts: %+v vs %+v", second, first)
+	}
+	if first.isZero() {
+		t.Fatal("a stream that filtered three events reported no activity")
+	}
+}
+
+// Unknown event types are dropped as a two-line frame (event: + data:).
+// The following valid event must survive with its terminator intact.
+func TestSSETwoLineFramingDropsEventAndData(t *testing.T) {
+	stream := "" +
+		"event: response.created\ndata: {\"type\":\"response.created\"}\n\n" +
+		"event: response.unknown_foobar\ndata: {\"type\":\"response.unknown_foobar\",\"delta\":\"x\"}\n\n" +
+		"data: \n\n" + // empty data: line is also dropped
+		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n" +
+		"data: [DONE]\n\n"
+	out, err := io.ReadAll(newResponsesSSEFilter(strings.NewReader(stream)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(out)
+	if strings.Contains(got, "unknown_foobar") {
+		t.Fatalf("unknown two-line frame survived: %q", got)
+	}
+	if strings.Contains(got, "data: \n") {
+		t.Fatalf("empty data frame survived: %q", got)
+	}
+	if !strings.Contains(got, "response.created") || !strings.Contains(got, "response.output_text.delta") {
+		t.Fatalf("valid framing events were lost: %q", got)
+	}
+	if !strings.Contains(got, "[DONE]") {
+		t.Fatalf("[DONE] sentinel lost: %q", got)
+	}
+	// Ensure stats counted both unknown and empty as droppedUnknown (2)
+	reader := newResponsesSSEFilter(strings.NewReader(stream))
+	filter, ok := reader.(streamStatsReporter)
+	if !ok {
+		t.Fatal("filter has no stats")
+	}
+	if _, err := io.ReadAll(reader); err != nil {
+		t.Fatal(err)
+	}
+	stats := filter.stats()
+	if stats.droppedUnknown < 2 {
+		t.Fatalf("expected at least 2 droppedUnknown (unknown+empty), got %+v", stats)
+	}
+}
+
+// SessionAffinityOff must not emit any session header, verified via the
+// single-entry helper buildUpstreamHeaders which is the canonical header
+// construction path. Non-browser clients without Origin must pass sameOriginGuard.
+func TestBuildUpstreamHeadersSessionAffinityOff(t *testing.T) {
+	src := http.Header{}
+	src.Set("X-Grok-Session-Id", "sess-999")
+	src.Set("Authorization", "Bearer tok")
+	dst := http.Header{}
+	buildUpstreamHeaders(dst, src, config.GatewayConfig{SessionAffinity: config.SessionAffinityOff}, "req-1", false)
+	if got := dst.Get("session_id"); got != "" {
+		t.Fatalf("Off mode leaked session_id %q", got)
+	}
+	if got := dst.Get("X-Client-Request-Id"); got != "" {
+		t.Fatalf("Off mode leaked X-Client-Request-Id %q", got)
+	}
+	if got := dst.Get("X-Session-Id"); got != "" {
+		t.Fatalf("Off mode leaked X-Session-Id %q", got)
+	}
+	if got := dst.Get("Authorization"); got != "Bearer tok" {
+		t.Fatalf("allowlisted Authorization lost in Off mode: %q", got)
 	}
 }

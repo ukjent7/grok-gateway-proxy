@@ -21,45 +21,27 @@ import (
 )
 
 const (
-	// maxRequestBodySize bounds the audit-captured request body. Requests
-	// larger than this are rejected with 413 before any upstream call.
-	maxRequestBodySize int64 = 64 << 20
-
-	// defaultResponseBodySize is the fallback when no configurable limit is
-	// set. Individual deployments can override via config.BodyCaptureLimitKB.
-	defaultResponseBodySize int64 = 256 << 10
-
-	// maxUpstreamTimeout caps the per-request timeout that a client may
-	// request via the X-Proxy-Timeout header.
-	maxUpstreamTimeout = 30 * time.Minute
-
-	// maxCapturedBodySize is the safety ceiling for a single captured column
-	// when body_capture_limit_kb is 0 ("capture everything"). Opting out of
-	// truncation must not mean unbounded: the request side is already capped
-	// by maxRequestBodySize, and without a matching ceiling here one large
-	// upstream response would land in SQLite in full. This mirrors the
-	// request-side limit so both directions are bounded the same way.
-	maxCapturedBodySize int64 = 64 << 20
+	maxBodyBytes            int64         = 32 << 20
+	inFlightBodyBudget      int64         = 64 << 20
+	bodyAdmissionTimeout                  = 30 * time.Second
+	defaultResponseBodySize int64         = 256 << 10
+	maxUpstreamTimeout                    = 30 * time.Minute
+	auditWriteTimeout                     = 15 * time.Second
 )
 
 type Proxy struct {
-	Config *config.Config
-	Store  *store.Store
-	Logger *slog.Logger
-	// Client/DirectClient serve non-streaming requests (no transport-level
-	// header cap — the request context bounds them). StreamClient and
-	// StreamDirectClient serve streaming requests (capped header wait against
-	// hung upstreams). Tests may set only Client/DirectClient; ClientFor falls
-	// back to them when the streaming pair is absent.
+	Config             *config.Config
+	Store              *store.Store
+	Logger             *slog.Logger
 	Client             *http.Client
 	DirectClient       *http.Client
 	StreamClient       *http.Client
 	StreamDirectClient *http.Client
 	clientMu           sync.RWMutex
-	ResponseBodySize   int64 // override body capture limit (0 = use config or default)
+	ResponseBodySize   int64
+	bodies             *bodyAdmission
 }
 
-// statusError carries an HTTP status code alongside the error message.
 type statusError struct {
 	status  int
 	message string
@@ -85,6 +67,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Request-Id", logEntry.ID)
 	defer p.finalizeLog(r.Context(), &logEntry, capture, started)
 
+	release, admitErr := p.admitBody(r)
+	defer release()
+	if admitErr != nil {
+		if errors.Is(admitErr, errAdmissionTimeout) {
+			p.Logger.Warn("request gave up waiting for body budget", "error", admitErr, "path", r.URL.Path)
+			w.Header().Set("Retry-After", "1")
+		}
+		logEntry.Error = admitErr.Error()
+		logEntry.StatusCode = http.StatusServiceUnavailable
+		WriteError(w, logEntry.StatusCode, admitErr)
+		return
+	}
+
 	requestBody, ok := p.readRequestBody(w, r, &logEntry, bodyLimit)
 	if !ok {
 		return
@@ -102,7 +97,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	upstreamCtx, cancel := p.upstreamContext(r, logEntry.Stream)
 	defer cancel()
 
-	upstreamRequest, err := p.buildUpstreamRequest(upstreamCtx, r, gateway, subpath, adapter, requestBody, &logEntry)
+	upstreamRequest, err := p.buildUpstreamRequest(upstreamCtx, r, gateway, subpath, adapter, requestBody, bodyLimit, &logEntry)
 	if err != nil {
 		logEntry.Error = err.Error()
 		logEntry.StatusCode = statusOf(err)
@@ -145,21 +140,23 @@ func (p *Proxy) finalizeLog(ctx context.Context, logEntry *store.RequestLog, cap
 }
 
 func (p *Proxy) readRequestBody(w http.ResponseWriter, r *http.Request, logEntry *store.RequestLog, bodyLimit int64) ([]byte, bool) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodySize+1))
-	if err != nil {
-		// The other error paths record what went wrong; a read failure must
-		// not leave an audit row that only shows a bare 400.
+	reject := func(status int, err error) ([]byte, bool) {
 		logEntry.Error = err.Error()
-		logEntry.StatusCode = http.StatusBadRequest
-		WriteError(w, http.StatusBadRequest, err)
+		logEntry.StatusCode = status
+		WriteError(w, status, err)
 		return nil, false
 	}
-	if int64(len(body)) > maxRequestBodySize {
-		err := fmt.Errorf("request body exceeds %d bytes", maxRequestBodySize)
-		logEntry.Error = err.Error()
-		logEntry.StatusCode = http.StatusRequestEntityTooLarge
-		WriteError(w, http.StatusRequestEntityTooLarge, err)
-		return nil, false
+	if r.ContentLength > maxBodyBytes {
+		return reject(http.StatusRequestEntityTooLarge, fmt.Errorf("request body exceeds %d bytes", maxBodyBytes))
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes+1)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return reject(http.StatusRequestEntityTooLarge, fmt.Errorf("request body exceeds %d bytes", maxBodyBytes))
+		}
+		return reject(http.StatusBadRequest, err)
 	}
 	logEntry.RequestBody = capBody(body, bodyLimit)
 	logEntry.Model = ParseModel(body)
@@ -181,28 +178,24 @@ func (p *Proxy) populateLogGateway(logEntry *store.RequestLog, gateway config.Ga
 
 func (p *Proxy) upstreamContext(r *http.Request, stream bool) (context.Context, context.CancelFunc) {
 	if stream {
-		// Streams deliberately get no hard deadline: reasoning models can run
-		// far past the non-streaming timeout. What bounds a stalled upstream is
-		// the request context cancelling on client disconnect, plus the
-		// transport's ResponseHeaderTimeout for an upstream that never sends
-		// headers at all. A mid-stream stall with the client still attached is
-		// not bounded, so a hung upstream keeps its goroutine until the client
-		// goes away.
+		// Streaming requests cancel when client disconnects; header wait is bounded by ResponseHeaderTimeout.
 		return r.Context(), func() {}
 	}
 	return context.WithTimeout(r.Context(), p.upstreamTimeout(r))
 }
 
 // resolveGateway maps the inbound path to a gateway + adapter and validates
-// the request (method, subpath, body). Returns a *statusError on failure.
 func (p *Proxy) resolveGateway(r *http.Request, body []byte) (config.GatewayConfig, string, GatewayAdapter, error) {
-	gateway, subpath, ok := p.gatewayForPath(r.URL.Path)
+	gateway, subpath, ok := p.Config.MatchGateway(r.URL.Path)
 	if !ok {
 		return config.GatewayConfig{}, "", nil, &statusError{status: http.StatusNotFound, message: fmt.Sprintf("unknown proxy path %s", r.URL.Path)}
 	}
-	adapter, ok := adapterFor(gateway.ID)
+	adapter, ok := adapterForGateway(gateway)
 	if !ok {
 		return gateway, subpath, nil, &statusError{status: http.StatusNotImplemented, message: fmt.Sprintf("adapter not implemented for %s", gateway.ID)}
+	}
+	if !gateway.Enabled {
+		return gateway, subpath, adapter, &statusError{status: http.StatusServiceUnavailable, message: fmt.Sprintf("gateway %s is disabled", gateway.ID)}
 	}
 	if r.Method != http.MethodPost {
 		return gateway, subpath, adapter, &statusError{status: http.StatusMethodNotAllowed, message: fmt.Sprintf("%s requires POST", r.URL.Path)}
@@ -213,15 +206,10 @@ func (p *Proxy) resolveGateway(r *http.Request, body []byte) (config.GatewayConf
 	if err := adapter.ValidateRequest(body); err != nil {
 		return gateway, subpath, adapter, &statusError{status: http.StatusBadRequest, message: err.Error()}
 	}
-	if !gateway.Enabled {
-		return gateway, subpath, adapter, &statusError{status: http.StatusServiceUnavailable, message: fmt.Sprintf("gateway %s is disabled", gateway.ID)}
-	}
 	return gateway, subpath, adapter, nil
 }
 
-// buildUpstreamRequest assembles the upstream HTTP request: URL, headers,
-// body transformation, and records them in the log entry.
-func (p *Proxy) buildUpstreamRequest(ctx context.Context, r *http.Request, gateway config.GatewayConfig, subpath string, adapter GatewayAdapter, requestBody []byte, logEntry *store.RequestLog) (*http.Request, error) {
+func (p *Proxy) buildUpstreamRequest(ctx context.Context, r *http.Request, gateway config.GatewayConfig, subpath string, adapter GatewayAdapter, requestBody []byte, bodyLimit int64, logEntry *store.RequestLog) (*http.Request, error) {
 	if strings.TrimSpace(gateway.BaseURL) == "" {
 		return nil, &statusError{status: http.StatusServiceUnavailable, message: fmt.Sprintf("gateway %q has no base URL configured; set it in the console", gateway.ID)}
 	}
@@ -229,27 +217,26 @@ func (p *Proxy) buildUpstreamRequest(ctx context.Context, r *http.Request, gatew
 	if err != nil {
 		return nil, &statusError{status: http.StatusBadGateway, message: err.Error()}
 	}
-	upstreamBody, err := transformRequestBody(adapter, requestBody)
+	upstreamBody, err := adapter.TransformRequestBody(requestBody)
 	if err != nil {
 		return nil, &statusError{status: http.StatusBadRequest, message: err.Error()}
 	}
+	if gateway.Protocol == config.ProtocolResponses {
+		if sessionID := grokSessionID(r.Header); sessionID != "" {
+			if newBody, changed := injectPromptCacheKey(upstreamBody, sessionID); changed {
+				upstreamBody = newBody
+			}
+		}
+	}
 	logEntry.UpstreamURL = upstreamURL
-	logEntry.UpstreamBody = capBody(upstreamBody, p.responseBodyLimit())
+	logEntry.UpstreamBody = capBody(upstreamBody, bodyLimit)
 
-	// The caller supplies the context that bounds the whole exchange: a
-	// deadline-bounded one for non-streaming requests, the raw request
-	// context for streams. Either way it stays in effect until the upstream
-	// response body has been fully read.
 	upstreamRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(upstreamBody))
 	if err != nil {
 		return nil, &statusError{status: http.StatusBadGateway, message: err.Error()}
 	}
 
-	allowlist := gateway.ForwardHeaders
-	if len(allowlist) == 0 {
-		allowlist = defaultForwardHeaders
-	}
-	copyForwardHeaders(upstreamRequest.Header, r.Header, allowlist)
+	buildUpstreamHeaders(upstreamRequest.Header, r.Header, gateway, logEntry.ID, logEntry.Stream)
 	upstreamRequest.Header.Set("Content-Type", "application/json")
 	upstreamRequest.Header.Del("Content-Length")
 	if gateway.UserAgentOverrideEnabled {
@@ -259,17 +246,16 @@ func (p *Proxy) buildUpstreamRequest(ctx context.Context, r *http.Request, gatew
 	return upstreamRequest, nil
 }
 
-// SetProxyURL replaces the global proxy clients so an address saved in the UI
-// applies to subsequent requests without restarting the process.
+func buildUpstreamClients(proxyURL string) (syncProxy, syncDirect, streamProxy, streamDirect *http.Client) {
+	return newSyncUpstreamClient(proxyURL), newSyncUpstreamClient(""), NewUpstreamClient(proxyURL), NewUpstreamClient("")
+}
+
 func (p *Proxy) SetProxyURL(proxyURL string) {
-	next := newSyncUpstreamClient(proxyURL)
-	nextDirect := newSyncUpstreamClient("")
-	nextStream := NewUpstreamClient(proxyURL)
-	nextStreamDirect := NewUpstreamClient("")
+	syncProxy, syncDirect, streamProxy, streamDirect := buildUpstreamClients(proxyURL)
 	p.clientMu.Lock()
 	old := []*http.Client{p.Client, p.DirectClient, p.StreamClient, p.StreamDirectClient}
-	p.Client, p.DirectClient = next, nextDirect
-	p.StreamClient, p.StreamDirectClient = nextStream, nextStreamDirect
+	p.Client, p.DirectClient = syncProxy, syncDirect
+	p.StreamClient, p.StreamDirectClient = streamProxy, streamDirect
 	p.clientMu.Unlock()
 	for _, client := range old {
 		if client != nil {
@@ -278,41 +264,37 @@ func (p *Proxy) SetProxyURL(proxyURL string) {
 	}
 }
 
-// clientFor selects the transport pair matching the gateway's proxy setting
-// and the request mode. Streaming and non-streaming requests use different
-// transports because their header-wait bounds differ; see client.go.
+type clientKey struct {
+	useProxy bool
+	stream   bool
+}
+
 func (p *Proxy) ClientFor(gateway config.GatewayConfig, stream bool) *http.Client {
 	p.clientMu.RLock()
-	proxyClient, directClient := p.Client, p.DirectClient
-	streamProxyClient, streamDirectClient := p.StreamClient, p.StreamDirectClient
-	p.clientMu.RUnlock()
+	defer p.clientMu.RUnlock()
+	table := map[clientKey]*http.Client{
+		{true, false}:  p.Client,
+		{false, false}: p.DirectClient,
+		{true, true}:   p.StreamClient,
+		{false, true}:  p.StreamDirectClient,
+	}
+	if c := table[clientKey{gateway.UseProxy, stream}]; c != nil {
+		return c
+	}
 	if stream {
-		if gateway.UseProxy && streamProxyClient != nil {
-			return streamProxyClient
-		}
-		if !gateway.UseProxy && streamDirectClient != nil {
-			return streamDirectClient
+		if c := table[clientKey{gateway.UseProxy, false}]; c != nil {
+			return c
 		}
 	}
-	if gateway.UseProxy && proxyClient != nil {
-		return proxyClient
-	}
-	if !gateway.UseProxy && directClient != nil {
-		return directClient
-	}
-	if proxyClient != nil {
-		return proxyClient
+	if p.Client != nil {
+		return p.Client
 	}
 	return http.DefaultClient
 }
 
-// forwardUpstreamResponse performs the upstream HTTP call and writes the
-// response back to the client, filling in the response-side audit fields.
 func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.RequestLog, adapter GatewayAdapter, gateway config.GatewayConfig, client *http.Client, upstreamRequest *http.Request, bodyLimit int64) error {
 	upstreamResponse, err := client.Do(upstreamRequest)
 	if err != nil {
-		// Transport-level failure (DNS, connect, timeout) before any upstream
-		// headers arrived: surface a gateway error instead of a raw error.
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return &statusError{status: http.StatusGatewayTimeout, message: err.Error()}
 		}
@@ -324,18 +306,9 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 	logEntry.UpstreamResponseStatusCode = upstreamResponse.StatusCode
 	logEntry.UpstreamResponseHeaders = headersJSON(upstreamResponse.Header)
 
-	// Error path: forward the upstream error body verbatim. Clients key their
-	// retry / rate-limit / request-error handling off `error.type` and
-	// `error.code`, so the proxy must not replace them with its own envelope;
-	// only the audit copy is capped, never the bytes the client receives.
-	// Retry-After reaches the client via copyResponseHeaders below: it is not
-	// a hop-by-hop header, so no special handling is needed for clients to
-	// back off correctly.
 	if upstreamResponse.StatusCode >= http.StatusBadRequest {
 		rawError, readErr := io.ReadAll(upstreamResponse.Body)
 		logEntry.ResponseBody = capBody(rawError, bodyLimit)
-		// A limit of zero means "capture everything", so nothing is truncated
-		// no matter how large the body: compare only when a cap is in effect.
 		logEntry.ResponseTruncated = bodyLimit > 0 && int64(len(rawError)) > bodyLimit
 		logEntry.UpstreamResponseBody = logEntry.ResponseBody
 		if readErr != nil {
@@ -346,8 +319,6 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 			logEntry.Error = fmt.Sprintf("upstream returned HTTP %d", upstreamResponse.StatusCode)
 		}
 		copyResponseHeaders(w.Header(), upstreamResponse.Header)
-		// Trust the upstream's own Content-Type (an HTML edge page must not be
-		// announced as JSON); fall back to JSON only when it sent none.
 		if w.Header().Get("Content-Type") == "" {
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		}
@@ -356,9 +327,6 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 		return nil
 	}
 
-	// Success path: stream or buffer based on content-type. Reached only when
-	// the upstream answered below 400 — the error branch above returns — so
-	// logEntry.StatusCode needs no further status-to-error mapping here.
 	copyResponseHeaders(w.Header(), upstreamResponse.Header)
 	writeResponseStatusAndHeaders(w, upstreamResponse)
 
@@ -369,24 +337,18 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 	if eventStream {
 		rawResponse := newCappedBuffer(bodyLimit)
 		responseReader := io.TeeReader(upstreamResponse.Body, rawResponse)
-		responseReader = transformSSE(adapter, responseReader)
-		// Metering is fed from the live stream: the capture below is capped, so
-		// a stream longer than the capture limit would lose the terminal
-		// usage-bearing event and be billed as zero tokens.
+		responseReader = adapter.TransformSSE(responseReader)
 		tracker := newUsageTracker(gateway.Protocol)
-		filterBefore := sanitizeMetrics()
 		copyErr = copyStream(w, responseReader, tracker)
 		usage = tracker.usage()
 		logEntry.UpstreamResponseBody = append([]byte(nil), rawResponse.Bytes()...)
 		logEntry.ResponseTruncated = rawResponse.truncated
-		// Observability for SSE filtering (optimization 5)
-		if delta := sanitizeMetricsDelta(filterBefore); len(delta) > 0 {
-			slog.Debug("sse filter metrics", "metrics", delta)
+		if reporter, ok := responseReader.(streamStatsReporter); ok {
+			if stats := reporter.stats(); !stats.isZero() {
+				slog.Debug("sse filter stats", "request_id", logEntry.ID, "stats", stats.String())
+			}
 		}
 	} else {
-		// Non-streaming: read the full body so the client always receives
-		// the complete (possibly transformed) response. Only the audit
-		// capture is capped.
 		rawCapture := newCappedBufferWithHint(bodyLimit, upstreamResponse.Header.Get("Content-Length"))
 		rawResponse, readErr := io.ReadAll(io.TeeReader(upstreamResponse.Body, rawCapture))
 		if readErr != nil {
@@ -395,7 +357,7 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 		logEntry.UpstreamResponseBody = append([]byte(nil), rawCapture.Bytes()...)
 		logEntry.ResponseTruncated = rawCapture.truncated
 
-		responseBody, transformErr := transformResponseBody(adapter, rawResponse)
+		responseBody, transformErr := adapter.TransformResponseBody(rawResponse)
 		if transformErr != nil {
 			copyErr = transformErr
 			responseBody = rawResponse
@@ -403,18 +365,12 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 		if _, writeErr := w.Write(responseBody); copyErr == nil && writeErr != nil {
 			copyErr = writeErr
 		}
-		// Non-streaming: responseBody is the complete body (not a capped
-		// capture), so the buffered scan sees the usage object.
 		usage = ExtractUsage(responseBody, gateway.Protocol)
 	}
 
 	if copyErr != nil {
 		logEntry.Error = copyErr.Error()
 	}
-	// A stream that broke mid-flight — or a body the client never received in
-	// full — is not a success, however the upstream answered: recording it as
-	// one counts a truncated answer as a whole one in the dashboard's success
-	// rate and token totals.
 	logEntry.Success = copyErr == nil &&
 		upstreamResponse.StatusCode >= 200 && upstreamResponse.StatusCode < 300
 	if logEntry.Success {
@@ -423,8 +379,6 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 	return copyErr
 }
 
-// upstreamTimeout returns the effective per-request timeout: the configured
-// default, optionally overridden (and capped) by an X-Proxy-Timeout header.
 func (p *Proxy) upstreamTimeout(r *http.Request) time.Duration {
 	t := config.DefaultUpstreamTimeout
 	if p.Config != nil {
@@ -438,24 +392,23 @@ func (p *Proxy) upstreamTimeout(r *http.Request) time.Duration {
 	return t
 }
 
-// responseBodyLimit returns the per-column capture cap in bytes. A configured
-// limit of zero means "capture everything" as far as the caller is concerned,
-// so it must not be replaced by the default (which is what "unset" falls back
-// to). It is still bounded by maxCapturedBodySize: that is what keeps an
-// opt-out from turning into an unbounded write to SQLite, and it is the only
-// difference from the configured value — everything below the ceiling is
-// stored whole, exactly as a bare "no truncation" would.
+// responseBodyLimit returns the effective per-column capture cap in bytes.
 func (p *Proxy) responseBodyLimit() int64 {
-	if p.ResponseBodySize > 0 {
-		return p.ResponseBodySize
+	return resolveBodyLimit(p.ResponseBodySize, p.Config)
+}
+
+// resolveBodyLimit computes the effective body capture limit in bytes.
+func resolveBodyLimit(override int64, cfg *config.Config) int64 {
+	if override > 0 {
+		return override
 	}
-	if p.Config != nil {
-		if limit := int64(p.Config.GetBodyCaptureLimitKB()) << 10; limit > 0 {
-			return limit
-		}
-		return maxCapturedBodySize
+	if cfg == nil {
+		return defaultResponseBodySize
 	}
-	return defaultResponseBodySize
+	if limit := int64(cfg.GetBodyCaptureLimitKB()) << 10; limit > 0 {
+		return limit
+	}
+	return maxBodyBytes
 }
 
 func capBody(data []byte, limit int64) []byte {
@@ -465,60 +418,35 @@ func capBody(data []byte, limit int64) []byte {
 	return append([]byte(nil), data...)
 }
 
-// gatewayForPath resolves a request path to its gateway. The longest matching
-// prefix wins: prefixes are not guaranteed to be disjoint, and Snapshot
-// returns a map, so returning the first match would make routing depend on
-// Go's randomized map iteration order.
-func (p *Proxy) gatewayForPath(path string) (config.GatewayConfig, string, bool) {
-	var (
-		best    config.GatewayConfig
-		bestLen = -1
-	)
-	for _, gateway := range p.Config.Snapshot() {
-		if path != gateway.Prefix && !strings.HasPrefix(path, gateway.Prefix+"/") {
-			continue
-		}
-		// Ties (two gateways configured with the same prefix) are broken by ID
-		// so the result stays deterministic across restarts.
-		if len(gateway.Prefix) > bestLen ||
-			(len(gateway.Prefix) == bestLen && gateway.ID < best.ID) {
-			best, bestLen = gateway, len(gateway.Prefix)
-		}
-	}
-	if bestLen < 0 {
-		return config.GatewayConfig{}, "", false
-	}
-	return best, strings.TrimPrefix(path, best.Prefix), true
-}
-
 func (p *Proxy) finishLog(ctx context.Context, logEntry *store.RequestLog, started time.Time) {
-	ctx = context.WithoutCancel(ctx)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), auditWriteTimeout)
+	defer cancel()
 	logEntry.DurationMS = time.Since(started).Milliseconds()
 	if logEntry.StatusCode == 0 {
 		logEntry.StatusCode = http.StatusInternalServerError
 	}
-	p.Logger.Info("request completed",
-		"request_id", logEntry.ID,
-		"gateway", logEntry.GatewayID,
-		"model", logEntry.Model,
-		"method", logEntry.Method,
-		"path", logEntry.RequestPath,
-		"status", logEntry.StatusCode,
-		"success", logEntry.Success,
-		"stream", logEntry.Stream,
-		"duration_ms", logEntry.DurationMS,
-		"input_tokens", logEntry.Usage.InputTokens,
-		"output_tokens", logEntry.Usage.OutputTokens,
-	)
-	if err := p.Store.Insert(ctx, *logEntry); err != nil {
-		p.Logger.Error("write request log", "error", err, "request_id", logEntry.ID)
+	if p.Logger != nil {
+		p.Logger.Info("request completed",
+			"request_id", logEntry.ID,
+			"gateway", logEntry.GatewayID,
+			"model", logEntry.Model,
+			"method", logEntry.Method,
+			"path", logEntry.RequestPath,
+			"status", logEntry.StatusCode,
+			"success", logEntry.Success,
+			"stream", logEntry.Stream,
+			"duration_ms", logEntry.DurationMS,
+			"input_tokens", logEntry.Usage.InputTokens,
+			"output_tokens", logEntry.Usage.OutputTokens,
+		)
+	}
+	if p.Store != nil {
+		if err := p.Store.Insert(ctx, *logEntry); err != nil && p.Logger != nil {
+			p.Logger.Error("write request log", "error", err, "request_id", logEntry.ID)
+		}
 	}
 }
 
-// writeResponseStatusAndHeaders writes the status code and already-copied
-// response headers, then flushes so headers reach the client immediately.
-// For SSE streams this ensures the client starts receiving as soon as the
-// first upstream headers arrive, rather than waiting for the full body.
 func writeResponseStatusAndHeaders(w http.ResponseWriter, resp *http.Response) {
 	w.WriteHeader(resp.StatusCode)
 	if f, ok := w.(http.Flusher); ok {

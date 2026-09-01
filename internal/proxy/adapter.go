@@ -9,51 +9,15 @@ import (
 	"grok-gateway-proxy/internal/config"
 )
 
-// GatewayAdapter describes one upstream's native protocol. Adapters validate
-// the fixed endpoint, and where the upstream dialect differs from what the
-// client speaks, rewrite the payload on the way in and out.
 type GatewayAdapter interface {
-	ID() string
 	Protocol() config.Protocol
 	EndpointPath() string
 	AcceptsPath(path string) bool
 	RejectMessage(path string) string
 	ValidateRequest(body []byte) error
-}
-
-// payloadTransformer is implemented by adapters that need to rewrite the JSON
-// payload on the way in or out (Responses request sanitization, SenseNova
-// tool-call normalization).
-type payloadTransformer interface {
 	TransformRequestBody([]byte) ([]byte, error)
 	TransformResponseBody([]byte) ([]byte, error)
-}
-
-// streamTransformer is implemented by adapters that need line-level SSE
-// transforms (Responses event filtering, SenseNova tool-call deltas).
-type streamTransformer interface {
 	TransformSSE(io.Reader) io.Reader
-}
-
-func transformRequestBody(adapter GatewayAdapter, body []byte) ([]byte, error) {
-	if transformer, ok := adapter.(payloadTransformer); ok {
-		return transformer.TransformRequestBody(body)
-	}
-	return body, nil
-}
-
-func transformResponseBody(adapter GatewayAdapter, body []byte) ([]byte, error) {
-	if transformer, ok := adapter.(payloadTransformer); ok {
-		return transformer.TransformResponseBody(body)
-	}
-	return body, nil
-}
-
-func transformSSE(adapter GatewayAdapter, reader io.Reader) io.Reader {
-	if transformer, ok := adapter.(streamTransformer); ok {
-		return transformer.TransformSSE(reader)
-	}
-	return reader
 }
 
 func validateJSONRequest(body []byte, protocolName string) error {
@@ -66,8 +30,6 @@ func validateJSONRequest(body []byte, protocolName string) error {
 	return nil
 }
 
-// gatewayAdapters maps a gateway ID to its protocol adapter. Adapters are
-// stateless singletons, so one instance per gateway is sufficient.
 var gatewayAdapters = map[string]GatewayAdapter{
 	"ds":  DeepSeekResponsesAdapter{},
 	"st":  SenseNovaChatAdapter{},
@@ -77,4 +39,14 @@ var gatewayAdapters = map[string]GatewayAdapter{
 func adapterFor(id string) (GatewayAdapter, bool) {
 	adapter, ok := gatewayAdapters[id]
 	return adapter, ok
+}
+
+func adapterForGateway(gateway config.GatewayConfig) (GatewayAdapter, bool) {
+	if adapter, ok := adapterFor(gateway.ID); ok {
+		return adapter, true
+	}
+	if gateway.Protocol == config.ProtocolResponses {
+		return StandardResponsesAdapter{}, true
+	}
+	return nil, false
 }

@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"sync"
 )
 
 // responseCapture wraps the client-facing ResponseWriter to snapshot the
@@ -51,11 +50,6 @@ func (w *responseCapture) Flush() {
 	}
 }
 
-// cappedBuffer is an io.Writer that stops accepting bytes once limit is
-// reached, so a TeeReader can snapshot the upstream stream without unbounded
-// buffering. Writes beyond the limit are reported as written so the
-// TeeReader keeps passing the full stream through. A limit of zero or less
-// disables the cap: everything is retained.
 type cappedBuffer struct {
 	buf       bytes.Buffer
 	limit     int64
@@ -73,8 +67,6 @@ func newCappedBuffer(limit int64) *cappedBuffer {
 	return c
 }
 
-// newCappedBufferWithHint pre-allocates based on Content-Length hint when available.
-// This reduces reallocations for large non-streaming bodies.
 func newCappedBufferWithHint(limit int64, contentLength string) *cappedBuffer {
 	if contentLength != "" {
 		if n, err := strconv.ParseInt(contentLength, 10, 64); err == nil && n > 0 {
@@ -114,7 +106,6 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 
 func (c *cappedBuffer) Bytes() []byte { return c.buf.Bytes() }
 
-// cloneHeaders creates a deep copy of headers for audit capture.
 func cloneHeaders(src http.Header) http.Header {
 	dst := make(http.Header, len(src))
 	for name, values := range src {
@@ -123,25 +114,8 @@ func cloneHeaders(src http.Header) http.Header {
 	return dst
 }
 
-// bufferPool reuses 32KB copy buffers to reduce GC pressure on streaming paths.
-var bufferPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 32*1024)
-		return &b
-	},
-}
-
-// copyStream forwards the stream to the client, flushing each chunk so events
-// reach it as they arrive rather than when the body completes. usage, when
-// non-nil, is fed every chunk so metering sees the whole stream instead of
-// only the captured prefix.
-//
-// Nothing is buffered here: the ResponseWriter the proxy passes in is a
-// responseCapture, which already snapshots what the client receives.
 func copyStream(w http.ResponseWriter, reader io.Reader, usage *usageTracker) error {
-	bufPtr := bufferPool.Get().(*[]byte)
-	buf := *bufPtr
-	defer bufferPool.Put(bufPtr)
+	buf := make([]byte, 32*1024)
 	flusher, canFlush := w.(http.Flusher)
 	for {
 		n, err := reader.Read(buf)
