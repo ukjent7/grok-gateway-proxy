@@ -10,9 +10,10 @@
 
 import { state, gatewayIds, loadConfig } from './state.js';
 import { api } from './api.js';
-import { $, escapeHtml, escapeAttr } from './utils.js';
-import { showToast } from './ui.js';
-import { healthDotHTML, applyHealthUI, pollHealth } from './health.js';
+import { $, $all, escapeHtml, gatewayPrefixLabel, gatewayTone } from './utils.js';
+import { showToast, confirmModal } from './ui.js';
+import { healthDotHTML, applyHealthUI, recordProbe, pollHealth } from './health.js';
+import { setupBaseURL } from './setup.js';
 
 function renderGlobalProxySettings() {
   const input = $('#proxyUrlInput');
@@ -64,7 +65,7 @@ async function saveProxyURL() {
       method: 'PATCH',
       body: JSON.stringify({ proxy_url: proxyURL })
     });
-    state.proxyURL = res.proxy_url || '';
+    state.proxyURL = (res && res.proxy_url) || '';
     renderGlobalProxySettings();
     showToast(state.proxyURL ? '全局代理地址已成功保存' : '已清除全局代理（恢复默认直连）', 'success');
   } catch (e) {
@@ -80,332 +81,323 @@ async function saveProxyURL() {
   }
 }
 
+function getPrefixPattern() {
+  const pat = state.config && state.config.gateway_rules && state.config.gateway_rules.prefix_pattern;
+  if (pat) {
+    try {
+      return new RegExp(pat);
+    } catch (_) {}
+  }
+  return /^[a-z0-9][a-z0-9_-]{0,31}$/;
+}
+
+function getReservedPrefixes() {
+  return (state.config && state.config.gateway_rules && state.config.gateway_rules.reserved_prefixes) || ['api', 'static', 'healthz', 'ui'];
+}
+
+function normalizePrefix(raw) {
+  return String(raw || '').trim().replace(/^\/+/, '');
+}
+
+function validateNewGateway(prefix, baseURL) {
+  if (!prefix) return '请填写调用前缀';
+  const pattern = getPrefixPattern();
+  if (!pattern.test(prefix)) {
+    return '前缀只能由小写字母、数字、- 与 _ 组成，且以字母或数字开头';
+  }
+  const reserved = getReservedPrefixes();
+  if (reserved.includes(prefix)) {
+    return `前缀 /${prefix} 为系统保留端点，不可使用`;
+  }
+  const exists = Object.values(state.gateways || {}).some(g => (g.prefix || '').toLowerCase() === ('/' + prefix).toLowerCase() || (g.prefix || '').toLowerCase() === prefix.toLowerCase());
+  if (exists) {
+    return `前缀 /${prefix} 已被其他网关占用`;
+  }
+  if (baseURL) {
+    if (!baseURL.startsWith('https://')) {
+      return '上游 Base URL 必须以 https:// 开头';
+    }
+    try {
+      new URL(baseURL);
+    } catch (_) {
+      return '上游 Base URL 格式无效';
+    }
+  }
+  return '';
+}
+
+async function createNewGateway() {
+  const prefixInput = $('#newGwPrefix');
+  const nameInput = $('#newGwName');
+  const baseInput = $('#newGwBaseURL');
+  const errorEl = $('#newGwError');
+  const btn = $('#newGwCreateBtn');
+
+  const prefix = normalizePrefix(prefixInput ? prefixInput.value : '');
+  const name = nameInput ? nameInput.value.trim() : '';
+  const baseURL = baseInput ? baseInput.value.trim() : '';
+
+  const err = validateNewGateway(prefix, baseURL);
+  if (err) {
+    if (errorEl) {
+      errorEl.textContent = err;
+      errorEl.hidden = false;
+    }
+    return;
+  }
+  if (errorEl) errorEl.hidden = true;
+
+  btn.disabled = true;
+  try {
+    await api('/gateways', {
+      method: 'POST',
+      body: JSON.stringify({
+        prefix,
+        name: name || prefix,
+        base_url: baseURL,
+      })
+    });
+    if (prefixInput) prefixInput.value = '';
+    if (nameInput) nameInput.value = '';
+    if (baseInput) baseInput.value = '';
+    updateNewGwPreview();
+    await loadConfig();
+    renderGatewayCards();
+    pollHealth();
+    showToast('自定义网关已成功创建', 'success');
+  } catch (e) {
+    if (errorEl) {
+      errorEl.textContent = '创建失败: ' + e.message;
+      errorEl.hidden = false;
+    } else {
+      showToast('创建失败: ' + e.message, 'error');
+    }
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function updateNewGwPreview() {
+  const prefixInput = $('#newGwPrefix');
+  const preview = $('#newGwPreview');
+  if (!preview) return;
+  const prefix = normalizePrefix(prefixInput ? prefixInput.value : '');
+  const base = setupBaseURL();
+  preview.textContent = prefix ? `${base}/${prefix}` : `${base}/<前缀>`;
+}
+
 export function renderGatewayCards() {
   renderGlobalProxySettings();
   const container = $('#gatewayCards');
   if (!container) return;
 
-  container.innerHTML = '';
-  gatewayIds().forEach(id => {
-    const gw = state.gateways[id];
-    if (!gw) return;
+  const ids = gatewayIds();
+  if (!ids.length) {
+    container.innerHTML = '<div class="empty-state"><span>暂无网关配置</span></div>';
+    return;
+  }
 
-    const card = document.createElement('div');
-    card.className = 'gw-card' + (gw.enabled ? '' : ' is-disabled');
-    card.dataset.id = id;
-    const headers = (gw.forward_headers || []).join('\n');
+  const upstreams = (state.health && state.health.upstreams) || {};
+  const affinityModes = (state.config && state.config.session_affinity_modes) || ['openai', 'openrouter', 'off'];
 
-    card.innerHTML = `
-      <!-- 卡片头部：分层结构，彻底杜绝文字挤压换行 -->
-      <div class="gw-card-head">
-        <div class="gw-card-head-top">
-          <div class="gw-card-title-group">
-            <span class="gw-dot gw-dot-${escapeHtml(id)}"></span>
-            <strong>${escapeHtml(gw.name)}</strong>
-            <code class="gw-card-prefix">${escapeHtml(gw.prefix || '')}</code>
+  container.innerHTML = ids.map(id => {
+    const gw = state.gateways[id] || {};
+    const u = upstreams[id];
+    const uaEnabled = !!gw.user_agent_override_enabled;
+    const forwardHeadersStr = (gw.forward_headers || []).join(', ');
+    const currentAffinity = gw.session_affinity || 'openai';
+
+    return `
+      <div class="panel gw-card" data-gw-id="${escapeHtml(id)}">
+        <div class="panel-head">
+          <div class="gw-card-title">
+            <span class="gw-dot gw-tone-${gatewayTone(id)}"></span>
+            <h3>${escapeHtml(gw.name || id)}</h3>
+            <code class="gw-prefix-tag">${escapeHtml(gatewayPrefixLabel(gw, id))}</code>
           </div>
-          <label class="toggle toggle-large" title="启用 / 停用此网关">
-            <input type="checkbox" class="f-enabled" ${gw.enabled ? 'checked' : ''}>
-            <span class="toggle-track"></span>
+          <div class="gw-card-head-actions">
+            ${healthDotHTML(u ? u.reachable : null)}
+            <label class="toggle-wrap" title="${gw.enabled ? '已启用此网关' : '已停用此网关'}">
+              <input type="checkbox" class="gw-enabled-toggle" ${gw.enabled ? 'checked' : ''}>
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+        </div>
+
+        <div class="gw-card-form">
+          <label class="field">
+            <span class="field-label">上游 Base URL</span>
+            <input type="text" class="input-modern gw-base-url" value="${escapeHtml(gw.base_url || '')}" placeholder="https://api.example.com" spellcheck="false">
           </label>
-        </div>
 
-        <div class="gw-card-head-meta">
-          <div class="gw-card-meta-left">
-            <span class="gw-card-protocol-tag">
-              ${gw.protocol === 'chat_completions' ? 'Chat Completions 协议' : 'Responses 协议'}
-            </span>
-            ${gw.enabled
-              ? '<span class="gw-badge is-on">已启用</span>'
-              : '<span class="gw-badge is-off">已停用</span>'}
-            ${healthDotHTML(id)}
-          </div>
-          <button type="button" class="btn-ghost small test-conn-btn" data-gw="${escapeHtml(id)}" title="向网关 /models 发起探测">
-            <svg viewBox="0 0 16 16" width="12" height="12" fill="none"><path d="M1 8h3l2-4 4 8 2-4h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            测试连通性
-          </button>
-        </div>
-      </div>
+          <label class="field">
+            <span class="field-label">请求头透传 (Forward Headers)</span>
+            <input type="text" class="input-modern gw-forward-headers" value="${escapeHtml(forwardHeadersStr)}" placeholder="例如: Authorization, X-Custom-Header (逗号分隔)" spellcheck="false">
+          </label>
 
-      <!-- 连通性测试结果提示条 -->
-      <div class="test-conn-result" id="testResult-${escapeHtml(id)}" hidden></div>
+          <label class="field">
+            <span class="field-label">会话粘性模式 (Session Affinity)</span>
+            <select class="input-modern gw-session-affinity">
+              ${affinityModes.map(mode => `
+                <option value="${escapeHtml(mode)}" ${currentAffinity === mode ? 'selected' : ''}>${escapeHtml(mode)}</option>
+              `).join('')}
+            </select>
+          </label>
 
-      <!-- 表单主体 -->
-      <div class="gw-card-body">
-        <div class="field">
-          <label class="field-label">网关显示名称</label>
-          <input type="text" class="f-name input-modern" value="${escapeAttr(gw.name)}" placeholder="网关显示名称">
-          <span class="field-error" hidden></span>
-        </div>
-
-        <div class="field">
-          <label class="field-label">上游基地址 (Base URL)</label>
-          <input type="text" class="f-baseurl input-modern" value="${escapeAttr(gw.base_url)}" placeholder="https://api.openai.com/v1">
-          <span class="field-error" hidden></span>
-        </div>
-
-        <div class="gw-card-toggles">
-          <div class="toggle-row">
-            <div class="toggle-info">
-              <span class="switch-label">使用全局代理</span>
-              <span class="field-hint">使用上方配置的 HTTP / HTTPS 代理转发请求</span>
+          <label class="field">
+            <span class="field-label">User-Agent 伪装</span>
+            <div class="gw-user-agent-row">
+              <input type="text" class="input-modern gw-user-agent" value="${escapeHtml(gw.user_agent_override || '')}" placeholder="默认由网关策略决定" spellcheck="false" ${uaEnabled ? '' : 'disabled'}>
+              <label class="toggle-wrap" title="${uaEnabled ? '上游请求已使用此 User-Agent' : '未启用：上游收到的是客户端原始 User-Agent'}">
+                <input type="checkbox" class="gw-user-agent-toggle" ${uaEnabled ? 'checked' : ''}>
+                <span class="toggle-slider"></span>
+              </label>
             </div>
-            <label class="toggle">
-              <input type="checkbox" class="f-proxy" ${gw.use_proxy !== false ? 'checked' : ''}>
-              <span class="toggle-track"></span>
-            </label>
-          </div>
+          </label>
 
-          <div class="toggle-row">
-            <div class="toggle-info">
-              <span class="switch-label">User-Agent 标头覆盖</span>
-              <span class="field-hint">向上游发起请求时伪装或重写 User-Agent</span>
+          <div class="gw-card-foot">
+            <div class="gw-card-left-actions">
+              <button type="button" class="btn-ghost small gw-test-btn" title="立即向该网关发起一次连通探测">测试连通</button>
+              ${gw.custom ? `<button type="button" class="btn-danger small gw-delete-btn" title="删除自定义网关">删除</button>` : ''}
             </div>
-            <label class="toggle">
-              <input type="checkbox" class="f-ua-enabled" ${gw.user_agent_override_enabled ? 'checked' : ''}>
-              <span class="toggle-track"></span>
-            </label>
+            <button type="button" class="btn-primary small gw-save-btn" disabled>保存</button>
           </div>
+          <div class="field-error gw-card-error" hidden></div>
         </div>
-
-        <div class="field f-ua-wrap ${gw.user_agent_override_enabled ? '' : 'is-collapsed'}">
-          <label class="field-label">自定义 User-Agent 标头</label>
-          <input type="text" class="f-ua input-modern" value="${escapeAttr(gw.user_agent_override || '')}" placeholder="grok-gateway-proxy/dev">
-        </div>
-
-        <div class="field">
-          <div class="field-label-row">
-            <label class="field-label">请求头白名单 (Forward Headers)</label>
-            <span class="field-hint">每行一个标头名；留空使用默认（Authorization、Accept、User-Agent），填写后整体替换默认列表</span>
-          </div>
-          <textarea class="f-headers textarea-modern" rows="3" placeholder="Authorization&#10;Accept&#10;User-Agent">${escapeHtml(headers)}</textarea>
-          <div class="preset-pills">
-            <span class="preset-pill-label">快捷添加：</span>
-            <button type="button" class="btn-preset" data-header="Authorization">+ Authorization</button>
-            <button type="button" class="btn-preset" data-header="X-Api-Key">+ X-Api-Key</button>
-            <button type="button" class="btn-preset" data-header="X-Session-Id">+ X-Session-Id</button>
-          </div>
-        </div>
-      </div>
-
-      <!-- 卡片脚栏 -->
-      <div class="gw-card-foot">
-        <div class="gw-dirty-indicator">
-          <span class="dot dot-warn"></span>
-          <span>有未保存的修改</span>
-        </div>
-        <button type="button" class="btn-primary small save-gw-btn">
-          <svg viewBox="0 0 16 16" width="12" height="12" fill="none"><path d="M4 8l3 3 5-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          保存配置
-        </button>
       </div>
     `;
+  }).join('');
 
-    container.appendChild(card);
-    bindGatewayCardEvents(id, card, gw);
-  });
+  $all('.gw-card', container).forEach(card => {
+    const id = card.dataset.gwId;
+    const baseInput = card.querySelector('.gw-base-url');
+    const headersInput = card.querySelector('.gw-forward-headers');
+    const affinitySelect = card.querySelector('.gw-session-affinity');
+    const uaInput = card.querySelector('.gw-user-agent');
+    const uaToggle = card.querySelector('.gw-user-agent-toggle');
+    const enabledToggle = card.querySelector('.gw-enabled-toggle');
+    const saveBtn = card.querySelector('.gw-save-btn');
+    const testBtn = card.querySelector('.gw-test-btn');
+    const delBtn = card.querySelector('.gw-delete-btn');
+    const errEl = card.querySelector('.gw-card-error');
 
-  applyHealthUI();
-}
-
-function bindGatewayCardEvents(id, card, initialGw) {
-  const urlInput = card.querySelector('.f-baseurl');
-  const nameInput = card.querySelector('.f-name');
-  const enabledToggle = card.querySelector('.f-enabled');
-  const proxyToggle = card.querySelector('.f-proxy');
-  const uaToggle = card.querySelector('.f-ua-enabled');
-  const uaInput = card.querySelector('.f-ua');
-  const uaWrap = card.querySelector('.f-ua-wrap');
-  const headersTextarea = card.querySelector('.f-headers');
-  const dirtyIndicator = card.querySelector('.gw-dirty-indicator');
-  const saveBtn = card.querySelector('.save-gw-btn');
-  const testBtn = card.querySelector('.test-conn-btn');
-  const testResult = card.querySelector(`#testResult-${id}`);
-
-  // Snapshot of saved state
-  const baseline = {
-    name: initialGw.name || '',
-    base_url: initialGw.base_url || '',
-    enabled: !!initialGw.enabled,
-    use_proxy: initialGw.use_proxy !== false,
-    user_agent_override_enabled: !!initialGw.user_agent_override_enabled,
-    user_agent_override: initialGw.user_agent_override || '',
-    forward_headers: (initialGw.forward_headers || []).join('\n')
-  };
-
-  const checkDirty = () => {
-    const curName = nameInput ? nameInput.value.trim() : '';
-    const curUrl = urlInput ? urlInput.value.trim() : '';
-    const curEnabled = enabledToggle ? enabledToggle.checked : false;
-    const curProxy = proxyToggle ? proxyToggle.checked : true;
-    const curUaEnabled = uaToggle ? uaToggle.checked : false;
-    const curUa = uaInput ? uaInput.value.trim() : '';
-    const curHeaders = headersTextarea ? headersTextarea.value.trim() : '';
-
-    const isModified =
-      curName !== baseline.name ||
-      curUrl !== baseline.base_url ||
-      curEnabled !== baseline.enabled ||
-      curProxy !== baseline.use_proxy ||
-      curUaEnabled !== baseline.user_agent_override_enabled ||
-      curUa !== baseline.user_agent_override ||
-      curHeaders !== baseline.forward_headers;
-
-    if (dirtyIndicator) {
-      dirtyIndicator.classList.toggle('is-dirty', isModified);
-    }
-  };
-
-  card.querySelectorAll('input, textarea').forEach(el => {
-    el.addEventListener('input', checkDirty);
-    el.addEventListener('change', checkDirty);
-  });
-
-  if (uaToggle && uaWrap) {
-    uaToggle.addEventListener('change', () => {
-      uaWrap.classList.toggle('is-collapsed', !uaToggle.checked);
-    });
-  }
-
-  // Preset pills
-  card.querySelectorAll('.btn-preset').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const header = btn.dataset.header;
-      if (!headersTextarea) return;
-      const current = headersTextarea.value.split('\n').map(s => s.trim()).filter(Boolean);
-      if (!current.includes(header)) {
-        current.push(header);
-        headersTextarea.value = current.join('\n');
-        checkDirty();
-        showToast(`已添加标头 ${header}`, 'info', 1200);
-      }
-    });
-  });
-
-  // Validation on input
-  const urlErr = urlInput.closest('.field').querySelector('.field-error');
-  const nameErr = nameInput.closest('.field').querySelector('.field-error');
-
-  urlInput.addEventListener('input', () => {
-    const v = urlInput.value.trim();
-    const bad = v !== '' && !v.startsWith('https://');
-    urlErr.textContent = bad ? 'Base URL 必须以 https:// 开头' : '';
-    urlErr.hidden = !bad;
-    urlInput.classList.toggle('is-invalid', bad);
-  });
-
-  nameInput.addEventListener('input', () => {
-    const bad = nameInput.value.trim() === '';
-    nameErr.textContent = bad ? '网关名称不能为空' : '';
-    nameErr.hidden = !bad;
-    nameInput.classList.toggle('is-invalid', bad);
-  });
-
-  // Test Connection
-  if (testBtn && testResult) {
-    testBtn.addEventListener('click', async () => {
-      testBtn.disabled = true;
-      testResult.hidden = false;
-      testResult.className = 'test-conn-result is-probing';
-      testResult.innerHTML = '<span class="btn-spinner"></span> 正在测试网关连接…';
-
-      const t0 = performance.now();
-      try {
-        await pollHealth();
-        const latency = Math.round(performance.now() - t0);
-        const upstreams = (state.health && state.health.upstreams) || {};
-        const h = upstreams[id];
-
-        if (h && h.reachable) {
-          testResult.className = 'test-conn-result is-ok';
-          testResult.innerHTML = `
-            <span class="dot dot-live"></span>
-            <span>连接正常 · 状态码 ${h.status || 200} · 耗时 ${latency}ms</span>
-          `;
-        } else {
-          testResult.className = 'test-conn-result is-err';
-          testResult.innerHTML = `
-            <span class="dot dot-error"></span>
-            <span>连接失败：${escapeHtml((h && h.error) || '上游返回异常')} · ${latency}ms</span>
-          `;
-        }
-      } catch (e) {
-        testResult.className = 'test-conn-result is-err';
-        testResult.innerHTML = `<span class="dot dot-error"></span> 探测异常: ${escapeHtml(e.message)}`;
-      } finally {
-        testBtn.disabled = false;
-        setTimeout(() => {
-          if (testResult && testResult.classList.contains('is-ok')) {
-            testResult.hidden = true;
-          }
-        }, 5000);
-      }
-    });
-  }
-
-  // Save Gateway Action
-  saveBtn.addEventListener('click', async () => {
-    const payload = {
-      name: nameInput.value.trim(),
-      base_url: urlInput.value.trim(),
-      enabled: enabledToggle.checked,
-      user_agent_override_enabled: uaToggle.checked,
-      user_agent_override: uaInput.value.trim(),
-      use_proxy: proxyToggle.checked,
-      forward_headers: headersTextarea.value.split('\n').map(s => s.trim()).filter(Boolean)
+    const markDirty = () => {
+      if (saveBtn) saveBtn.disabled = false;
     };
 
-    let ok = true;
-    if (!payload.base_url.startsWith('https://')) {
-      ok = false;
-      urlErr.textContent = 'Base URL 必须以 https:// 开头';
-      urlErr.hidden = false;
-      urlInput.classList.add('is-invalid');
-    }
-    if (!payload.name) {
-      ok = false;
-      nameErr.textContent = '网关名称不能为空';
-      nameErr.hidden = false;
-      nameInput.classList.add('is-invalid');
-    }
+    const runProbe = async () => {
+      const probe = await api(`/gateways/${encodeURIComponent(id)}/test`, { method: 'POST' });
+      recordProbe(id, probe);
+      const dotSlot = card.querySelector('.gw-card-head-actions .dot');
+      if (dotSlot) dotSlot.outerHTML = healthDotHTML(probe ? probe.reachable : null);
+      applyHealthUI(state.health);
+      return probe;
+    };
 
-    if (!ok) {
-      showToast('请修正表单中的错误项', 'error');
-      return;
-    }
-
-    const origBtnHTML = saveBtn.innerHTML;
-    saveBtn.disabled = true;
-    saveBtn.innerHTML = '<span class="btn-spinner"></span> 保存中…';
-
-    try {
-      const res = await api('/gateways/' + id, {
-        method: 'PATCH',
-        body: JSON.stringify(payload)
+    if (baseInput) baseInput.addEventListener('input', markDirty);
+    if (headersInput) headersInput.addEventListener('input', markDirty);
+    if (affinitySelect) affinitySelect.addEventListener('change', markDirty);
+    if (uaInput) uaInput.addEventListener('input', markDirty);
+    if (enabledToggle) enabledToggle.addEventListener('change', markDirty);
+    if (uaToggle) {
+      uaToggle.addEventListener('change', () => {
+        markDirty();
+        if (uaInput) uaInput.disabled = !uaToggle.checked;
       });
-      if (res.gateway) state.gateways[id] = res.gateway;
-      showToast(`网关 ${payload.name} 配置已成功保存`, 'success');
-      renderGatewayCards();
-    } catch (e) {
-      showToast('保存失败: ' + e.message, 'error');
-      saveBtn.disabled = false;
-      saveBtn.innerHTML = origBtnHTML;
+    }
+
+    if (saveBtn) {
+      saveBtn.addEventListener('click', async () => {
+        saveBtn.disabled = true;
+        if (errEl) errEl.hidden = true;
+        try {
+          const forwardHeaders = (headersInput ? headersInput.value : '')
+            .split(',')
+            .map(s => s.trim())
+            .filter(Boolean);
+
+          await api(`/gateways/${encodeURIComponent(id)}`, {
+            method: 'PATCH',
+            body: JSON.stringify({
+              base_url: baseInput ? baseInput.value.trim() : '',
+              forward_headers: forwardHeaders,
+              session_affinity: affinitySelect ? affinitySelect.value : 'openai',
+              user_agent_override: uaInput ? uaInput.value.trim() : '',
+              user_agent_override_enabled: uaToggle ? uaToggle.checked : false,
+              enabled: enabledToggle ? enabledToggle.checked : true,
+            })
+          });
+          await loadConfig();
+          await runProbe().catch(() => {});
+          renderGatewayCards();
+          showToast(`网关 ${id} 配置已保存`, 'success');
+        } catch (e) {
+          saveBtn.disabled = false;
+          if (errEl) {
+            errEl.textContent = '保存失败: ' + e.message;
+            errEl.hidden = false;
+          } else {
+            showToast('保存失败: ' + e.message, 'error');
+          }
+        }
+      });
+    }
+
+    if (testBtn) {
+      testBtn.addEventListener('click', async () => {
+        testBtn.disabled = true;
+        const orig = testBtn.textContent;
+        testBtn.textContent = '探测中…';
+        try {
+          const probe = await runProbe();
+          if (probe && probe.reachable) {
+            showToast(`网关 ${id} 连通正常${probe.status ? ` (HTTP ${probe.status})` : ''}`, 'success', 2000);
+          } else {
+            showToast(`网关 ${id} 探测失败: ${(probe && probe.error) || '上游不可达'}`, 'error', 4000);
+          }
+        } catch (e) {
+          showToast(`网关 ${id} 探测失败: ` + e.message, 'error');
+        } finally {
+          testBtn.disabled = false;
+          testBtn.textContent = orig;
+        }
+      });
+    }
+
+    if (delBtn) {
+      delBtn.addEventListener('click', () => {
+        confirmModal('删除网关', `确定要删除自定义网关 /${id} 吗？此操作无法撤销。`, async () => {
+          try {
+            await api(`/gateways/${encodeURIComponent(id)}`, { method: 'DELETE' });
+            await loadConfig();
+            renderGatewayCards();
+            showToast(`网关 /${id} 已删除`, 'success');
+          } catch (e) {
+            showToast('删除网关失败: ' + e.message, 'error');
+          }
+        });
+      });
     }
   });
 }
 
 export function initGateways() {
-  const reloadButton = $('#gatewaysReloadBtn');
-  if (reloadButton) {
-    reloadButton.addEventListener('click', async () => {
+  const saveProxyBtn = $('#proxyUrlSaveBtn');
+  if (saveProxyBtn) saveProxyBtn.addEventListener('click', saveProxyURL);
+
+  const createGwBtn = $('#newGwCreateBtn');
+  if (createGwBtn) createGwBtn.addEventListener('click', createNewGateway);
+
+  const newGwPrefix = $('#newGwPrefix');
+  if (newGwPrefix) newGwPrefix.addEventListener('input', updateNewGwPreview);
+
+  const reloadBtn = $('#gatewaysReloadBtn');
+  if (reloadBtn) {
+    reloadBtn.addEventListener('click', async () => {
       await loadConfig();
       renderGatewayCards();
-      showToast('已重新载入网关配置', 'success');
+      pollHealth();
+      showToast('网关配置已重新载入', 'success');
     });
-  }
-
-  const proxyButton = $('#proxyUrlSaveBtn');
-  if (proxyButton) {
-    proxyButton.addEventListener('click', saveProxyURL);
   }
 }

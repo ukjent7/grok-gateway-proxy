@@ -1,91 +1,161 @@
 'use strict';
 
-/* ============================================================
-   Grok Gateway Console · 通用工具与格式化模块
-   ============================================================ */
+export const $ = (sel, el = document) => el.querySelector(sel);
+export const $all = (sel, el = document) => Array.from(el.querySelectorAll(sel));
 
-export function $(sel, root) { return (root || document).querySelector(sel); }
-export function $all(sel, root) { return Array.from((root || document).querySelectorAll(sel)); }
+export function escapeHtml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+export function gatewayPrefixLabel(gw, id) {
+  const prefix = (gw && gw.prefix) || `/${id}`;
+  return prefix.startsWith('/') ? prefix : `/${prefix}`;
+}
+
+export const GATEWAY_TONE_COUNT = 8;
+
+export function gatewayTone(id) {
+  const key = String(id || '');
+  let hash = 0;
+  for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
+  return hash % GATEWAY_TONE_COUNT;
+}
 
 export function fmtNum(n) {
-  if (n === null || n === undefined || Number.isNaN(Number(n))) return '—';
+  if (n === null || n === undefined || isNaN(n)) return '0';
   return Number(n).toLocaleString('en-US');
 }
 
 export function fmtPct(n) {
-  if (n === null || n === undefined || Number.isNaN(Number(n))) return '—';
+  if (n === null || n === undefined || isNaN(n)) return '—';
   return Number(n).toFixed(1) + '%';
 }
 
 export function fmtMs(ms) {
-  if (ms === null || ms === undefined || Number.isNaN(Number(ms))) return '—';
-  const val = Number(ms);
-  if (val < 1) return '<1ms';
-  if (val < 1000) return val + 'ms';
-  return (val / 1000).toFixed(2) + 's';
+  if (ms === null || ms === undefined || isNaN(ms)) return '0ms';
+  const num = Number(ms);
+  if (num < 1000) return `${Math.round(num)}ms`;
+  return `${(num / 1000).toFixed(2)}s`;
 }
 
-export function fmtBytes(bytes) {
-  if (!bytes || bytes <= 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return (bytes / Math.pow(k, i)).toFixed(i === 0 ? 0 : 1) + ' ' + sizes[i];
+export function fmtCompact(n) {
+  if (n === null || n === undefined || isNaN(n)) return '0';
+  const num = Number(n);
+  if (Math.abs(num) >= 1_000_000) return (num / 1_000_000).toFixed(1) + 'M';
+  if (Math.abs(num) >= 1_000) return (num / 1_000).toFixed(1) + 'k';
+  return String(num);
 }
 
-export function fmtTime(iso) {
-  if (!iso) return '—';
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return iso;
-  return d.toLocaleString('zh-CN', {
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false
-  });
+export function fmtTime(t) {
+  if (!t) return '—';
+  const d = new Date(t);
+  if (isNaN(d.getTime())) return String(t);
+  return d.toLocaleString('zh-CN', { hour12: false });
 }
 
-export function fmtTimeShort(iso) {
-  if (!iso) return '—';
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return iso;
-  return d.toLocaleTimeString('zh-CN', {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false
-  });
+export function fmtTimeShort(t) {
+  if (!t) return '—';
+  const d = new Date(t);
+  if (isNaN(d.getTime())) return String(t);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-export function fmtTimeRelative(iso) {
-  if (!iso) return '—';
-  const d = new Date(iso);
-  const now = new Date();
-  const diffSec = Math.floor((now.getTime() - d.getTime()) / 1000);
-  if (diffSec < 5) return '刚刚';
-  if (diffSec < 60) return diffSec + ' 秒前';
-  const diffMin = Math.floor(diffSec / 60);
-  if (diffMin < 60) return diffMin + ' 分钟前';
-  const diffHours = Math.floor(diffMin / 60);
-  if (diffHours < 24) return diffHours + ' 小时前';
-  const diffDays = Math.floor(diffHours / 24);
-  return diffDays + ' 天前';
+export async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const success = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return success;
+  }
 }
 
-export function escapeHtml(str) {
-  return String(str == null ? '' : str).replace(/[&<>"']/g, c => ({
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#39;'
-  }[c]));
+export function downloadFile(filename, content, mime = 'text/plain;charset=utf-8') {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
-export function escapeAttr(str) {
-  return escapeHtml(str);
+export function buildCurlFromLog(log) {
+  if (!log) return '';
+  const method = log.method || 'POST';
+  const host = window.location.host;
+  const raw = log.request_url || log.request_path || '';
+  const path = raw.startsWith('/') ? raw : '/' + raw;
+  const url = `${window.location.protocol}//${host}${path}`;
+
+  const escapeHeader = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+
+  let cmd = `curl -X ${method} "${url}" \\\n  -H "Content-Type: application/json"`;
+
+  const reqHeaders = log.request_headers || {};
+  for (const [k, v] of Object.entries(reqHeaders)) {
+    if (k.toLowerCase() === 'content-type' || k.toLowerCase() === 'host') continue;
+    const val = Array.isArray(v) ? v.join(', ') : v;
+    cmd += ` \\\n  -H "${escapeHeader(k)}: ${escapeHeader(val)}"`;
+  }
+
+  const reqBody = log.request_body;
+  if (reqBody) {
+    const escaped = typeof reqBody === 'string' ? reqBody : JSON.stringify(reqBody);
+    cmd += ` \\\n  -d '${escaped.replace(/'/g, `'\\''`)}'`;
+  }
+  return cmd;
+}
+
+export function csvCell(val) {
+  if (val === null || val === undefined) return '""';
+  const s = String(val).replace(/"/g, '""');
+  return `"${s}"`;
+}
+
+export function latencyThresholds(items) {
+  if (!items || !items.length) return { relative: false, slow: 2000 };
+  const latencies = items
+    .filter(l => l.success && l.duration_ms > 0)
+    .map(l => l.duration_ms)
+    .sort((a, b) => a - b);
+  if (latencies.length < 5) return { relative: false, slow: 2000 };
+  const p90Idx = Math.floor(latencies.length * 0.9);
+  const p90 = latencies[p90Idx] || 2000;
+  return { relative: true, slow: Math.max(800, p90) };
+}
+
+export function latencyClass(ms, thresholds) {
+  if (!thresholds || !thresholds.relative) {
+    if (ms > 3000) return 'latency-slow';
+    if (ms > 1000) return 'latency-medium';
+    return 'latency-fast';
+  }
+  if (ms >= thresholds.slow) return 'latency-slow';
+  if (ms >= thresholds.slow * 0.6) return 'latency-medium';
+  return 'latency-fast';
+}
+
+export function latencyTitle(ms, thresholds) {
+  if (!thresholds || !thresholds.relative) return fmtMs(ms);
+  if (ms >= thresholds.slow) return `${fmtMs(ms)} (超过 p90 阈值 ${fmtMs(thresholds.slow)})`;
+  return fmtMs(ms);
 }
 
 export function rangeToFrom(range) {
@@ -98,86 +168,26 @@ export function rangeToFrom(range) {
 }
 
 export function rangeLabel(range) {
-  return ({
-    '15m': '15分钟',
-    '1h': '1小时',
-    '24h': '24小时',
-    '7d': '7天',
-    'all': '全部'
-  })[range] || range;
+  if (range === '15m') return '15分钟';
+  if (range === '1h') return '1小时';
+  if (range === '24h') return '24小时';
+  if (range === '7d') return '7天';
+  return '全部';
 }
 
 export function tryPretty(raw) {
   if (!raw) return '';
+  if (typeof raw === 'object') {
+    try {
+      return JSON.stringify(raw, null, 2);
+    } catch (_) {
+      return String(raw);
+    }
+  }
   try {
-    return JSON.stringify(JSON.parse(raw), null, 2);
-  } catch (e) {
+    const parsed = JSON.parse(raw);
+    return JSON.stringify(parsed, null, 2);
+  } catch (_) {
     return String(raw);
   }
-}
-
-export function copyText(text) {
-  if (navigator.clipboard && window.isSecureContext) {
-    return navigator.clipboard.writeText(text);
-  }
-  return new Promise((resolve, reject) => {
-    const textArea = document.createElement('textarea');
-    textArea.value = text;
-    textArea.style.position = 'fixed';
-    textArea.style.opacity = '0';
-    document.body.appendChild(textArea);
-    textArea.focus();
-    textArea.select();
-    try {
-      document.execCommand('copy');
-      textArea.remove();
-      resolve();
-    } catch (err) {
-      textArea.remove();
-      reject(err);
-    }
-  });
-}
-
-// 折叠展示/复制时单个体量上限，超过则截断并用注释说明，避免把整段报文塞进
-// 剪贴板或 DOM。
-export const MAX_PREVIEW_BYTES = 64 * 1024;
-
-// 把一条日志还原成可复现的 curl 命令。请求体超过 MAX_PREVIEW_BYTES 时不内联，
-// 只留一行注释：完整报文在抽屉里看，命令本身仍可执行。
-export function buildCurlFromLog(log) {
-  const url = log.request_url || log.request_path || '';
-  let cmd = `curl ${JSON.stringify(url)} \\\n  -X ${log.method || 'POST'}`;
-  const headers = log.request_headers;
-  if (headers) {
-    try {
-      const obj = JSON.parse(headers);
-      for (const [k, v] of Object.entries(obj)) {
-        cmd += ` \\\n  -H ${JSON.stringify(k + ': ' + v)}`;
-      }
-    } catch (e) {}
-  }
-  const body = log.request_body || '';
-  if (body) {
-    if (body.length > MAX_PREVIEW_BYTES) {
-      cmd += ` \\\n  # 请求体过大（${body.length} 字符），已折叠`;
-    } else {
-      cmd += ` \\\n  -d ${JSON.stringify(body)}`;
-    }
-  }
-  return cmd;
-}
-
-export function downloadFile(filename, content, type = 'text/plain;charset=utf-8') {
-  const blob = new Blob([content], { type });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(() => {
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }, 100);
 }

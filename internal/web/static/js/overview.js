@@ -1,45 +1,41 @@
 'use strict';
 
-/* ============================================================
-   Grok Gateway Console · 总览视图
-   - 核心指标卡片 & 环形进度仪表
-   - 平滑曲线 Sparklines
-   - 网关缓存命中率分解矩阵
-   - 实时信号与最新请求流
-   ============================================================ */
-
 import { state, gatewayIds } from './state.js';
 import { api } from './api.js';
 import {
-  $, $all, fmtNum, fmtPct, fmtMs, fmtTime, fmtTimeShort, fmtTimeRelative,
-  escapeHtml, rangeToFrom, rangeLabel
+  $, $all, fmtNum, fmtPct, fmtMs, fmtTimeShort,
+  escapeHtml, rangeToFrom, rangeLabel, latencyThresholds, fmtCompact,
+  gatewayPrefixLabel, gatewayTone
 } from './utils.js';
 import { loadGatewayPulses } from './pulse.js';
 import { openDrawer } from './drawer.js';
 import { showToast } from './ui.js';
 
-function metricsQuery(extra) {
-  const params = new URLSearchParams();
+const WINDOW_LIMIT = 100;
+const ATTENTION_ROWS = 8;
+const RECENT_ROWS = 12;
+
+function windowQuery(limit) {
+  const params = new URLSearchParams({ limit: String(limit || WINDOW_LIMIT) });
   const from = rangeToFrom(state.range);
   if (from) params.set('from', from.toISOString());
-  if (extra) Object.keys(extra).forEach(k => extra[k] && params.set(k, extra[k]));
   return params.toString();
 }
 
 export async function loadOverview() {
-  await Promise.all([
-    loadMetrics(),
-    loadSparkSeries(),
-    loadGatewayPulses(),
-    loadRecentLogs()
-  ]);
-  const rangeEl = $('#pulseRange');
-  if (rangeEl) rangeEl.textContent = rangeLabel(state.range);
+  await Promise.all([loadMetrics(), loadWindow(), loadGatewayPulses()]);
+  const label = rangeLabel(state.range);
+  for (const sel of ['#pulseRange', '#attentionRange']) {
+    const el = $(sel);
+    if (el) el.textContent = label;
+  }
 }
 
-export async function loadMetrics() {
+/* ---------------- 1. 指标条 ---------------- */
+
+async function loadMetrics() {
   try {
-    const m = await api('/metrics?' + metricsQuery());
+    const m = await api('/metrics?' + windowQuery());
     const sig = JSON.stringify([
       m.requests, m.successes, m.failures, m.input_tokens, m.output_tokens,
       m.reasoning_tokens, m.cache_hit_rate, m.cache_coverage_percent,
@@ -56,73 +52,150 @@ export async function loadMetrics() {
   }
 }
 
-function setGauge(sel, pct, colorVar = '--teal') {
-  const el = document.querySelector(sel);
-  if (!el) return;
-  const valid = pct !== null && pct !== undefined && !Number.isNaN(Number(pct));
-  const v = valid ? Math.max(0, Math.min(100, Number(pct))) : 0;
-  
-  // Radial SVG Gauge
-  const radius = 18;
-  const circumference = 2 * Math.PI * radius;
-  const offset = circumference - (v / 100) * circumference;
-
-  el.innerHTML = `
-    <svg viewBox="0 0 44 44" width="44" height="44" class="gauge-svg">
-      <circle cx="22" cy="22" r="${radius}" class="gauge-bg"/>
-      <circle cx="22" cy="22" r="${radius}" class="gauge-val" style="stroke-dasharray:${circumference};stroke-dashoffset:${offset};stroke:${colorVar}"/>
-    </svg>
-  `;
+function setMetric(id, value, note, tone) {
+  const el = document.getElementById(id);
+  if (el) {
+    el.textContent = value;
+    el.classList.toggle('is-warn', tone === 'warn');
+    el.classList.toggle('is-err', tone === 'err');
+  }
+  const sub = document.getElementById(id + 'Sub');
+  if (sub) sub.textContent = note;
 }
 
 function renderMetrics(m) {
-  // 1. Requests
-  $('#statRequests').textContent = m ? fmtNum(m.requests) : '—';
-  const reqSub = $('#statRequestsSub');
-  if (reqSub) {
-    if (!m) {
-      reqSub.innerHTML = '<span class="muted">加载失败</span>';
-    } else if (m.failures > 0) {
-      reqSub.innerHTML = `<span class="stat-badge-err">${fmtNum(m.failures)} 次异常</span> · 成功率 ${fmtPct((m.successes / Math.max(1, m.requests)) * 100)}`;
-    } else {
-      reqSub.innerHTML = '<span class="stat-badge-ok">全部正常</span> · 0 次异常';
-    }
+  const keys = ['Requests', 'Success', 'CacheHit', 'CacheCoverage', 'Tokens', 'Reasoning'];
+  if (!m) {
+    keys.forEach(k => setMetric('stat' + k, '—', '加载失败'));
+    renderGatewayCacheRates(null);
+    return;
   }
-
-  // 2. Success Rate
-  const successRate = m && m.requests > 0 ? (m.successes / m.requests) * 100 : null;
-  $('#statSuccess').textContent = successRate === null ? '—' : fmtPct(successRate);
-  $('#statSuccessSub').textContent = m ? `${fmtNum(m.successes)} 成功 / ${fmtNum(m.requests)} 总量` : '—';
-  setGauge('#gaugeSuccess', successRate, 'var(--emerald)');
-
-  // 3. Cache Hit Rate
-  const cacheHit = (!m || m.cache_hit_rate === null || m.cache_hit_rate === undefined) ? null : m.cache_hit_rate;
-  $('#statCacheHit').textContent = cacheHit === null ? '—' : fmtPct(cacheHit);
-  $('#statCacheHitSub').textContent = m ? `${fmtNum(m.cache_read_tokens)} Cached Tokens` : '—';
-  setGauge('#gaugeCacheHit', cacheHit, 'var(--sky)');
-
-  // 4. Cache Coverage
-  const cacheCoverage = (!m || m.cache_coverage_percent === null || m.cache_coverage_percent === undefined) ? null : m.cache_coverage_percent;
-  $('#statCacheCoverage').textContent = cacheCoverage === null ? '—' : fmtPct(cacheCoverage);
-  $('#statCacheCoverageSub').textContent = m ? `${fmtNum(m.cache_supported_calls)} / ${fmtNum(m.usage_calls)} 支持调用` : '—';
-  setGauge('#gaugeCoverage', cacheCoverage, 'var(--violet)');
-
-  // 5. Tokens Throughput
-  const totalPromptTokens = m ? (m.prompt_tokens || m.input_tokens || 0) : 0;
-  const totalOutputTokens = m ? (m.output_tokens || 0) : 0;
-  $('#statTokens').textContent = m ? `${fmtNum(totalPromptTokens)} / ${fmtNum(totalOutputTokens)}` : '—';
-  $('#statTokensSub').textContent = m
-    ? `未命中 ${fmtNum(m.input_tokens)} · 命中 ${fmtNum(m.cache_read_tokens)}`
-    : '—';
-
-  // 6. Reasoning Tokens
-  $('#statReasoning').textContent = m ? fmtNum(m.reasoning_tokens) : '—';
-  $('#statReasoningSub').textContent = m
-    ? `写入缓存 ${fmtNum(m.cache_write_tokens)} tok`
-    : '—';
+  setMetric('statRequests', fmtNum(m.requests),
+    m.failures > 0 ? `${fmtNum(m.failures)} 次失败` : '全部成功',
+    m.failures > 0 ? 'err' : null);
+  setMetric('statSuccess', m.requests > 0 ? fmtPct((m.successes / m.requests) * 100) : '—',
+    `${fmtNum(m.successes)} / ${fmtNum(m.requests)} 成功`);
+  setMetric('statCacheHit', m.cache_hit_rate == null ? '—' : fmtPct(m.cache_hit_rate),
+    `${fmtCompact(m.cache_read_tokens)} 命中 Token`);
+  setMetric('statCacheCoverage', m.cache_coverage_percent == null ? '—' : fmtPct(m.cache_coverage_percent),
+    `${fmtNum(m.cache_supported_calls)} / ${fmtNum(m.usage_calls)} 次支持缓存`);
+  setMetric('statTokens', fmtCompact(m.prompt_tokens || m.input_tokens || 0),
+    `输出 ${fmtCompact(m.output_tokens)} · 未命中 ${fmtCompact(m.input_tokens)}`);
+  setMetric('statReasoning', fmtCompact(m.reasoning_tokens),
+    `缓存写入 ${fmtCompact(m.cache_write_tokens)} Token`);
 
   renderGatewayCacheRates(m);
 }
+
+/* ---------------- 2. 异常优先 ---------------- */
+
+async function loadWindow() {
+  let items;
+  try {
+    const data = await api('/logs?' + windowQuery());
+    items = data.items || [];
+  } catch (e) {
+    renderAttention(null);
+    renderRecent(null);
+    return;
+  }
+  state.recentLogs = items;
+  renderAttention(items);
+  renderRecent(items.slice(0, RECENT_ROWS));
+}
+
+function attentionItems(items, thresholds) {
+  const rows = [];
+  for (const l of items.filter(l => !l.success)) {
+    rows.push({
+      kind: 'err',
+      title: `HTTP ${l.status_code || '—'} · ${l.gateway_name || l.gateway_id || '未知网关'}`,
+      detail: l.error || l.model || '请求失败',
+      logId: l.id
+    });
+  }
+  if (thresholds.relative) {
+    for (const l of items.filter(l => l.success && (l.duration_ms || 0) > thresholds.slow)) {
+      rows.push({
+        kind: 'warn',
+        title: `${fmtMs(l.duration_ms)} · ${l.gateway_name || l.gateway_id || '未知网关'}`,
+        detail: `超出本窗口 p90（${fmtMs(thresholds.slow)}）· ${l.model || '未知模型'}`,
+        logId: l.id
+      });
+    }
+  }
+  const upstreams = (state.health && state.health.upstreams) || {};
+  for (const [id, h] of Object.entries(upstreams)) {
+    const gateway = state.gateways[id];
+    if (h.reachable || !gateway || !gateway.enabled) continue;
+    rows.push({
+      kind: 'err',
+      title: `不可达 · ${gateway.name || id}`,
+      detail: h.error || '上游未响应',
+      gatewayId: id
+    });
+  }
+  return rows;
+}
+
+function renderAttention(items) {
+  const container = $('#attentionList');
+  if (!container) return;
+
+  if (items === null) {
+    container.innerHTML = '<div class="attention-empty is-err">日志窗口读取失败，指标条数字可能同样过期</div>';
+    return;
+  }
+  const rows = attentionItems(items, latencyThresholds(items));
+  if (!rows.length) {
+    const scope = state.range === 'all' ? '全部历史' : `近 ${rangeLabel(state.range)}`;
+    container.innerHTML = `<div class="attention-empty">${escapeHtml(scope)}无失败、无明显慢请求、上游均可达</div>`;
+    return;
+  }
+
+  container.innerHTML = rows.slice(0, ATTENTION_ROWS).map(r => `
+    <div class="attention-row is-${r.kind}"${r.logId ? ` data-log-id="${escapeHtml(r.logId)}"` : ''}${r.gatewayId ? ` data-gateway="${escapeHtml(r.gatewayId)}"` : ''} role="button" tabindex="0">
+      <span class="attention-mark"></span>
+      <span class="attention-title">${escapeHtml(r.title)}</span>
+      <span class="attention-detail">${escapeHtml(r.detail)}</span>
+      <span class="attention-go" aria-hidden="true">→</span>
+    </div>
+  `).join('') + (rows.length > ATTENTION_ROWS
+    ? `<div class="attention-more">另有 ${rows.length - ATTENTION_ROWS} 条同类未列出 · <button type="button" class="btn-link" id="attentionSeeAll">在日志中查看全部</button></div>`
+    : '');
+
+  $all('.attention-row', container).forEach(row => {
+    const open = () => {
+      if (row.dataset.logId) {
+        openDrawer(row.dataset.logId);
+        return;
+      }
+      const select = $('#filterGateway');
+      if (select && row.dataset.gateway) select.value = row.dataset.gateway;
+      const nav = $('[data-view="logs"]');
+      if (nav) nav.click();
+    };
+    row.addEventListener('click', open);
+    row.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        open();
+      }
+    });
+  });
+
+  const seeAll = $('#attentionSeeAll', container);
+  if (seeAll) {
+    seeAll.addEventListener('click', () => {
+      const status = $('#filterStatus');
+      if (status) status.value = 'failure';
+      const nav = $('[data-view="logs"]');
+      if (nav) nav.click();
+    });
+  }
+}
+
+/* ---------------- 3. 网关缓存效率 ---------------- */
 
 function renderGatewayCacheRates(metrics) {
   const container = $('#gatewayCacheRates');
@@ -135,7 +208,6 @@ function renderGatewayCacheRates(metrics) {
     const valid = metric && metric.cache_hit_rate !== null && metric.cache_hit_rate !== undefined;
     const rate = valid ? Number(metric.cache_hit_rate) : 0;
     const width = Math.max(0, Math.min(100, rate));
-    const value = valid ? fmtPct(rate) : '—';
 
     let detail = '暂无请求数据';
     if (valid) {
@@ -145,240 +217,88 @@ function renderGatewayCacheRates(metrics) {
     }
 
     return `
-      <article class="gateway-cache-rate" data-gwid="${escapeHtml(id)}">
-        <div class="gateway-cache-rate-head">
-          <div class="gateway-title-group">
-            <span class="gw-dot gw-dot-${escapeHtml(id)}"></span>
-            <strong>${escapeHtml(gateway.name || id)}</strong>
-            <code>${escapeHtml(gateway.prefix || id)}</code>
-          </div>
-          <div class="gateway-cache-rate-value">${value}</div>
-        </div>
-        <div class="gateway-cache-rate-bar" role="progressbar" aria-valuenow="${width}" aria-valuemin="0" aria-valuemax="100">
-          <span style="width:${width}%" class="bar-fill-${escapeHtml(id)}"></span>
-        </div>
-        <div class="gateway-cache-rate-foot">
-          <span class="gateway-cache-rate-detail">${escapeHtml(detail)}</span>
-          <button type="button" class="btn-link gw-filter-jump" data-gw="${escapeHtml(id)}" title="在日志中筛选此网关">
-            查看日志 →
-          </button>
-        </div>
-      </article>
+      <div class="gateway-rate-row" data-gwid="${escapeHtml(id)}">
+        <span class="gw-dot gw-tone-${gatewayTone(id)}"></span>
+        <span class="gateway-rate-name">${escapeHtml(gateway.name || id)}</span>
+        <code class="gateway-rate-prefix">${escapeHtml(gatewayPrefixLabel(gateway, id))}</code>
+        <span class="gateway-rate-bar"><span style="width:${width}%"></span></span>
+        <span class="gateway-rate-value">${valid ? fmtPct(rate) : '—'}</span>
+        <span class="gateway-rate-detail">${escapeHtml(detail)}</span>
+        <button type="button" class="btn-link gw-filter-jump" data-gw="${escapeHtml(id)}">日志</button>
+      </div>
     `;
   }).join('');
 
   $all('.gw-filter-jump', container).forEach(btn => {
-    btn.addEventListener('click', (e) => {
+    btn.addEventListener('click', e => {
       e.stopPropagation();
-      const gw = btn.dataset.gw;
-      const navLogs = $(`[data-view="logs"]`);
-      const selGw = $('#filterGateway');
-      if (selGw) selGw.value = gw;
-      if (navLogs) navLogs.click();
+      const select = $('#filterGateway');
+      if (select) select.value = btn.dataset.gw;
+      const nav = $('[data-view="logs"]');
+      if (nav) nav.click();
     });
   });
 }
 
-/* ---------------- Sparklines (平滑 Bezier 曲线) ---------------- */
+/* ---------------- 4. 最近请求 ---------------- */
 
-export async function loadSparkSeries() {
-  try {
-    const params = new URLSearchParams({ limit: '40' });
-    const from = rangeToFrom(state.range);
-    if (from) params.set('from', from.toISOString());
-    const data = await api('/logs?' + params.toString());
-    const items = data.items || [];
-    const sig = items.map(l => l.id + ':' + (l.success ? 1 : 0) + ':' + (l.duration_ms || 0)).join(',');
-    if (sig === state.sparkSig && state.sparkSeries.length) return;
-    state.sparkSig = sig;
-    state.sparkSeries = items.slice().reverse();
-    renderSparklines();
-  } catch (e) {
-    /* ignore sparkline errors */
-  }
-}
-
-function sparklineSmooth(svg, values, color = '#06b6d4') {
-  const W = 120, H = 32, pad = 3;
-  if (!values || !values.length) {
-    svg.innerHTML = '';
-    return;
-  }
-
-  const max = Math.max(...values);
-  const min = Math.min(...values);
-  const range = (max - min) || 1;
-  const n = values.length;
-
-  const points = values.map((v, i) => {
-    const x = n === 1 ? W / 2 : (i / (n - 1)) * (W - 2 * pad) + pad;
-    const y = H - pad - ((v - min) / range) * (H - 2 * pad);
-    return [x, y];
-  });
-
-  // Bezier smoothing
-  let linePath = `M ${points[0][0].toFixed(1)} ${points[0][1].toFixed(1)}`;
-  for (let i = 0; i < points.length - 1; i++) {
-    const p0 = points[i];
-    const p1 = points[i + 1];
-    const midX = (p0[0] + p1[0]) / 2;
-    linePath += ` C ${midX.toFixed(1)} ${p0[1].toFixed(1)}, ${midX.toFixed(1)} ${p1[1].toFixed(1)}, ${p1[0].toFixed(1)} ${p1[1].toFixed(1)}`;
-  }
-
-  const lastPoint = points[points.length - 1];
-  const firstPoint = points[0];
-  const areaPath = `${linePath} L ${lastPoint[0].toFixed(1)} ${H} L ${firstPoint[0].toFixed(1)} ${H} Z`;
-  const gid = 'spark-grad-' + Math.random().toString(36).slice(2, 8);
-
-  svg.innerHTML = `
-    <defs>
-      <linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="${color}" stop-opacity="0.32"/>
-        <stop offset="100%" stop-color="${color}" stop-opacity="0.0"/>
-      </linearGradient>
-    </defs>
-    <path class="spark-fill" d="${areaPath}" fill="url(#${gid})" stroke="none"/>
-    <path class="spark-line" d="${linePath}" fill="none" stroke="${color}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-  `;
-}
-
-function requestHistogram(items) {
-  const BUCKETS = 24;
-  const times = items.map(l => new Date(l.started_at).getTime()).filter(t => !Number.isNaN(t));
-  if (times.length < 2) return items.map(() => 1);
-  const min = Math.min(...times);
-  const max = Math.max(...times);
-  const span = Math.max(max - min, 1);
-  const buckets = new Array(BUCKETS).fill(0);
-  for (const t of times) {
-    const idx = Math.min(BUCKETS - 1, Math.floor(((t - min) / span) * BUCKETS));
-    buckets[idx] += 1;
-  }
-  return buckets;
-}
-
-function renderSparklines() {
-  const logs = state.sparkSeries;
-  const map = {
-    requests: { data: requestHistogram(logs), color: 'var(--teal)' },
-    success: { data: logs.map(l => (l.success ? 1 : 0)), color: 'var(--emerald)' },
-    cacheHit: {
-      data: logs.map(l => {
-        if (!l.usage || !l.usage.cache_supported || !l.usage.prompt_tokens) return 0;
-        return (l.usage.cache_read_tokens / l.usage.prompt_tokens) * 100;
-      }),
-      color: 'var(--sky)'
-    },
-    cacheCoverage: {
-      data: logs.map(l => (l.usage && l.usage.cache_supported ? 1 : 0)),
-      color: 'var(--violet)'
-    },
-    tokens: {
-      data: logs.map(l => {
-        if (!l.usage) return 0;
-        return (l.usage.prompt_tokens || l.usage.input_tokens || 0) + (l.usage.output_tokens || 0);
-      }),
-      color: 'var(--amber)'
-    },
-    reasoning: {
-      data: logs.map(l => (l.usage && l.usage.reasoning_tokens) || 0),
-      color: 'var(--rose)'
-    }
-  };
-
-  $all('.stat-spark').forEach(svg => {
-    const key = svg.dataset.stat;
-    if (map[key]) {
-      sparklineSmooth(svg, map[key].data, map[key].color);
-    }
-  });
-}
-
-/* ---------------- 最近请求列表 ---------------- */
-
-const EMPTY_RECENT_SVG = `
-  <svg viewBox="0 0 64 64" width="44" height="44" fill="none" class="empty-icon">
-    <circle cx="32" cy="32" r="28" stroke="currentColor" stroke-width="1.5" stroke-dasharray="3 4" opacity="0.4"/>
-    <path d="M22 34l7 7 15-16" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="0.6"/>
-  </svg>
-`;
-
-export async function loadRecentLogs() {
+function renderRecent(items) {
   const container = $('#recentLogList');
   if (!container) return;
 
-  try {
-    const params = new URLSearchParams({ limit: '12' });
-    const from = rangeToFrom(state.range);
-    if (from) params.set('from', from.toISOString());
-    const data = await api('/logs?' + params.toString());
-    const items = data.items || [];
-    const sig = items.map(l => l.id + ':' + (l.success ? 1 : 0) + ':' + (l.duration_ms || 0)).join(',');
-
-    if (sig === state.recentSig && container.children.length) return;
-    state.recentSig = sig;
-    state.recentLogs = items;
-
-    if (!items.length) {
-      container.innerHTML = `
-        <div class="empty-state">
-          ${EMPTY_RECENT_SVG}
-          <span>暂无请求记录，等待流量接入…</span>
-        </div>
-      `;
-      return;
-    }
-
-    container.innerHTML = items.map(l => {
-      const gwId = l.gateway_id || 'unknown';
-      const duration = l.duration_ms || 0;
-      let latencyCls = 'latency-fast';
-      if (duration > 1500) latencyCls = 'latency-slow';
-      else if (duration > 500) latencyCls = 'latency-mid';
-
-      return `
-        <div class="recent-log-item" data-id="${escapeHtml(l.id)}" role="button" tabindex="0" aria-label="查看请求 ${escapeHtml(l.id)} 详情">
-          <span class="rli-status-dot ${l.success ? 'is-ok' : 'is-err'}"></span>
-          <span class="rli-gw gw-badge-${escapeHtml(gwId)}">${escapeHtml(l.gateway_name || gwId)}</span>
-          <span class="rli-model" title="${escapeHtml(l.model || '')}">${escapeHtml(l.model || '(未知模型)')}</span>
-          <span class="rli-meta">
-            <span class="rli-latency ${latencyCls}">${fmtMs(l.duration_ms)}</span>
-            <span class="rli-time" title="${fmtTime(l.started_at)}">${fmtTimeRelative(l.started_at)}</span>
-          </span>
-          <span class="rli-arrow">→</span>
-        </div>
-      `;
-    }).join('');
-
-    $all('.recent-log-item', container).forEach(el => {
-      const open = () => openDrawer(el.dataset.id);
-      el.addEventListener('click', open);
-      el.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          open();
-        }
-      });
-    });
-  } catch (e) {
-    container.innerHTML = `
-      <div class="empty-state">
-        <span class="text-danger">加载失败：${escapeHtml(e.message)}</span>
-      </div>
-    `;
+  if (items === null) {
+    container.innerHTML = '<div class="empty-state"><span class="text-danger">加载失败</span></div>';
+    return;
   }
+  const sig = items.map(l => l.id + ':' + (l.success ? 1 : 0) + ':' + (l.duration_ms || 0)).join(',');
+  if (sig === state.recentSig && container.children.length) return;
+  state.recentSig = sig;
+
+  if (!items.length) {
+    container.innerHTML = '<div class="empty-state"><span>暂无请求记录，等待流量接入…</span></div>';
+    return;
+  }
+
+  container.innerHTML = items.map(l => `
+    <div class="recent-log-item" data-id="${escapeHtml(l.id)}" role="button" tabindex="0" aria-label="查看请求 ${escapeHtml(l.id)} 详情">
+      <span class="rli-status-dot ${l.success ? 'is-ok' : 'is-err'}"></span>
+      <span class="rli-gw">${escapeHtml(l.gateway_name || l.gateway_id || '未知')}</span>
+      <span class="rli-model" title="${escapeHtml(l.model || '')}">${escapeHtml(l.model || '(未知模型)')}</span>
+      <span class="rli-meta">
+        <span class="rli-latency">${fmtMs(l.duration_ms)}</span>
+        <span class="rli-time">${l.status_code || ''}${l.stream ? ' · SSE' : ''}</span>
+        <span class="rli-time" title="${escapeHtml(l.started_at || '')}">${fmtTimeShort(l.started_at)}</span>
+      </span>
+      <span class="rli-arrow" aria-hidden="true">→</span>
+    </div>
+  `).join('');
+
+  $all('.recent-log-item', container).forEach(el => {
+    const open = () => openDrawer(el.dataset.id);
+    el.addEventListener('click', open);
+    el.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        open();
+      }
+    });
+  });
 }
+
+/* ---------------- 5. 初始化 ---------------- */
 
 export function initOverview() {
   const picker = $('#rangePicker');
   if (picker) {
-    picker.addEventListener('click', (e) => {
+    picker.addEventListener('click', e => {
       const btn = e.target.closest('button[data-range]');
       if (!btn) return;
       state.range = btn.dataset.range;
-      $all('#rangePicker button').forEach(b => b.classList.toggle('is-active', b === btn));
-      const rangeEl = $('#pulseRange');
-      if (rangeEl) rangeEl.textContent = rangeLabel(state.range);
+      $all('#rangePicker button').forEach(b => {
+        const active = b === btn;
+        b.classList.toggle('is-active', active);
+        b.setAttribute('aria-pressed', String(active));
+      });
       loadOverview();
     });
   }

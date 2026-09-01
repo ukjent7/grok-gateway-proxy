@@ -11,7 +11,8 @@
 import { escapeHtml } from './utils.js';
 
 export function tryParseJSON(raw) {
-  if (!raw || !raw.trim()) return { ok: false };
+  if (!raw || (typeof raw === 'string' && !raw.trim())) return { ok: false };
+  if (typeof raw === 'object') return { ok: true, value: raw };
   try {
     return { ok: true, value: JSON.parse(raw) };
   } catch (e) {
@@ -97,411 +98,150 @@ export function explainJSONChange(path, kind, before, after, category) {
     return '剔除 stream_tool_calls：xAI 私有参数，标准 Responses 协议不含此字段（协议对齐）';
   }
   if (kind === 'deleted' && path.startsWith('$.tools[')) {
-    return `剔除工具条目 ${path}：类型不在标准 Responses 工具词汇表内（协议对齐）`;
+    return '剔除工具条目：类型不在标准 Responses 工具词汇表内（协议对齐）';
   }
-  if (kind === 'deleted' && (path === '$.include' || path.startsWith('$.include['))) {
-    return `剔除 include ${path}：上游不支持该扩展（协议对齐）`;
+  if (kind === 'modified' && path.includes('.filters.excluded_domains')) {
+    return '标准拼写修正：将 excluded_domains 重命名为 blocked_domains';
   }
-  if (kind === 'deleted' && (path.endsWith('.summary') || path.endsWith('.encrypted_content')) && path.includes('.input[')) {
-    return `剔除 ${path}：DeepSeek 不支持 reasoning summary/encrypted_content，明文 content 保留回传（协议对齐）`;
+  if (kind === 'deleted' && path === '$.include') {
+    return 'DeepSeek 兼容：剔除 include 参数，思维链直接以明文回传';
   }
-
-  if (kind === 'added') return `新增字段 ${path}`;
-  if (kind === 'deleted') return `删除字段 ${path}`;
-  return `修改字段 ${path}`;
+  if (kind === 'deleted') {
+    return `字段剔除：由代理协议对齐策略剥离`;
+  }
+  if (kind === 'added') {
+    return `字段注入：由代理策略补充`;
+  }
+  return `字段修改：由代理对齐转换`;
 }
 
-export function buildJSONDiff(before, after, category) {
-  const beforeMap = new Map(flattenJSON(before).map(item => [item.path, item.value]));
-  const afterMap = new Map(flattenJSON(after).map(item => [item.path, item.value]));
-  const paths = Array.from(new Set([...beforeMap.keys(), ...afterMap.keys()])).sort();
-  const rows = [];
+export function buildDiff(beforeJSON, afterJSON, category = 'body') {
+  const beforeParsed = tryParseJSON(beforeJSON);
+  const afterParsed = tryParseJSON(afterJSON);
 
-  paths.forEach(path => {
+  if (!beforeParsed.ok && !afterParsed.ok) {
+    return [];
+  }
+
+  const beforeFlat = beforeParsed.ok ? flattenJSON(beforeParsed.value) : [];
+  const afterFlat = afterParsed.ok ? flattenJSON(afterParsed.value) : [];
+
+  const beforeMap = new Map(beforeFlat.map(item => [item.path, formatDiffValue(item.value)]));
+  const afterMap = new Map(afterFlat.map(item => [item.path, formatDiffValue(item.value)]));
+
+  const allPaths = Array.from(new Set([...beforeMap.keys(), ...afterMap.keys()])).sort();
+  const diffs = [];
+
+  for (const path of allPaths) {
     const hasBefore = beforeMap.has(path);
     const hasAfter = afterMap.has(path);
-    if (!hasBefore) {
-      const afterVal = formatDiffValue(afterMap.get(path));
-      const explanation = explainJSONChange(path, 'added', '', afterVal, category);
-      rows.push({
+    const beforeVal = beforeMap.get(path);
+    const afterVal = afterMap.get(path);
+
+    if (!hasBefore && hasAfter) {
+      diffs.push({
+        path,
         kind: 'added',
-        path,
+        before: null,
         after: afterVal,
-        explanation,
-        expected: explanation.includes('协议对齐')
+        explanation: explainJSONChange(path, 'added', null, afterVal, category)
       });
-    } else if (!hasAfter) {
-      const beforeVal = formatDiffValue(beforeMap.get(path));
-      const explanation = explainJSONChange(path, 'deleted', beforeVal, '', category);
-      rows.push({
+    } else if (hasBefore && !hasAfter) {
+      diffs.push({
+        path,
         kind: 'deleted',
-        path,
         before: beforeVal,
-        explanation,
-        expected: explanation.includes('协议对齐')
+        after: null,
+        explanation: explainJSONChange(path, 'deleted', beforeVal, null, category)
       });
-    } else if (JSON.stringify(beforeMap.get(path)) !== JSON.stringify(afterMap.get(path))) {
-      const beforeValue = formatDiffValue(beforeMap.get(path));
-      const afterValue = formatDiffValue(afterMap.get(path));
-      const explanation = explainJSONChange(path, 'modified', beforeValue, afterValue, category);
-      rows.push({
-        kind: 'modified',
+    } else if (beforeVal !== afterVal) {
+      diffs.push({
         path,
-        before: beforeValue,
-        after: afterValue,
-        explanation,
-        expected: false
-      });
-    }
-  });
-
-  return rows;
-}
-
-export function buildValueDiff(path, before, after) {
-  if (String(before) === String(after)) return { rows: [] };
-  return {
-    rows: [{
-      kind: 'modified',
-      path,
-      before: String(before),
-      after: String(after),
-      explanation: `${path} 从 ${before} 变为 ${after}`,
-      expected: false
-    }]
-  };
-}
-
-export function inlineHighlight(before, after) {
-  before = String(before || '');
-  after = String(after || '');
-  if (before === after) return { beforeHTML: escapeHtml(before), afterHTML: escapeHtml(after) };
-
-  // Short strings (<800 chars): LCS diff
-  if (Math.max(before.length, after.length) < 800) {
-    return charLcsHighlight(before, after);
-  }
-  return prefixSuffixHighlight(before, after, 80);
-}
-
-function prefixSuffixHighlight(before, after, context = 64) {
-  let pre = 0;
-  const minLen = Math.min(before.length, after.length);
-  while (pre < minLen && before[pre] === after[pre]) pre++;
-
-  let suf = 0;
-  while (suf < minLen - pre && before[before.length - 1 - suf] === after[after.length - 1 - suf]) suf++;
-
-  if (pre === before.length && pre === after.length) {
-    return { beforeHTML: escapeHtml(before), afterHTML: escapeHtml(after) };
-  }
-
-  const beforeMid = before.slice(pre, before.length - suf);
-  const afterMid = after.slice(pre, after.length - suf);
-  const beforePre = before.slice(0, pre);
-  const beforeSuf = before.slice(before.length - suf);
-  const afterPre = after.slice(0, pre);
-  const afterSuf = after.slice(after.length - suf);
-
-  let bHtml = '';
-  if (beforePre.length > context) bHtml += '…' + escapeHtml(beforePre.slice(-context));
-  else bHtml += escapeHtml(beforePre);
-  if (beforeMid) bHtml += `<span class="diff-char-del">${escapeHtml(beforeMid)}</span>`;
-  if (beforeSuf.length > context) bHtml += escapeHtml(beforeSuf.slice(0, context)) + '…';
-  else bHtml += escapeHtml(beforeSuf);
-
-  let aHtml = '';
-  if (afterPre.length > context) aHtml += '…' + escapeHtml(afterPre.slice(-context));
-  else aHtml += escapeHtml(afterPre);
-  if (afterMid) aHtml += `<span class="diff-char-add">${escapeHtml(afterMid)}</span>`;
-  if (afterSuf.length > context) aHtml += escapeHtml(afterSuf.slice(0, context)) + '…';
-  else aHtml += escapeHtml(afterSuf);
-
-  return { beforeHTML: bHtml, afterHTML: aHtml };
-}
-
-function charLcsHighlight(before, after) {
-  const n = before.length, m = after.length;
-  if (n * m > 1200000 || n > 2500 || m > 2500) {
-    return prefixSuffixHighlight(before, after, 80);
-  }
-
-  const table = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
-  for (let i = n - 1; i >= 0; i--) {
-    for (let j = m - 1; j >= 0; j--) {
-      table[i][j] = before[i] === after[j] ? table[i + 1][j + 1] + 1 : Math.max(table[i + 1][j], table[i][j + 1]);
-    }
-  }
-
-  let i = 0, j = 0;
-  let bHTML = '', aHTML = '';
-  while (i < n && j < m) {
-    if (before[i] === after[j]) {
-      bHTML += escapeHtml(before[i]);
-      aHTML += escapeHtml(after[j]);
-      i++; j++;
-    } else if (table[i + 1][j] >= table[i][j + 1]) {
-      bHTML += `<span class="diff-char-del">${escapeHtml(before[i])}</span>`;
-      i++;
-    } else {
-      aHTML += `<span class="diff-char-add">${escapeHtml(after[j])}</span>`;
-      j++;
-    }
-  }
-  while (i < n) bHTML += `<span class="diff-char-del">${escapeHtml(before[i++])}</span>`;
-  while (j < m) aHTML += `<span class="diff-char-add">${escapeHtml(after[j++])}</span>`;
-
-  return { beforeHTML: bHTML, afterHTML: aHTML };
-}
-
-export function buildTextDiff(before, after) {
-  const oldLines = before.split(/\r?\n/);
-  const newLines = after.split(/\r?\n/);
-
-  if (oldLines.length === 1 && newLines.length === 1 && Math.max(before.length, after.length) > 200) {
-    return [{
-      kind: 'modified',
-      path: '文本',
-      before,
-      after,
-      explanation: '单行文本字符差异（已高亮修改处）'
-    }];
-  }
-
-  const maxCells = 1600000;
-  if (oldLines.length * newLines.length > maxCells) {
-    return [{
-      kind: 'modified',
-      path: '文本',
-      before: before.slice(0, 4000) + '\n… (已截断)',
-      after: after.slice(0, 4000) + '\n… (已截断)',
-      explanation: '文本体积过大，已折叠预览'
-    }];
-  }
-
-  const table = Array.from({ length: oldLines.length + 1 }, () => new Uint32Array(newLines.length + 1));
-  for (let i = oldLines.length - 1; i >= 0; i--) {
-    for (let j = newLines.length - 1; j >= 0; j--) {
-      table[i][j] = oldLines[i] === newLines[j] ? table[i + 1][j + 1] + 1 : Math.max(table[i + 1][j], table[i][j + 1]);
-    }
-  }
-
-  const operations = [];
-  let i = 0, j = 0;
-  while (i < oldLines.length && j < newLines.length) {
-    if (oldLines[i] === newLines[j]) {
-      operations.push({ kind: 'same', text: oldLines[i] });
-      i++; j++;
-    } else if (table[i + 1][j] >= table[i][j + 1]) {
-      operations.push({ kind: 'deleted', text: oldLines[i++] });
-    } else {
-      operations.push({ kind: 'added', text: newLines[j++] });
-    }
-  }
-  while (i < oldLines.length) operations.push({ kind: 'deleted', text: oldLines[i++] });
-  while (j < newLines.length) operations.push({ kind: 'added', text: newLines[j++] });
-
-  const rows = [];
-  for (let idx = 0; idx < operations.length; idx++) {
-    const cur = operations[idx];
-    const next = operations[idx + 1];
-    if (cur.kind === 'deleted' && next && next.kind === 'added') {
-      rows.push({
         kind: 'modified',
-        path: `第 ${idx + 1} 行`,
-        before: cur.text,
-        after: next.text,
-        explanation: `修改第 ${idx + 1} 行`,
-        expected: false
+        before: beforeVal,
+        after: afterVal,
+        explanation: explainJSONChange(path, 'modified', beforeVal, afterVal, category)
       });
-      idx++;
-    } else if (cur.kind === 'deleted') {
-      rows.push({ kind: 'deleted', path: '文本行', before: cur.text, explanation: '删除文本行', expected: false });
-    } else if (cur.kind === 'added') {
-      rows.push({ kind: 'added', path: '文本行', after: cur.text, explanation: '新增文本行', expected: false });
     } else {
-      rows.push({ kind: 'same', path: '', before: cur.text, after: cur.text, expected: false });
+      diffs.push({
+        path,
+        kind: 'unchanged',
+        before: beforeVal,
+        after: afterVal,
+        explanation: ''
+      });
     }
   }
-  return rows;
-}
 
-export function buildDiff(beforeRaw, afterRaw, category) {
-  const before = String(beforeRaw || '');
-  const after = String(afterRaw || '');
-  if (before === after) return { rows: [] };
-
-  const beforeJSON = tryParseJSON(before);
-  const afterJSON = tryParseJSON(after);
-  if (beforeJSON.ok && afterJSON.ok) {
-    return { rows: buildJSONDiff(beforeJSON.value, afterJSON.value, category) };
-  }
-  return { rows: buildTextDiff(before, after) };
+  return diffs;
 }
 
 export function diffStats(diffs) {
-  return diffs.filter(Boolean).reduce((total, diff) => {
-    for (const row of diff.rows) {
-      if (row.expected) continue;
-      if (row.kind === 'added') total.added++;
-      if (row.kind === 'modified' || row.kind === 'moved') total.modified++;
-      if (row.kind === 'deleted') total.deleted++;
-      if (row.kind !== 'same') total.total++;
-    }
-    return total;
-  }, { added: 0, modified: 0, deleted: 0, total: 0 });
+  let added = 0, deleted = 0, modified = 0, unchanged = 0;
+  for (const d of diffs) {
+    if (d.kind === 'added') added++;
+    else if (d.kind === 'deleted') deleted++;
+    else if (d.kind === 'modified') modified++;
+    else unchanged++;
+  }
+  return { added, deleted, modified, unchanged, totalChanges: added + deleted + modified };
 }
 
-export function diffSummaryBadge(label, count, kind) {
-  return count ? `<span class="diff-summary-badge diff-${kind}">${label} <strong>${count}</strong></span>` : '';
+export function diffSummaryBadge(stats) {
+  if (!stats || stats.totalChanges === 0) {
+    return '<span class="diff-badge is-clean">完全一致 (零改动透传)</span>';
+  }
+  const parts = [];
+  if (stats.deleted) parts.push(`<span class="text-danger">-${stats.deleted} 剔除</span>`);
+  if (stats.added) parts.push(`<span class="text-success">+${stats.added} 注入</span>`);
+  if (stats.modified) parts.push(`<span class="text-warn">~${stats.modified} 修改</span>`);
+  return `<span class="diff-badge is-changed">${parts.join(' · ')}</span>`;
 }
 
-export function renderDiffSection(diff, title, subtitle) {
-  const changedRows = diff.rows.filter(row => row.kind !== 'same');
-  const unexpected = changedRows.filter(r => !r.expected);
-  const expected = changedRows.filter(r => r.expected);
+export function renderDiffSection(title, diffs, options = {}) {
+  const stats = diffStats(diffs);
+  const changedOnly = diffs.filter(d => d.kind !== 'unchanged');
 
-  if (!changedRows.length) {
+  if (!changedOnly.length) {
     return `
-      <section class="diff-section diff-section-empty">
+      <div class="diff-section">
         <div class="diff-section-head">
-          <div>
-            <strong>${escapeHtml(title)}</strong>
-            <span class="diff-subtitle">${escapeHtml(subtitle)}</span>
-          </div>
-          <span class="diff-no-change-badge">✓ 无变化</span>
+          <h4>${escapeHtml(title)}</h4>
+          ${diffSummaryBadge(stats)}
         </div>
-      </section>
+        <div class="diff-clean-notice">报文逐字节严格对齐透传，未触发任何清洗或篡改规则</div>
+      </div>
     `;
   }
 
-  if (!unexpected.length && expected.length) {
-    return `
-      <section class="diff-section diff-section-expected">
-        <div class="diff-section-head">
-          <div>
-            <strong>${escapeHtml(title)}</strong>
-            <span class="diff-subtitle">${escapeHtml(subtitle)}</span>
-          </div>
-          <span class="diff-expected-badge">仅含 ${expected.length} 处预期协议转换</span>
-        </div>
-        <details class="diff-expected-details">
-          <summary>展开查看 ${expected.length} 条预期改写细节</summary>
-          <div class="diff-rows">${renderDiffRows(expected)}</div>
-        </details>
-      </section>
-    `;
-  }
-
-  return `
-    <section class="diff-section">
-      <div class="diff-section-head">
-        <div>
-          <strong>${escapeHtml(title)}</strong>
-          <span class="diff-subtitle">${escapeHtml(subtitle)}</span>
-        </div>
-        <span class="diff-change-count-badge">${unexpected.length} 处变更 ${expected.length ? `(+${expected.length} 预期折叠)` : ''}</span>
-      </div>
-      <div class="diff-column-head">
-        <span>原始客户端报文</span>
-        <span>代理上游转发报文</span>
-      </div>
-      <div class="diff-rows">
-        ${renderDiffRows(unexpected)}
-        ${expected.length ? `
-          <details class="diff-expected-details">
-            <summary>展开 ${expected.length} 条预期协议对齐剔除</summary>
-            <div class="diff-rows">${renderDiffRows(expected)}</div>
-          </details>
-        ` : ''}
-      </div>
-    </section>
-  `;
-}
-
-export function renderDiffRows(rows) {
-  const output = [];
-  const changedIndexes = rows.map((row, index) => row.kind !== 'same' ? index : -1).filter(index => index >= 0);
-  const visibleContext = new Set();
-  changedIndexes.forEach(index => {
-    for (let offset = -2; offset <= 2; offset++) {
-      if (index + offset >= 0 && index + offset < rows.length) visibleContext.add(index + offset);
-    }
-  });
-
-  let collapsed = false;
-  rows.forEach((row, index) => {
-    if (row.kind === 'same' && !visibleContext.has(index)) {
-      if (!collapsed) output.push('<div class="diff-collapse-banner">… 未修改内容已折叠 …</div>');
-      collapsed = true;
-      return;
-    }
-    collapsed = false;
-    output.push(renderDiffRow(row));
-  });
-
-  return output.join('');
-}
-
-function diffLineText(row, value) {
-  if (row.kind === 'same' || !row.path) return value;
-  return `${row.path} = ${value}`;
-}
-
-function renderDiffRow(row) {
-  const isMod = row.kind === 'modified' || row.kind === 'moved';
-  let oldLine = '', newLine = '';
-  let oldHTML = '', newHTML = '';
-
-  if (row.kind === 'added') {
-    newLine = diffLineText(row, row.after || '');
-    newHTML = escapeHtml(newLine);
-  } else if (row.kind === 'deleted') {
-    oldLine = diffLineText(row, row.before || '');
-    oldHTML = escapeHtml(oldLine);
-  } else if (isMod) {
-    if (row.kind === 'moved') {
-      const parts = row.path.split(' → ');
-      oldHTML = escapeHtml(diffLineText({ path: parts[0], kind: 'modified' }, row.before || ''));
-      newHTML = escapeHtml(diffLineText({ path: parts[1] || row.path, kind: 'modified' }, row.after || ''));
-      if (row.before === row.after) {
-        oldHTML += ' <span class="diff-note-tag">(位置重排)</span>';
-        newHTML += ' <span class="diff-note-tag">(位置重排)</span>';
-      }
+  const rows = changedOnly.map(d => {
+    let diffContent = '';
+    if (d.kind === 'deleted') {
+      diffContent = `<del class="diff-del">${escapeHtml(d.before)}</del>`;
+    } else if (d.kind === 'added') {
+      diffContent = `<ins class="diff-ins">${escapeHtml(d.after)}</ins>`;
     } else {
-      const leftRaw = diffLineText(row, row.before || '');
-      const rightRaw = diffLineText(row, row.after || '');
-      const inline = inlineHighlight(leftRaw, rightRaw);
-      oldHTML = inline.beforeHTML;
-      newHTML = inline.afterHTML;
+      diffContent = `<del class="diff-del">${escapeHtml(d.before)}</del> <span class="diff-arrow">→</span> <ins class="diff-ins">${escapeHtml(d.after)}</ins>`;
     }
-  } else {
-    oldHTML = escapeHtml(diffLineText(row, row.before || ''));
-    newHTML = escapeHtml(diffLineText(row, row.after || ''));
-  }
 
-  const oldClass = (row.kind === 'deleted' || isMod) ? 'diff-line-del' : 'diff-line-empty';
-  const newClass = (row.kind === 'added' || isMod) ? 'diff-line-add' : 'diff-line-empty';
-  const marker = row.kind === 'added' ? '+' : row.kind === 'deleted' ? '−' : row.kind === 'moved' ? '↔' : isMod ? '±' : ' ';
-  const expClass = row.expected ? ' is-expected' : '';
+    return `
+      <div class="diff-row is-${d.kind}">
+        <div class="diff-row-main">
+          <code class="diff-path">${escapeHtml(d.path)}</code>
+          <div class="diff-val">${diffContent}</div>
+        </div>
+        ${d.explanation ? `<div class="diff-explain">${escapeHtml(d.explanation)}</div>` : ''}
+      </div>
+    `;
+  }).join('');
 
   return `
-    <div class="diff-row diff-${row.kind}${expClass}">
-      <div class="diff-line ${oldClass}">
-        <span class="diff-marker">${row.kind === 'added' ? '' : marker}</span>
-        <code>${isMod ? oldHTML : escapeHtml(oldLine)}</code>
+    <div class="diff-section">
+      <div class="diff-section-head">
+        <h4>${escapeHtml(title)}</h4>
+        ${diffSummaryBadge(stats)}
       </div>
-      <div class="diff-line ${newClass}">
-        <span class="diff-marker">${row.kind === 'deleted' ? '' : marker}</span>
-        <code>${isMod ? newHTML : escapeHtml(newLine)}</code>
-      </div>
-      ${row.kind === 'same' ? '' : `
-        <div class="diff-explanation">
-          <span class="diff-exp-dot"></span>
-          <span>${escapeHtml(row.explanation || '')}</span>
-          ${row.path ? `<code>${escapeHtml(row.path)}</code>` : ''}
-        </div>
-      `}
+      <div class="diff-rows">${rows}</div>
     </div>
   `;
 }
