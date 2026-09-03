@@ -21,8 +21,6 @@ import (
 	"grok-gateway-proxy/internal/web"
 )
 
-// version is the release version surfaced to the dashboard. Override at
-// build time with -ldflags "-X main.version=X.Y.Z".
 var version = "2.1.0"
 
 func main() {
@@ -40,7 +38,7 @@ func main() {
 	if env := os.Getenv("GROK_PROXY_DATA_DIR"); env != "" && *dataDir == "" {
 		*dataDir = env
 	}
-	// Retention precedence: explicit flag > env var > config file > default (7 days).
+
 	var explicitRetention *int
 	if env := os.Getenv("GROK_PROXY_LOG_RETENTION_DAYS"); env != "" {
 		if days, err := strconv.Atoi(env); err == nil {
@@ -102,7 +100,6 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Maintain log retention and WAL checkpoint.
 	maintain := func() {
 		pruned := int64(0)
 		retention := cfg.GetLogRetention()
@@ -193,8 +190,6 @@ func defaultDataDir() string {
 	return filepath.Join(".", "data")
 }
 
-// isLoopbackAddr 判断监听地址是否仅回环（127.0.0.0/8、::1 或 localhost）。
-// 空 host（例如 :8787）表示监听全部网络接口（0.0.0.0 / ::），非回环地址。
 func isLoopbackAddr(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
