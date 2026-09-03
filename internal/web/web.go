@@ -17,13 +17,15 @@ import (
 //go:embed static
 var staticFiles embed.FS
 
+var staticRoot, _ = fs.Sub(staticFiles, "static")
+
 func (a *App) handleUI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		proxy.WriteError(w, http.StatusMethodNotAllowed, fmt.Errorf("only GET is supported for the UI"))
 		return
 	}
 	if r.URL.Path == "/" || r.URL.Path == "/ui" || r.URL.Path == "/ui/" {
-		data, err := staticFiles.ReadFile("static/index.html")
+		data, err := fs.ReadFile(staticRoot, "index.html")
 		if err != nil {
 			proxy.WriteError(w, http.StatusInternalServerError, err)
 			return
@@ -32,12 +34,7 @@ func (a *App) handleUI(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(data)
 		return
 	}
-	root, err := fs.Sub(staticFiles, "static")
-	if err != nil {
-		proxy.WriteError(w, http.StatusInternalServerError, err)
-		return
-	}
-	http.StripPrefix("/static/", http.FileServer(http.FS(root))).ServeHTTP(w, r)
+	http.StripPrefix("/static/", http.FileServer(http.FS(staticRoot))).ServeHTTP(w, r)
 }
 
 func parseFilter(r *http.Request) (store.LogFilter, error) {
@@ -98,21 +95,19 @@ func normalizeListenAddr(listenAddr string) string {
 	if addr == "" {
 		return "http://127.0.0.1:8787"
 	}
-	// The outer guard already proved there is no scheme, and no branch below
-	// adds one before the http:// default, so the cases are exhaustive.
+
 	if !strings.Contains(addr, "://") {
 		switch {
 		case strings.HasPrefix(addr, ":"):
 			addr = "http://127.0.0.1" + addr
 		case strings.HasPrefix(addr, "/"):
-			// A unix socket path: localhost is as far as a browser can go.
+
 			addr = "http://localhost" + addr
 		default:
 			addr = "http://" + addr
 		}
 	}
-	// A wildcard listen address is reachable on every interface, but only a
-	// concrete host works as a base URL.
+
 	addr = strings.Replace(addr, "://0.0.0.0", "://127.0.0.1", 1)
 	addr = strings.Replace(addr, "://[::]", "://127.0.0.1", 1)
 	addr = strings.Replace(addr, "://::", "://127.0.0.1", 1)

@@ -42,8 +42,7 @@ func TestCreateAndDeleteCustomGatewayThroughAPI(t *testing.T) {
 	if created["id"] != "mygate" || created["prefix"] != "/mygate" {
 		t.Fatalf("created gateway identity = %v", created)
 	}
-	// The console needs to tell built-in from user-created without hard-coding
-	// the built-in list, so the flag is computed server-side.
+
 	if created["custom"] != true {
 		t.Fatalf("created gateway should be flagged custom: %v", created)
 	}
@@ -104,7 +103,7 @@ func TestCreateGatewayRejectsUnknownAndMalformed(t *testing.T) {
 			}
 		})
 	}
-	// None of the rejected attempts may leave a gateway behind.
+
 	for _, id := range []string{"ok", "api", "MyGate", "oc"} {
 		if _, exists := app.config.Snapshot()[id]; exists {
 			t.Errorf("rejected create left gateway %q configured", id)
@@ -112,9 +111,6 @@ func TestCreateGatewayRejectsUnknownAndMalformed(t *testing.T) {
 	}
 }
 
-// Two gateways whose names normalise to the same model key would emit two
-// `[model.x-model]` sections in the client config, and the client keeps only
-// one of them. The create must fail and leave nothing behind.
 func TestCreateGatewayRejectsCollidingModelKey(t *testing.T) {
 	app, _ := newTestApp(t)
 	recorder := httptest.NewRecorder()
@@ -128,9 +124,6 @@ func TestCreateGatewayRejectsCollidingModelKey(t *testing.T) {
 	}
 }
 
-// The regression this guards: gateway routing used to be decided against the
-// compiled-in table, so a runtime-created prefix fell through to the UI handler
-// and 404'd behind its own address.
 func TestCustomPrefixIsRoutedToProxyNotUI(t *testing.T) {
 	app, _ := newTestApp(t)
 	recorder := httptest.NewRecorder()
@@ -143,8 +136,7 @@ func TestCustomPrefixIsRoutedToProxyNotUI(t *testing.T) {
 	recorder = httptest.NewRecorder()
 	app.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/mygate/responses",
 		strings.NewReader(`{"model":"m","input":"hi"}`)))
-	// No base URL was set, so the proxy answers 503. A 404 here means the
-	// request never reached it.
+
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d from the proxy: %s", recorder.Code, http.StatusServiceUnavailable, recorder.Body.String())
 	}
@@ -162,20 +154,16 @@ func TestRouteIsGatewayUsesLiveConfig(t *testing.T) {
 	if !app.routeIsGateway("/mygate/responses") {
 		t.Fatal("a configured custom prefix should route to the proxy")
 	}
-	// Component-boundary matching, not string prefixing: /mygateway is a
-	// different route entirely.
+
 	if app.routeIsGateway("/mygateway/responses") {
 		t.Fatal("prefix matching must respect path components")
 	}
-	// A bare App has no config to read; it must still recognise the built-ins.
+
 	if !(&App{}).routeIsGateway("/std/responses") {
 		t.Fatal("a bare App should fall back to the built-in prefixes")
 	}
 }
 
-// The client model key is derived from the display name, so renaming a gateway
-// can collide exactly as well as creating one. Without this the uniqueness
-// invariant would only hold on the path that checked it.
 func TestRenamingGatewayOntoAnotherModelKeyIsRejected(t *testing.T) {
 	app, _ := newTestApp(t)
 	recorder := httptest.NewRecorder()
@@ -195,7 +183,6 @@ func TestRenamingGatewayOntoAnotherModelKeyIsRejected(t *testing.T) {
 		t.Fatalf("the rejected rename changed the name to %q", got)
 	}
 
-	// A name that does not collide still goes through.
 	recorder = httptest.NewRecorder()
 	app.ServeHTTP(recorder, httptest.NewRequest(http.MethodPatch, "http://127.0.0.1:8787/api/gateways/team",
 		strings.NewReader(`{"name":"Team Second"}`)))

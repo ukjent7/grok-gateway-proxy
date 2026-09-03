@@ -14,8 +14,6 @@ import (
 	"grok-gateway-proxy/internal/proxy"
 )
 
-// The middleware chain must recover from panics and return 500 instead of
-// crashing the test process.
 func TestRecoverMiddlewareCatchesPanic(t *testing.T) {
 	panicking := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		panic("boom")
@@ -38,7 +36,6 @@ func TestRecoverMiddlewareCatchesPanic(t *testing.T) {
 	}
 }
 
-// Non-panicking handlers must pass through untouched.
 func TestRecoverMiddlewarePassthrough(t *testing.T) {
 	ok := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -55,7 +52,6 @@ func TestRecoverMiddlewarePassthrough(t *testing.T) {
 	}
 }
 
-// SecurityHeadersMiddleware must set both headers on every response.
 func TestSecurityHeadersMiddlewareSetsHeaders(t *testing.T) {
 	handler := Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -73,8 +69,6 @@ func TestSecurityHeadersMiddlewareSetsHeaders(t *testing.T) {
 	}
 }
 
-// The full chain (recover → security headers → app) must set security headers
-// even when the inner handler returns normally.
 func TestFullChainSetsSecurityHeadersOnNormalResponse(t *testing.T) {
 	cfg := config.DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
 	app := &App{config: cfg, logger: slog.Default()}
@@ -95,12 +89,10 @@ func TestFullChainSetsSecurityHeadersOnNormalResponse(t *testing.T) {
 	}
 }
 
-// The full chain must recover from a panic inside ServeHTTP and still return
-// the security headers alongside the 500 error.
 func TestFullChainRecoversPanicWithSecurityHeaders(t *testing.T) {
 	cfg := config.DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
 	app := &App{config: cfg, logger: slog.Default()}
-	// Wrap with a panicking middleware to simulate a handler panic.
+
 	panickingApp := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/config") {
 			panic("simulated crash")
@@ -121,8 +113,6 @@ func TestFullChainRecoversPanicWithSecurityHeaders(t *testing.T) {
 	}
 }
 
-// The chain ordering must be correct: the first middleware listed is
-// outermost, so it wraps all subsequent layers.
 func TestChainOrdering(t *testing.T) {
 	var order []string
 	mw := func(name string) Middleware {
@@ -155,8 +145,6 @@ func TestChainOrdering(t *testing.T) {
 	}
 }
 
-// Concurrent requests through the full chain must all get security headers
-// without races or panics.
 func TestFullChainConcurrentSafety(t *testing.T) {
 	cfg := config.DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
 	p := proxy.NewProxy(cfg, nil, slog.Default())
@@ -184,10 +172,6 @@ func TestFullChainConcurrentSafety(t *testing.T) {
 	wg.Wait()
 }
 
-// TestSameOriginGuardRejectsSimpleRequestCSRF pins the hole the guard exists
-// for: a fetch() with a string body is a "simple request" — the browser sends
-// it without a CORS preflight, so nothing but this check stops an unrelated
-// page from adding a gateway that this proxy then forwards Authorization to.
 func TestSameOriginGuardRejectsSimpleRequestCSRF(t *testing.T) {
 	app, cfg := newTestAppWithConfig(t)
 
@@ -208,9 +192,6 @@ func TestSameOriginGuardRejectsSimpleRequestCSRF(t *testing.T) {
 	}
 }
 
-// The body-less mutations are equally reachable and say nothing in a
-// Content-Type, so the guard cannot rest on one: DELETE /api/logs wipes the
-// audit table from a page the user merely visited.
 func TestSameOriginGuardRejectsBodylessMutation(t *testing.T) {
 	app, _ := newTestAppWithConfig(t)
 
@@ -219,8 +200,7 @@ func TestSameOriginGuardRejectsBodylessMutation(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for a cross-site delete, got %d: %s", rec.Code, rec.Body.String())
 	}
-	// Sec-Fetch-Site alone, which is what a browser sends when the request
-	// carries no Origin.
+
 	rec = serveAPI(http.MethodDelete, "http://127.0.0.1:8787/api/logs", "", app,
 		"Sec-Fetch-Site", "cross-site")
 	if rec.Code != http.StatusForbidden {
@@ -228,8 +208,6 @@ func TestSameOriginGuardRejectsBodylessMutation(t *testing.T) {
 	}
 }
 
-// The console itself must keep working: same-origin traffic from the browser
-// it is served by, and a request whose Origin simply matches this host.
 func TestSameOriginGuardAllowsSameOriginAndBrowsers(t *testing.T) {
 	app, _ := newTestAppWithConfig(t)
 
@@ -240,8 +218,6 @@ func TestSameOriginGuardAllowsSameOriginAndBrowsers(t *testing.T) {
 	}
 }
 
-// Reads are not the threat: they cannot mutate anything, and no cross-origin
-// page can read the response without CORS headers this server never sends.
 func TestSameOriginGuardLeavesReadsAlone(t *testing.T) {
 	app, _ := newTestAppWithConfig(t)
 
@@ -258,8 +234,6 @@ func newTestAppWithConfig(t *testing.T) (*App, *config.Config) {
 	return app, app.config
 }
 
-// serveAPI sends one request through the app, setting any header pairs given
-// as trailing arguments.
 func serveAPI(method, target, body string, app *App, headers ...string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, target, strings.NewReader(body))
 	for i := 0; i+1 < len(headers); i += 2 {

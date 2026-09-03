@@ -122,9 +122,6 @@ func TestHealthzReportsGatewayStatus(t *testing.T) {
 	}
 }
 
-// A 401/403 means the proxy reached the upstream but no request can succeed
-// without credentials; reporting plain reachability would light the dashboard
-// green for an unusable gateway.
 func TestProbeUpstreamMarksAuthenticationRejection(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -154,11 +151,6 @@ func TestProbeUpstreamMarksAuthenticationRejection(t *testing.T) {
 	}
 }
 
-// The console's "测试连通" button is a measurement, not a re-read of the
-// background sweep: a freshly saved base URL has to be probed now, or the
-// answer describes a gateway the user just stopped configuring. The shape it
-// returns is the same entry /healthz publishes per gateway, because the card
-// renders both with one piece of code.
 func TestTestGatewayProbesOnDemand(t *testing.T) {
 	var probes atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -193,7 +185,6 @@ func TestTestGatewayProbesOnDemand(t *testing.T) {
 		t.Fatalf("probe answer must say when it measured: %+v", entry)
 	}
 
-	// /healthz reports the same measurement under the same keys.
 	health := map[string]any{}
 	if err := json.Unmarshal(serveAPI(http.MethodGet, "http://127.0.0.1:8787/healthz", "", app).Body.Bytes(), &health); err != nil {
 		t.Fatal(err)
@@ -211,8 +202,6 @@ func TestTestGatewayProbesOnDemand(t *testing.T) {
 		t.Fatalf("/healthz and the probe disagree: %+v vs %+v", cached, entry)
 	}
 
-	// An id with no gateway is a 404, not a probe of nothing reported as a
-	// failure the user would read as an upstream problem.
 	missing := serveAPI(http.MethodPost, "http://127.0.0.1:8787/api/gateways/nosuch/test", "", app)
 	if missing.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for an unknown gateway, got %d: %s", missing.Code, missing.Body.String())
@@ -245,10 +234,6 @@ func TestGatewayConfigAPIUpdatesUserAgentOverride(t *testing.T) {
 	}
 }
 
-// The console's Forward Headers field is the only way to route an xAI-only
-// opt-in (x-grok-doom-loop-check) to a backend that understands it, so the
-// PATCH path has to persist it — including names that the proxy drops by
-// default.
 func TestGatewayConfigAPIUpdatesForwardHeaders(t *testing.T) {
 	cfg := config.DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
 	app := &App{config: cfg, logger: slog.Default()}
@@ -278,8 +263,6 @@ func TestGatewayConfigAPIUpdatesForwardHeaders(t *testing.T) {
 	}
 }
 
-// Clearing the field must restore the default allowlist rather than leaving
-// the gateway forwarding nothing at all.
 func TestGatewayConfigAPIClearingForwardHeadersRestoresDefaults(t *testing.T) {
 	cfg := config.DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
 	app := &App{config: cfg, logger: slog.Default()}
@@ -288,10 +271,6 @@ func TestGatewayConfigAPIClearingForwardHeadersRestoresDefaults(t *testing.T) {
 	app.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPatch,
 		"http://127.0.0.1:8787/api/gateways/std", strings.NewReader(`{"forward_headers":[]}`)))
 
-	// Clearing yields a nil (not empty-non-nil) slice, which serializes away
-	// under omitempty and leaves the gateway on the default allowlist. An
-	// empty request-side allowlist is what buildUpstreamRequest replaces with
-	// defaultForwardHeaders, so a gateway can never end up forwarding nothing.
 	if got := len(cfg.Gateways["std"].ForwardHeaders); got != 0 {
 		t.Fatalf("expected the allowlist to be cleared, got %d entries: %#v", got, cfg.Gateways["std"].ForwardHeaders)
 	}
@@ -378,8 +357,6 @@ func TestProxyConfigAPIUpdatesGlobalProxyURL(t *testing.T) {
 	}
 }
 
-// TestEmbeddedJavaScriptImportsAndReferences verifies that all embedded ES modules
-// have matching export/import bindings and no referenced utils functions are omitted.
 func TestEmbeddedJavaScriptImportsAndReferences(t *testing.T) {
 	entries, err := staticFiles.ReadDir("static/js")
 	if err != nil {
@@ -401,7 +378,6 @@ func TestEmbeddedJavaScriptImportsAndReferences(t *testing.T) {
 		jsFiles[entry.Name()] = content
 		exports[entry.Name()] = make(map[string]bool)
 
-		// Parse export function, export const, export async function, export { ... }
 		lines := strings.Split(content, "\n")
 		for _, line := range lines {
 			trimmed := strings.TrimSpace(line)
@@ -424,7 +400,7 @@ func TestEmbeddedJavaScriptImportsAndReferences(t *testing.T) {
 	}
 
 	for fileName, content := range jsFiles {
-		// Verify import { a, b } from './mod.js'
+
 		for _, line := range strings.Split(content, "\n") {
 			trimmed := strings.TrimSpace(line)
 			if !strings.HasPrefix(trimmed, "import") || !strings.Contains(trimmed, "from") {
@@ -499,9 +475,6 @@ func TestDeleteLogsReclaimsSpace(t *testing.T) {
 	}
 }
 
-// A gateway route takes a POST that reaches a third-party upstream, so the
-// same cross-site guard as the management API covers it. A native client
-// (grok-build, curl) sends neither marker and is unaffected.
 func TestGatewayRouteRejectsCrossSitePOST(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

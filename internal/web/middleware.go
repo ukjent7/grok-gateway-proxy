@@ -10,10 +10,8 @@ import (
 	"grok-gateway-proxy/internal/proxy"
 )
 
-// Middleware wraps an http.Handler with cross-cutting concerns.
 type Middleware func(http.Handler) http.Handler
 
-// Chain composes middlewares so the first listed runs outermost.
 func Chain(h http.Handler, mws ...Middleware) http.Handler {
 	for i := len(mws) - 1; i >= 0; i-- {
 		h = mws[i](h)
@@ -21,8 +19,6 @@ func Chain(h http.Handler, mws ...Middleware) http.Handler {
 	return h
 }
 
-// RecoverMiddleware catches panics from any handler, logs them, and returns
-// a 500 instead of crashing the process.
 func RecoverMiddleware(logger *slog.Logger) Middleware {
 	if logger == nil {
 		logger = slog.Default()
@@ -44,7 +40,6 @@ func RecoverMiddleware(logger *slog.Logger) Middleware {
 	}
 }
 
-// SecurityHeadersMiddleware sets baseline response headers on every route.
 func SecurityHeadersMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
@@ -55,10 +50,6 @@ func SecurityHeadersMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// sameOriginGuard is browser-CSRF mitigation, not gateway authentication.
-// It blocks cross-site POST/PATCH/DELETE to /api/* when the browser sends
-// Origin or Sec-Fetch-Site. Non-browser clients (Grok Build, curl) send
-// neither header and therefore pass — do not rely on this for authorization.
 func sameOriginGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {

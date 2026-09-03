@@ -68,8 +68,6 @@ func TestListLogsTotalCountsTheWholeMatchNotThePage(t *testing.T) {
 	seedLog(t, st, "req-count-2")
 	seedLog(t, st, "req-count-3")
 
-	// One row of a three-row match: the pager needs the 3, because len(items)
-	// is what made "载入更多记录" impossible.
 	body := getJSON(t, app, "http://127.0.0.1:8787/api/logs?limit=1")
 	var page struct {
 		Items []struct {
@@ -87,8 +85,6 @@ func TestListLogsTotalCountsTheWholeMatchNotThePage(t *testing.T) {
 		t.Fatalf("expected total 3 for the whole match, got %d", page.Total)
 	}
 
-	// The count is answered under the same filter as the list: a gateway that
-	// has no rows must report zero rather than the table's size.
 	filtered := getJSON(t, app, "http://127.0.0.1:8787/api/logs?gateway=nosuchgateway")
 	var empty struct {
 		Items []json.RawMessage `json:"items"`
@@ -153,6 +149,44 @@ func TestHandleMetrics(t *testing.T) {
 	}
 }
 
+func TestHandleMetricsTimeseries(t *testing.T) {
+	app, st := newTestApp(t)
+	seedLog(t, st, "req-ts-1")
+
+	body := getJSON(t, app, "http://127.0.0.1:8787/api/metrics/timeseries?buckets=24")
+	var series struct {
+		From          time.Time `json:"from"`
+		To            time.Time `json:"to"`
+		BucketSeconds int64     `json:"bucket_seconds"`
+		Buckets       []struct {
+			T        string `json:"t"`
+			Requests int64  `json:"requests"`
+			Failures int64  `json:"failures"`
+		} `json:"buckets"`
+	}
+	if err := json.Unmarshal(body, &series); err != nil {
+		t.Fatal(err)
+	}
+	var total int64
+	for _, bucket := range series.Buckets {
+		total += bucket.Requests
+	}
+	if total != 1 {
+		t.Fatalf("expected the seeded request in exactly one bucket, got %d over %d buckets", total, len(series.Buckets))
+	}
+	if series.BucketSeconds <= 0 {
+		t.Fatalf("expected a positive bucket width, got %d", series.BucketSeconds)
+	}
+
+	if req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/api/metrics/timeseries?buckets=not-a-number", nil); req != nil {
+		recorder := httptest.NewRecorder()
+		app.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("a malformed buckets value should fall back to the default, got %d", recorder.Code)
+		}
+	}
+}
+
 func TestDeleteLogsRejectsMalformedBefore(t *testing.T) {
 	app, _ := newTestApp(t)
 	req := httptest.NewRequest(http.MethodDelete, "http://127.0.0.1:8787/api/logs?before=not-a-time", nil)
@@ -163,9 +197,6 @@ func TestDeleteLogsRejectsMalformedBefore(t *testing.T) {
 	}
 }
 
-// parseFilter is the only thing standing between raw query strings and the
-// SQL layer, so every malformed value must fall back to a safe default or be
-// rejected outright instead of reaching the store with surprising semantics.
 func TestParseFilterClampsAndDefaults(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -204,9 +235,6 @@ func TestParseFilterClampsAndDefaults(t *testing.T) {
 	}
 }
 
-// An unparsable time bound must be rejected, not silently dropped: the caller
-// believes it is looking at a time window, and answering with every row would
-// corrupt counts and totals.
 func TestParseFilterRejectsInvalidTimeWindow(t *testing.T) {
 	for _, query := range []string{"from=yesterday", "to=tomorrow"} {
 		req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/api/logs?"+query, nil)
@@ -250,9 +278,7 @@ func TestHandleSetupRendersASnippetPerGateway(t *testing.T) {
 		if !strings.Contains(snippet.Snippet, string(gateway.Protocol)) {
 			t.Fatalf("snippet for %q does not declare its api_backend %q: %s", id, gateway.Protocol, snippet.Snippet)
 		}
-		// The key the console's other snippets are built from must be the very
-		// one the TOML block defines, or copying both gives a client a model
-		// the config does not declare.
+
 		if snippet.ModelKey == "" {
 			t.Fatalf("snippet for %q carries no model key", id)
 		}
@@ -262,8 +288,6 @@ func TestHandleSetupRendersASnippetPerGateway(t *testing.T) {
 	}
 }
 
-// A storage failure must not be reported as "no such log": the user would read
-// a database problem as a record they somehow deleted.
 func TestGetLogByIDReportsStorageFailureAsServerError(t *testing.T) {
 	app, st := newTestApp(t)
 	if err := st.Close(); err != nil {
@@ -285,8 +309,7 @@ func TestNormalizeListenAddr(t *testing.T) {
 		{in: "", want: "http://127.0.0.1:8787"},
 		{in: "   ", want: "http://127.0.0.1:8787"},
 		{in: ":8787", want: "http://127.0.0.1:8787"},
-		// A wildcard listen address is a valid listen target but not a usable
-		// base URL: no browser can open 0.0.0.0, so the snippet pins loopback.
+
 		{in: "0.0.0.0:9000", want: "http://127.0.0.1:9000"},
 		{in: "[::]:9000", want: "http://127.0.0.1:9000"},
 		{in: "http://example.test:1234", want: "http://example.test:1234"},
@@ -335,9 +358,6 @@ func TestUIRejectsNonGET(t *testing.T) {
 	}
 }
 
-// The health checker must report an unconfigured gateway as unreachable
-// rather than probing an empty base URL, and must stop when the context is
-// cancelled.
 func TestStartHealthCheckReportsUnconfiguredAndReachableUpstreams(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/models" {
@@ -357,7 +377,7 @@ func TestStartHealthCheckReportsUnconfiguredAndReachableUpstreams(t *testing.T) 
 	reachable := cfg.Gateways["st"]
 	reachable.BaseURL = upstream.URL
 	cfg.Gateways["st"] = reachable
-	// "ds" keeps its empty default base URL.
+
 	app := NewApp(cfg, st, slog.Default(), "1.0.0")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -368,8 +388,6 @@ func TestStartHealthCheckReportsUnconfiguredAndReachableUpstreams(t *testing.T) 
 		app.StartHealthCheck(ctx, 10*time.Millisecond)
 	}()
 
-	// The first pass runs before the ticker, but from a goroutine, so wait
-	// for it rather than racing it.
 	deadline := time.Now().Add(2 * time.Second)
 	var unconfigured upstreamHealth
 	for time.Now().Before(deadline) {
@@ -424,9 +442,6 @@ func TestStartHealthCheckReportsUnconfiguredAndReachableUpstreams(t *testing.T) 
 	}
 }
 
-// The overview board renders every gateway's ticks from one request. Answering
-// it per gateway was one /logs call per card, so the page's cost grew with the
-// number of gateways it was drawing.
 func TestPulseGroupsRecentRowsByGateway(t *testing.T) {
 	app, st := newTestApp(t)
 	ctx := context.Background()
@@ -452,7 +467,7 @@ func TestPulseGroupsRecentRowsByGateway(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	// Every gateway in the window, not just the one a filter named.
+
 	if len(response.Gateways) != 2 {
 		t.Fatalf("gateways = %d, want 2: %s", len(response.Gateways), recorder.Body.String())
 	}
