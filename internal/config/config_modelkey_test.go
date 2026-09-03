@@ -15,8 +15,7 @@ func TestModelKeyIsASCIISlug(t *testing.T) {
 		{name: "DeepSeek", id: "ds", want: "deepseek-model"},
 		{name: "标准 Responses", id: "std", want: "responses-model"},
 		{name: "  Spaced   Out  ", id: "std", want: "spaced-out-model"},
-		// A name with nothing ASCII in it cannot produce a usable key: fall
-		// back to the gateway id rather than emit `[model.-model]`.
+
 		{name: "中文网关", id: "ds", want: "ds-model"},
 		{name: "", id: "ds", want: "ds-model"},
 	}
@@ -27,10 +26,6 @@ func TestModelKeyIsASCIISlug(t *testing.T) {
 	}
 }
 
-// The rule that decides what two gateways collide on is the one the console
-// renders client snippets from, so it has to be enforced where a change
-// commits: a create rejected for a colliding name must leave nothing behind,
-// not even in the file.
 func TestAddGatewayRejectsCollidingModelKeyWithoutWriting(t *testing.T) {
 	cfg, err := LoadConfig(filepath.Join(t.TempDir(), "config.json"), nil)
 	if err != nil {
@@ -47,7 +42,6 @@ func TestAddGatewayRejectsCollidingModelKeyWithoutWriting(t *testing.T) {
 		t.Fatal("the accepted gateway did not reach the file")
 	}
 
-	// "Team  Gateway" slugs to the same key as "Team Gateway".
 	if _, err := cfg.AddGateway(NewGateway{Prefix: "/clone", Name: "Team  Gateway"}); err == nil {
 		t.Fatal("expected the colliding name to be rejected")
 	} else if !strings.Contains(err.Error(), "client model key") {

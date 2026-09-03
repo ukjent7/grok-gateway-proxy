@@ -18,8 +18,10 @@ import (
 type Protocol string
 
 const (
-	ProtocolResponses Protocol = "responses"
-	ProtocolChat      Protocol = "chat_completions"
+	ProtocolResponses        Protocol = "responses"
+	ProtocolChat             Protocol = "chat_completions"
+	ProtocolOpenAICompatible Protocol = "openai_compatible"
+	ProtocolAnthropic        Protocol = "anthropic"
 )
 
 const DefaultUpstreamTimeout = 5 * time.Minute
@@ -42,10 +44,11 @@ type GatewayConfig struct {
 const (
 	SessionAffinityOpenAI     = "openai"
 	SessionAffinityOpenRouter = "openrouter"
+	SessionAffinityOpenCode   = "opencode"
 	SessionAffinityOff        = "off"
 )
 
-var SessionAffinityModes = []string{SessionAffinityOpenAI, SessionAffinityOpenRouter, SessionAffinityOff}
+var SessionAffinityModes = []string{SessionAffinityOpenAI, SessionAffinityOpenRouter, SessionAffinityOpenCode, SessionAffinityOff}
 
 func (g GatewayConfig) EffectiveSessionAffinity() string {
 	if slices.Contains(SessionAffinityModes, g.SessionAffinity) {
@@ -103,10 +106,8 @@ func SetProductVersion(version string) {
 		return
 	}
 	DefaultUserAgentOverride = "grok-gateway-proxy/" + version
-	for id, gateway := range DefaultGateways {
-		gateway.UserAgentOverride = DefaultUserAgentOverride
-		DefaultGateways[id] = gateway
-	}
+
+	DefaultGateways = BuildDefaultGateways()
 }
 
 var customGatewayIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
@@ -166,6 +167,28 @@ func BuildDefaultGateways() map[string]GatewayConfig {
 			UserAgentOverride: DefaultUserAgentOverride,
 			UseProxy:          true,
 		},
+		"oaic": {
+			ID:                "oaic",
+			Prefix:            "/oaic",
+			Name:              "OpenAI Compatible",
+			BaseURL:           "",
+			Protocol:          ProtocolOpenAICompatible,
+			Enabled:           true,
+			SessionAffinity:   SessionAffinityOpenAI,
+			UserAgentOverride: DefaultUserAgentOverride,
+			UseProxy:          true,
+		},
+		"anth": {
+			ID:                "anth",
+			Prefix:            "/anth",
+			Name:              "Anthropic",
+			BaseURL:           "",
+			Protocol:          ProtocolAnthropic,
+			Enabled:           true,
+			SessionAffinity:   SessionAffinityOpenAI,
+			UserAgentOverride: DefaultUserAgentOverride,
+			UseProxy:          true,
+		},
 	}
 }
 
@@ -180,8 +203,6 @@ func DefaultConfig(path string) *Config {
 	}
 }
 
-// LoadConfig loads configuration from the specified path. If logRetentionDays
-// is non-nil, it overrides the value in the configuration.
 func LoadConfig(path string, logRetentionDays *int) (*Config, error) {
 	cfg := DefaultConfig(path)
 
@@ -209,6 +230,13 @@ func LoadConfig(path string, logRetentionDays *int) (*Config, error) {
 	if err := json.Unmarshal(b, &disk); err != nil {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
+
+	var rawGateways struct {
+		Gateways map[string]json.RawMessage `json:"gateways"`
+	}
+	if err := json.Unmarshal(b, &rawGateways); err != nil {
+		return nil, fmt.Errorf("decode config: %w", err)
+	}
 	if disk.ListenAddr != "" {
 		cfg.listenAddr = disk.ListenAddr
 	}
@@ -233,12 +261,18 @@ func LoadConfig(path string, logRetentionDays *int) (*Config, error) {
 	}
 	for id, gateway := range disk.Gateways {
 		if defaultGateway, ok := DefaultGateways[id]; ok {
+			var fields map[string]json.RawMessage
+			if raw, ok := rawGateways.Gateways[id]; ok {
+				if err := json.Unmarshal(raw, &fields); err != nil {
+					fields = nil
+				}
+			}
 			gateway.Prefix = defaultGateway.Prefix
 			gateway.Protocol = defaultGateway.Protocol
 			if gateway.Name == "" {
 				gateway.Name = defaultGateway.Name
 			}
-			if gateway.BaseURL == "" {
+			if _, present := fields["base_url"]; !present && gateway.BaseURL == "" {
 				gateway.BaseURL = defaultGateway.BaseURL
 			}
 			if gateway.UserAgentOverride == "" || gateway.UserAgentOverride == "grok-gateway-proxy/dev" {
@@ -296,14 +330,12 @@ func (c *Config) setBodyCaptureLimit(kb int) error {
 	return nil
 }
 
-// Save persists the configuration to disk under a write lock.
 func (c *Config) Save() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.saveLocked()
 }
 
-// saveLocked writes the configuration to a temporary file and atomically renames it.
 func (c *Config) saveLocked() error {
 	if err := c.validateLocked(); err != nil {
 		return err
@@ -372,10 +404,7 @@ func ValidateConfig(listenAddr string, gateways map[string]GatewayConfig) error 
 		if gateway.UserAgentOverrideEnabled && strings.TrimSpace(gateway.UserAgentOverride) == "" {
 			return fmt.Errorf("gateway %q user_agent_override is required when the override is enabled", id)
 		}
-		// ForwardHeaders is user-editable, so each name has to be one the HTTP
-		// transport can actually put on the wire: a name with a colon, a
-		// space or a non-ASCII byte is either dropped or rejected at write
-		// time, which would leave the gateway silently forwarding nothing.
+
 		for _, name := range gateway.ForwardHeaders {
 			if !headerNamePattern.MatchString(strings.TrimSpace(name)) {
 				return fmt.Errorf("gateway %q forward_headers entry %q is not a valid HTTP header name", id, name)
@@ -384,8 +413,7 @@ func ValidateConfig(listenAddr string, gateways map[string]GatewayConfig) error 
 		if affinity := strings.TrimSpace(gateway.SessionAffinity); affinity != "" && !slices.Contains(SessionAffinityModes, affinity) {
 			return fmt.Errorf("gateway %q session_affinity %q must be one of %s", id, affinity, strings.Join(SessionAffinityModes, ", "))
 		}
-		// Base URL may be empty: the gateway stays unusable until a base URL
-		// is configured in the console, but the config itself is valid.
+
 		if raw := strings.TrimSpace(gateway.BaseURL); raw != "" {
 			u, err := url.Parse(raw)
 			if err != nil || u.Scheme != "https" || u.Host == "" {

@@ -14,8 +14,6 @@ func newTestConfig(t *testing.T) *Config {
 	return DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
 }
 
-// Save must be atomic enough to never leave a partially written config, and
-// must not leave temp files behind for the next save to trip over.
 func TestSaveRoundTripsAndLeavesNoTempFiles(t *testing.T) {
 	cfg := newTestConfig(t)
 	cfg.SetListenAddr("127.0.0.1:9999")
@@ -78,8 +76,6 @@ func TestSaveRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
-// Snapshot hands out copies: a caller mutating what it received must not be
-// able to reach back into the live configuration.
 func TestSnapshotIsIndependentCopy(t *testing.T) {
 	cfg := newTestConfig(t)
 	gateway := cfg.Gateways["ds"]
@@ -118,7 +114,7 @@ func TestPatchGatewayAppliesPartialUpdate(t *testing.T) {
 	if len(updated.ForwardHeaders) != 1 || updated.ForwardHeaders[0] != "X-Trace" {
 		t.Fatalf("ForwardHeaders = %v, want [X-Trace]", updated.ForwardHeaders)
 	}
-	// Keys not mentioned in the patch keep their previous value.
+
 	if updated.BaseURL != cfg.Gateways["ds"].BaseURL {
 		t.Fatalf("BaseURL changed without being patched: %q", updated.BaseURL)
 	}
@@ -127,8 +123,6 @@ func TestPatchGatewayAppliesPartialUpdate(t *testing.T) {
 	}
 }
 
-// Identity fields are immutable: a patch must not be able to move a gateway
-// to a different prefix or protocol.
 func TestPatchGatewayPinsImmutableIdentity(t *testing.T) {
 	cfg := newTestConfig(t)
 	before := cfg.Gateways["st"]
@@ -142,7 +136,6 @@ func TestPatchGatewayPinsImmutableIdentity(t *testing.T) {
 	}
 }
 
-// An empty name means "leave it alone" rather than "blank it out".
 func TestPatchGatewayKeepsNameWhenPatchedEmpty(t *testing.T) {
 	cfg := newTestConfig(t)
 	empty := ""
@@ -162,8 +155,6 @@ func TestPatchGatewayUnknownID(t *testing.T) {
 	}
 }
 
-// A rejected patch must roll the whole gateway map back, not leave a
-// partially applied one behind.
 func TestPatchGatewayRejectsInvalidCandidateAndRollsBack(t *testing.T) {
 	cfg := newTestConfig(t)
 	before := cfg.Gateways["ds"]
@@ -171,7 +162,7 @@ func TestPatchGatewayRejectsInvalidCandidateAndRollsBack(t *testing.T) {
 	enabled := true
 	if _, err := cfg.PatchGateway("ds", GatewayPatch{
 		UserAgentOverrideEnabled: &enabled,
-		UserAgentOverride:        new(string), // empty override
+		UserAgentOverride:        new(string),
 	}); err == nil {
 		t.Fatal("expected PatchGateway to reject an enabled but empty user agent override")
 	}
@@ -182,7 +173,6 @@ func TestPatchGatewayRejectsInvalidCandidateAndRollsBack(t *testing.T) {
 	}
 }
 
-// The legacy per-gateway switch is still accepted by older clients.
 func TestPatchGatewayAcceptsLegacyUseSystemProxy(t *testing.T) {
 	cfg := newTestConfig(t)
 	disabled := false
@@ -204,7 +194,6 @@ func TestSetProxyURL(t *testing.T) {
 		t.Fatalf("ProxyURL() = %q, want http://127.0.0.1:7890", got)
 	}
 
-	// Clearing is allowed.
 	if err := cfg.SetProxyURL(""); err != nil {
 		t.Fatalf("SetProxyURL(\"\"): %v", err)
 	}
@@ -212,7 +201,6 @@ func TestSetProxyURL(t *testing.T) {
 		t.Fatalf("ProxyURL() = %q, want empty", cfg.ProxyURL())
 	}
 
-	// An invalid value must be rejected without clobbering the current one.
 	if err := cfg.SetProxyURL("http://127.0.0.1:7890"); err != nil {
 		t.Fatalf("SetProxyURL: %v", err)
 	}
@@ -237,12 +225,6 @@ func TestValidateProxyURL(t *testing.T) {
 	}
 }
 
-// A zero upstream timeout is what an absent config field leaves behind, so the
-// getter substitutes the default rather than handing back a deadline that would
-// cancel every request. The body capture limit's zero is a meaningful value
-// ("capture everything") and must pass through untouched; a negative never
-// reaches the getter at all, because setBodyCaptureLimit is the only writer and
-// it rejects them (see TestLoadConfigRejectsNegativeBodyCaptureLimit).
 func TestGettersSubstituteDefaultsForUnsetValues(t *testing.T) {
 	cfg := newTestConfig(t)
 	cfg.SetUpstreamTimeout(0)
@@ -255,8 +237,6 @@ func TestGettersSubstituteDefaultsForUnsetValues(t *testing.T) {
 	}
 }
 
-// Gateways written by older builds predate the global proxy switch and must
-// keep working without a migration step.
 func TestGatewayConfigUnmarshalJSONMigratesLegacyProxySwitch(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -283,8 +263,6 @@ func TestGatewayConfigUnmarshalJSONMigratesLegacyProxySwitch(t *testing.T) {
 	}
 }
 
-// The saved file is the source of truth on the next boot, so the on-disk
-// shape must stay stable: renaming a field silently discards user settings.
 func TestSavedConfigKeepsExpectedFieldNames(t *testing.T) {
 	cfg := newTestConfig(t)
 	if err := cfg.Save(); err != nil {
@@ -308,8 +286,6 @@ func TestSavedConfigKeepsExpectedFieldNames(t *testing.T) {
 	}
 }
 
-// ValidateConfig is the gate for hand-edited config files, so every way a
-// gateway entry can disagree with its known identity must be rejected.
 func TestValidateConfigRejectsDivergentGateway(t *testing.T) {
 	base := DefaultGateways
 	tests := []struct {
@@ -357,8 +333,6 @@ func TestValidateConfigRejectsUnknownGatewayAndEmptyListenAddr(t *testing.T) {
 	}
 }
 
-// A gateway cannot be saved with the override switched on but empty: the
-// proxy would send a blank User-Agent upstream.
 func TestValidateConfigRejectsEmptyUserAgentOverride(t *testing.T) {
 	gateways := BuildDefaultGateways()
 	gateway := gateways["ds"]
@@ -370,10 +344,9 @@ func TestValidateConfigRejectsEmptyUserAgentOverride(t *testing.T) {
 	}
 }
 
-// Save surfaces I/O failures instead of silently discarding the config.
 func TestSaveReportsWriteFailure(t *testing.T) {
 	cfg := DefaultConfig(filepath.Join(t.TempDir(), "config.json"))
-	// A path whose parent is an existing file cannot be created.
+
 	blocker := filepath.Join(t.TempDir(), "blocker")
 	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
 		t.Fatal(err)
@@ -391,10 +364,6 @@ func TestGatewayConfigUnmarshalJSONRejectsBadLegacyValue(t *testing.T) {
 	}
 }
 
-// The loader never writes; it reports whether the file on disk already
-// describes what it produced. Starting up must not rewrite a config that is
-// already current (that made a read-only config directory fatal and persisted
-// per-process overrides), and must rewrite one that is missing or stale.
 func TestShouldPersistReportsMissingOrStaleConfig(t *testing.T) {
 	t.Run("no file yet", func(t *testing.T) {
 		cfg, err := LoadConfig(filepath.Join(t.TempDir(), "config.json"), nil)
@@ -461,10 +430,6 @@ func TestShouldPersistReportsMissingOrStaleConfig(t *testing.T) {
 	})
 }
 
-// Routing sits on every proxied request, so it must not rebuild the gateway
-// table to read one entry out of it. Snapshot deep-copies the map and every
-// ForwardHeaders slice; MatchGateway reads the live table under the lock and
-// copies nothing, and this is what keeps that true.
 func TestMatchGatewayDoesNotAllocate(t *testing.T) {
 	cfg := newTestConfig(t)
 	gateway := cfg.Gateways["ds"]

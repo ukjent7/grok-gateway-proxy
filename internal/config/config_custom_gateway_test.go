@@ -18,7 +18,6 @@ func TestAddGatewayCreatesCustomResponsesGateway(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The leading slash is optional on input but never part of the id.
 	created, err := cfg.AddGateway(NewGateway{Prefix: "mygate", Name: "My Gate", BaseURL: "https://api.example.com/v1"})
 	if err != nil {
 		t.Fatal(err)
@@ -26,8 +25,7 @@ func TestAddGatewayCreatesCustomResponsesGateway(t *testing.T) {
 	if created.ID != "mygate" || created.Prefix != "/mygate" {
 		t.Fatalf("identity = %q / %q, want mygate and /mygate", created.ID, created.Prefix)
 	}
-	// Protocol is not a free field: a custom gateway exists to reuse the
-	// standard Responses adapter.
+
 	if created.Protocol != ProtocolResponses {
 		t.Fatalf("protocol = %q, want %q", created.Protocol, ProtocolResponses)
 	}
@@ -51,8 +49,7 @@ func TestAddGatewayRejectsUnusablePrefixes(t *testing.T) {
 	tests := []struct {
 		name   string
 		prefix string
-		// contains is the substring the error must mention; "" only requires
-		// that the call failed.
+
 		contains string
 	}{
 		{name: "empty", prefix: ""},
@@ -137,9 +134,6 @@ func TestDeleteGatewayOnlyRemovesCustomGateways(t *testing.T) {
 	}
 }
 
-// A config written by an older build mixes three cases in one map: gateways
-// this build ships, gateways the user added, and gateways this build removed.
-// Only the second group may survive.
 func TestLoadConfigKeepsCustomAndDropsLegacyGateways(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	body := `{"listen_addr":"127.0.0.1:8787","gateways":{` +
@@ -160,8 +154,7 @@ func TestLoadConfigKeepsCustomAndDropsLegacyGateways(t *testing.T) {
 	if !ok {
 		t.Fatalf("the custom gateway was discarded: %v", cfg.Gateways)
 	}
-	// Whatever the file claimed about protocol and prefix is overridden: the id
-	// is the prefix and the protocol is the adapter it reuses.
+
 	if gateway.Protocol != ProtocolResponses || gateway.Prefix != "/mygate" {
 		t.Fatalf("custom identity was not pinned: %+v", gateway)
 	}
@@ -170,12 +163,11 @@ func TestLoadConfigKeepsCustomAndDropsLegacyGateways(t *testing.T) {
 			t.Errorf("legacy gateway %q was revived as a custom gateway", legacy)
 		}
 	}
-	// The dropped entries are still on disk, so a rewrite is owed.
+
 	if !cfg.ShouldPersist() {
 		t.Error("a config still listing removed gateways should be rewritten")
 	}
 
-	// Round-tripping through Save leaves the custom gateway intact and current.
 	if err := cfg.Save(); err != nil {
 		t.Fatal(err)
 	}
@@ -217,8 +209,6 @@ func TestValidateConfigRejectsBrokenCustomGateways(t *testing.T) {
 	}
 }
 
-// Overlapping prefixes are deliberately legal: routing resolves the longest
-// match, so neither gateway becomes ambiguous at request time.
 func TestValidateConfigAllowsNestedPrefixes(t *testing.T) {
 	gateways := map[string]GatewayConfig{
 		"gw":    {ID: "gw", Prefix: "/gw", Name: "GW", Protocol: ProtocolResponses},

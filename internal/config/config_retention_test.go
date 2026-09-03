@@ -21,7 +21,7 @@ func TestLoadConfigRetentionPrecedence(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		file     string // "" means no config file
+		file     string
 		explicit *int
 		wantDays int
 		wantErr  bool
