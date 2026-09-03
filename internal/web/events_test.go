@@ -3,6 +3,7 @@ package web
 import (
 	"bufio"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -26,6 +27,7 @@ func TestEventsStreamPushesOnChange(t *testing.T) {
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
+		return
 	}
 	defer resp.Body.Close()
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
@@ -33,8 +35,8 @@ func TestEventsStreamPushesOnChange(t *testing.T) {
 	}
 
 	events := make(chan string, 4)
-	go func() {
-		scanner := bufio.NewScanner(resp.Body)
+	go func(body io.Reader) {
+		scanner := bufio.NewScanner(body)
 		for scanner.Scan() {
 			select {
 			case events <- scanner.Text():
@@ -42,7 +44,7 @@ func TestEventsStreamPushesOnChange(t *testing.T) {
 			}
 		}
 		close(events)
-	}()
+	}(resp.Body)
 
 	waitEvent := func(want string) {
 		t.Helper()
