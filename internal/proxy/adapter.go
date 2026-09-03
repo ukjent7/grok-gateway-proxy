@@ -31,9 +31,11 @@ func validateJSONRequest(body []byte, protocolName string) error {
 }
 
 var gatewayAdapters = map[string]GatewayAdapter{
-	"ds":  DeepSeekResponsesAdapter{},
-	"st":  SenseNovaChatAdapter{},
-	"std": StandardResponsesAdapter{},
+	"ds":   DeepSeekResponsesAdapter{},
+	"st":   SenseNovaChatAdapter{},
+	"std":  StandardResponsesAdapter{},
+	"oaic": OpenAICompatibleChatAdapter{},
+	"anth": AnthropicMessagesAdapter{},
 }
 
 func adapterFor(id string) (GatewayAdapter, bool) {
@@ -45,8 +47,15 @@ func adapterForGateway(gateway config.GatewayConfig) (GatewayAdapter, bool) {
 	if adapter, ok := adapterFor(gateway.ID); ok {
 		return adapter, true
 	}
-	if gateway.Protocol == config.ProtocolResponses {
+	switch gateway.Protocol {
+	case config.ProtocolResponses:
 		return StandardResponsesAdapter{}, true
+	case config.ProtocolChat:
+		return SenseNovaChatAdapter{}, true
+	case config.ProtocolOpenAICompatible:
+		return OpenAICompatibleChatAdapter{}, true
+	case config.ProtocolAnthropic:
+		return AnthropicMessagesAdapter{}, true
 	}
 	return nil, false
 }

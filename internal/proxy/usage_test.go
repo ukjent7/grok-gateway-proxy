@@ -33,7 +33,7 @@ func TestExtractResponsesUsage(t *testing.T) {
 	if !usage.CacheSupported || usage.OutputTokens != 12 || usage.ReasoningTokens != 4 {
 		t.Fatalf("unexpected usage details: %+v", usage)
 	}
-	// 50 cache reads out of 160 prompt tokens.
+
 	if hitRate := float64(usage.CacheReadTokens) / float64(usage.PromptTokens) * 100; hitRate != 31.25 {
 		t.Fatalf("unexpected hit rate: %v%%", hitRate)
 	}
@@ -75,10 +75,6 @@ func TestExtractSSEUsage(t *testing.T) {
 	}
 }
 
-// The Responses API emits response.created / response.in_progress with an
-// all-zero usage object before the terminal response.completed carries the
-// cumulative totals. Extraction must prefer the last (terminal) event so the
-// metrics reflect what the client is actually billed on.
 func TestExtractSSEUsagePrefersTerminalEvent(t *testing.T) {
 	created := mustJSON(t, map[string]any{
 		"type": "response.created",
@@ -112,12 +108,6 @@ func TestExtractSSEUsagePrefersTerminalEvent(t *testing.T) {
 	}
 }
 
-// Each event must be decoded into a fresh map. encoding/json merges into an
-// existing map instead of clearing it, so a map reused across iterations
-// keeps top-level keys that later events lack: a stream that opens with
-// envelope-shaped events (response.usage) still carries that stale envelope
-// when the terminal chunk reports usage at the root, and the stale one wins
-// because extractUsageFromRoot checks the envelope first.
 func TestExtractSSEUsageDoesNotLeakAcrossEvents(t *testing.T) {
 	enveloped := mustJSON(t, map[string]any{
 		"type": "response.in_progress",
@@ -156,9 +146,6 @@ func TestUsageWithoutCacheFieldsIsUnsupported(t *testing.T) {
 	}
 }
 
-// A single `data:` line past bufio.Scanner's 1 MiB limit used to stop the
-// buffered scan dead, losing every event after it — including the terminal
-// usage event. The tracker carries partial lines instead, so it has no limit.
 func TestUsageTrackerHandlesOversizedLine(t *testing.T) {
 	tracker := newUsageTracker(config.ProtocolResponses)
 	tracker.observe([]byte(`data: {"type":"response.image_generation_call.partial_image","b64":"`))
@@ -174,8 +161,6 @@ func TestUsageTrackerHandlesOversizedLine(t *testing.T) {
 	}
 }
 
-// Feed the same stream in different chunkings: line splitting must not depend
-// on where chunk boundaries fall.
 func TestUsageTrackerIsChunkBoundaryAgnostic(t *testing.T) {
 	stream := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n" +
 		"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":8}}}\n\n"
@@ -200,8 +185,6 @@ func TestUsageTrackerIsChunkBoundaryAgnostic(t *testing.T) {
 	}
 }
 
-// The terminal event wins even when it is preceded by the all-zero usage
-// object that response.created carries.
 func TestUsageTrackerPrefersTerminalEvent(t *testing.T) {
 	tracker := newUsageTracker(config.ProtocolResponses)
 	tracker.observe([]byte(`data: {"type":"response.created","response":{"usage":{"input_tokens":0,"output_tokens":0}}}` + "\n\n"))
@@ -237,9 +220,6 @@ func TestFirstNumberOKAcceptsJSONNumberTypes(t *testing.T) {
 	}
 }
 
-// A json.Number that is not an integer (or is out of range) must be skipped
-// rather than silently truncated to zero, so the caller can fall through to
-// the next candidate key.
 func TestFirstNumberOKSkipsUnparsableJSONNumber(t *testing.T) {
 	values := map[string]any{
 		"fractional": json.Number("1.5"),
@@ -258,7 +238,7 @@ func TestFirstNumberOKPrefersFirstPresentKey(t *testing.T) {
 	if got, ok := firstNumberOK(values, "b", "a"); !ok || got != 2 {
 		t.Fatalf("expected the first listed key to win, got (%d, %v)", got, ok)
 	}
-	// A key that is present but holds a non-number does not stop the search.
+
 	if got, ok := firstNumberOK(values, "missing", "b", "c"); !ok || got != 2 {
 		t.Fatalf("expected the search to continue past absent/non-numeric keys, got (%d, %v)", got, ok)
 	}

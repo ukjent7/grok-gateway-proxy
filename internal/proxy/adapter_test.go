@@ -9,11 +9,6 @@ import (
 	"grok-gateway-proxy/internal/config"
 )
 
-// The two tables listing the supported gateways — config.DefaultGateways
-// (identity: prefix, protocol, base URL) and gatewayAdapters (behaviour) —
-// are separate literals in separate packages, so adding a gateway can easily
-// update only one of them. That is only caught at request time today, as a
-// 500 from adapterFor. This pins the two together.
 func TestEveryDefaultGatewayHasAnAdapter(t *testing.T) {
 	if len(config.DefaultGateways) == 0 {
 		t.Fatal("config.DefaultGateways is empty")
@@ -120,9 +115,6 @@ func TestSenseNovaDropsToolMessagesForRemovedCalls(t *testing.T) {
 	}
 }
 
-// The response-side conversion must only rewrite tool-call entries inside
-// tool_calls arrays; any other "type" property (e.g. echoed tool definitions)
-// is left byte-for-byte intact.
 func TestSenseNovaResponseTransformScopedToToolCalls(t *testing.T) {
 	adapter := SenseNovaChatAdapter{}
 	body := []byte(`{"tools":[{"type":"function_call","function":{"name":"defn"}}],"choices":[{"message":{"tool_calls":[{"id":"call-1","type":"function_call","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":""}]}`)
@@ -180,7 +172,7 @@ func TestStandardRenamesLegacyReasoningEvents(t *testing.T) {
 
 func TestStandardRenameDoesNotCorruptQuotedContent(t *testing.T) {
 	adapter := StandardResponsesAdapter{}
-	// The old event name quoted inside delta text must survive untouched.
+
 	input := "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"the event is response.reasoning.delta\"}\n\n"
 	reader := adapter.TransformSSE(strings.NewReader(input))
 	body, err := io.ReadAll(reader)
@@ -192,8 +184,6 @@ func TestStandardRenameDoesNotCorruptQuotedContent(t *testing.T) {
 	}
 }
 
-// Event types outside the client's vocabulary are dropped; the legacy
-// reasoning names count as known because they are renamed downstream.
 func TestStandardFiltersUnknownEventTypes(t *testing.T) {
 	adapter := StandardResponsesAdapter{}
 	input := "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0}\n\n" +
@@ -229,17 +219,9 @@ func TestStandardPassesResponsesStreamThroughUnchanged(t *testing.T) {
 	}
 }
 
-// TestStandardRenameHandlesSpacedAndNestedSerialization verifies the type-field
-// rewrite copes with serialization variants a naive byte replace would miss:
-// extra whitespace around the colon, and the legacy event name appearing as the
-// value of a different key (e.g. "delta" text) where it must survive untouched.
-// Only "type" properties whose value is the legacy event name are renamed;
-// other string values are left intact.
 func TestStandardRenameHandlesSpacedAndNestedSerialization(t *testing.T) {
 	adapter := StandardResponsesAdapter{}
-	// Extra spaces around the colon; the legacy name also appears as a "delta"
-	// string value, which must NOT be rewritten (it is payload text, not an
-	// event name).
+
 	input := "event: response.reasoning.delta\n" +
 		`data: {"type" : "response.reasoning.delta","delta":"response.reasoning.delta"}` + "\n\n"
 	reader := adapter.TransformSSE(strings.NewReader(input))
@@ -248,15 +230,14 @@ func TestStandardRenameHandlesSpacedAndNestedSerialization(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := string(body)
-	// The top-level type field and the event: line must be renamed.
+
 	if !strings.Contains(got, "event: response.reasoning_text.delta") {
 		t.Fatalf("event: line was not renamed: %s", got)
 	}
 	if !strings.Contains(got, `"type" : "response.reasoning_text.delta"`) {
 		t.Fatalf("type field was not renamed despite spaced colon: %s", got)
 	}
-	// The "delta" string value must survive untouched — it is payload text,
-	// not the event name.
+
 	if !strings.Contains(got, `"delta":"response.reasoning.delta"`) {
 		t.Fatalf("delta string value was wrongly renamed: %s", got)
 	}
@@ -304,9 +285,6 @@ func TestSenseNovaStreamingToolCallContinuationKeepsIdentity(t *testing.T) {
 	}
 }
 
-// The upstream payload is not required to be compact: pretty-printed or
-// otherwise spaced JSON must be cleaned up just the same. A naive
-// bytes.Contains(`"id":""`) pre-filter silently misses {"id": ""}.
 func TestSenseNovaSpacedToolCallContinuationKeepsIdentity(t *testing.T) {
 	adapter := SenseNovaChatAdapter{}
 	input := "data: { \"choices\": [ { \"delta\": { \"tool_calls\": [ { \"index\": 0, \"id\": \"call-1\", \"type\": \"function\", \"function\": { \"name\": \"lookup\", \"arguments\": \"{\" } } ] }, \"finish_reason\": \"\" } ] }\n\n" +
@@ -316,8 +294,7 @@ func TestSenseNovaSpacedToolCallContinuationKeepsIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := string(body)
-	// Whitespace is collapsed so the assertions match regardless of whether
-	// the adapter re-marshals a chunk or forwards it verbatim.
+
 	compacted := strings.Join(strings.Fields(result), "")
 	if !strings.Contains(compacted, `"id":"call-1"`) || !strings.Contains(compacted, `"name":"lookup"`) {
 		t.Fatalf("initial tool-call identity was lost: %s", result)
@@ -330,9 +307,6 @@ func TestSenseNovaSpacedToolCallContinuationKeepsIdentity(t *testing.T) {
 	}
 }
 
-// Every Responses request sent upstream must conform to the standard
-// protocol: xAI-only extensions are stripped regardless of model, while
-// everything else survives untouched.
 func TestStandardSanitizesResponsesRequestsForAllModels(t *testing.T) {
 	adapter := StandardResponsesAdapter{}
 	body := []byte(`{"model":"deepseek-v4-flash","stream":true,"stream_tool_calls":true,"tools":[{"type":"x_search"},{"type":"web_search","filters":{"excluded_domains":["evil.example"]}},{"type":"web_search","filters":{"allowed_domains":["docs.example"]}},{"type":"function","name":"lookup","parameters":{}}],"include":["reasoning.encrypted_content","no_inline_citations"],"input":[]}`)
@@ -349,8 +323,7 @@ func TestStandardSanitizesResponsesRequestsForAllModels(t *testing.T) {
 			t.Fatalf("non-standard stream_tool_calls survived for %q: %s", model, upstreamBody)
 		}
 		tools := payload["tools"].([]any)
-		// x_search is dropped; the excluded-domains web_search survives with
-		// its filter renamed to blocked_domains.
+
 		if len(tools) != 3 {
 			t.Fatalf("x_search was not dropped, or a standard tool was lost, for %q: %s", model, upstreamBody)
 		}
@@ -380,8 +353,6 @@ func TestStandardSanitizesResponsesRequestsForAllModels(t *testing.T) {
 	}
 }
 
-// A request that already conforms to the standard protocol must pass through
-// byte-for-byte.
 func TestStandardLeavesConformantRequestsUnchanged(t *testing.T) {
 	adapter := StandardResponsesAdapter{}
 	body := []byte(`{"model":"deepseek-v4-flash","stream":true,"input":[]}`)
@@ -394,10 +365,6 @@ func TestStandardLeavesConformantRequestsUnchanged(t *testing.T) {
 	}
 }
 
-// Pings and event types outside the client's vocabulary are dropped, legacy
-// reasoning event names are renamed to the standard reasoning_text variants,
-// and known events (and the [DONE] sentinel) are preserved — identically for
-// every model.
 func TestStandardFiltersPingsAndUnknownEvents(t *testing.T) {
 	adapter := StandardResponsesAdapter{}
 	input := "event: ping\ndata: {\"type\":\"ping\",\"cost\":\"0\"}\n\n" +
@@ -423,10 +390,6 @@ func TestStandardFiltersPingsAndUnknownEvents(t *testing.T) {
 	}
 }
 
-// The request rewrite walks a decoded document, so numbers that have nothing
-// to do with the rewrite still have to leave the way they arrived. Decoding
-// into a generic value without UseNumber silently turns 9007199254740993 into
-// 9007199254740992 and 1.0 into 1.
 func TestSenseNovaRequestRewritePreservesNumberLiterals(t *testing.T) {
 	body := []byte(`{"model":"m","seq":9007199254740993,"ratio":1.0,"sci":1e3,` +
 		`"messages":[{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]}]}`)

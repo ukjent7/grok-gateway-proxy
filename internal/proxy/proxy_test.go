@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -242,9 +243,6 @@ func TestProxyRoutesBothNativeResponseAdapters(t *testing.T) {
 	}
 }
 
-// Upstream error bodies are forwarded verbatim: `error.type` and `error.code`
-// are what clients branch on for retry / rate-limit / request-error handling,
-// so the proxy must not swap in an envelope of its own.
 func TestProxyPassesThroughUpstreamErrors(t *testing.T) {
 	const upstreamError = `{"error":{"message":"quota exceeded","type":"rate_limit_error","code":"rate_limit_exceeded"}}`
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -294,9 +292,6 @@ func TestJoinUpstreamURL(t *testing.T) {
 	}
 }
 
-// A response larger than the capture cap must still be forwarded to the
-// client in full, while the log keeps only the first cap bytes and flags the
-// log with response_truncated.
 func TestProxyCapsResponseBodyCapture(t *testing.T) {
 	const capSize = 1024
 	bigBody := bytes.Repeat([]byte("x"), 4*capSize)
@@ -321,7 +316,6 @@ func TestProxyCapsResponseBodyCapture(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	p.ServeHTTP(recorder, req)
 
-	// The client still receives the full body.
 	if recorder.Code != http.StatusOK || recorder.Body.Len() != len(bigBody) {
 		t.Fatalf("client did not receive full body: status=%d len=%d", recorder.Code, recorder.Body.Len())
 	}
@@ -342,8 +336,6 @@ func TestProxyCapsResponseBodyCapture(t *testing.T) {
 	}
 }
 
-// An SSE stream larger than the capture cap is forwarded in full to the
-// client; only the logged raw/transformed captures are capped and flagged.
 func TestProxyCapsSSEResponseBodyCapture(t *testing.T) {
 	const capSize = 1024
 	var stream bytes.Buffer
@@ -392,10 +384,6 @@ func TestProxyCapsSSEResponseBodyCapture(t *testing.T) {
 	}
 }
 
-// Usage must be metered from the live stream, not from the capped capture: the
-// terminal usage-bearing event lands outside the capture window whenever the
-// stream is longer than the cap, and re-scanning the capture would then report
-// zero tokens for a response that was billed in full.
 func TestProxyStreamUsageSurvivesCaptureTruncation(t *testing.T) {
 	const capSize = 1024
 	var stream bytes.Buffer
@@ -444,7 +432,6 @@ func TestProxyStreamUsageSurvivesCaptureTruncation(t *testing.T) {
 	}
 }
 
-// A response within the cap is stored in full and not flagged.
 func TestProxyResponseWithinCapIsNotFlagged(t *testing.T) {
 	const capSize = 4096
 	body := []byte(`{"id":"ok","choices":[]}`)
@@ -485,8 +472,6 @@ func TestProxyResponseWithinCapIsNotFlagged(t *testing.T) {
 	}
 }
 
-// A slow upstream must be cut off by the per-request timeout and reported as
-// a 504 gateway timeout instead of hanging the client indefinitely.
 func TestProxyEnforcesUpstreamTimeout(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {
@@ -581,9 +566,6 @@ func TestProxyStreamingSurvivesUpstreamTimeout(t *testing.T) {
 	}
 }
 
-// Responses requests must reach the upstream conforming to the standard
-// protocol: xAI-only extensions are stripped while the rest of the body is
-// preserved, and the log keeps both sides for comparison.
 func TestProxySanitizesResponsesRequestToUpstream(t *testing.T) {
 	var upstreamBody map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -639,10 +621,6 @@ func TestProxySanitizesResponsesRequestToUpstream(t *testing.T) {
 	}
 }
 
-// End-to-end check with the exact request shape Grok Build sends and the
-// event stream its strict parser accepts: xAI-only request extensions are
-// stripped before the upstream sees them, and ping / unknown event types are
-// dropped from the reply instead of failing the whole client stream.
 func TestProxyGrokBuildResponsesEndToEnd(t *testing.T) {
 	var upstreamBody map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -669,8 +647,6 @@ func TestProxyGrokBuildResponsesEndToEnd(t *testing.T) {
 	cfg.Gateways["std"] = gateway
 	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client()}
 
-	// The xAI-flavored body: backend-only option, raw hosted tools, xAI-only
-	// include, reasoning history with reasoning_text content parts.
 	requestBody := `{"model":"some-model","stream":true,"stream_tool_calls":true,"store":false,` +
 		`"include":["reasoning.encrypted_content","no_inline_citations"],` +
 		`"tools":[{"type":"x_search","from_date":"2026-01-01"},{"type":"web_search","filters":{"excluded_domains":["a.example"]}},` +
@@ -685,12 +661,10 @@ func TestProxyGrokBuildResponsesEndToEnd(t *testing.T) {
 		t.Fatalf("unexpected status: %d %s", recorder.Code, recorder.Body.String())
 	}
 
-	// Request direction: standard vocabulary only.
 	if _, exists := upstreamBody["stream_tool_calls"]; exists {
 		t.Fatalf("stream_tool_calls reached upstream: %+v", upstreamBody)
 	}
-	// x_search is dropped; the excluded-domains web_search survives with its
-	// filter renamed to the standard blocked_domains.
+
 	tools := upstreamBody["tools"].([]any)
 	if len(tools) != 2 {
 		t.Fatalf("non-standard tools reached upstream: %+v", tools)
@@ -721,7 +695,6 @@ func TestProxyGrokBuildResponsesEndToEnd(t *testing.T) {
 		t.Fatalf("reasoning input item was not preserved: %+v", reasoning)
 	}
 
-	// Response direction: client-parseable events only.
 	client := recorder.Body.String()
 	for _, forbidden := range []string{"ping", "apply_patch"} {
 		if strings.Contains(client, forbidden) {
@@ -735,9 +708,6 @@ func TestProxyGrokBuildResponsesEndToEnd(t *testing.T) {
 	}
 }
 
-// DeepSeek 网关全链路：grok build 形状的请求清洗为 DeepSeek 接受的标准
-// Responses 请求（include 移除、reasoning 明文 content 保留回传），上游
-// 事件流无 data: [DONE] 时客户端按 EOF 完整收尾。
 func TestProxyDeepSeekResponsesEndToEnd(t *testing.T) {
 	var upstreamBody map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -800,7 +770,6 @@ func TestProxyDeepSeekResponsesEndToEnd(t *testing.T) {
 	}
 }
 
-// Base URL 留空的网关在请求时必须返回明确的 503，而不是模糊的上游错误。
 func TestProxyUnconfiguredBaseURLReturns503(t *testing.T) {
 	st, err := store.OpenStore(t.TempDir() + "/proxy.db")
 	if err != nil {
@@ -819,9 +788,6 @@ func TestProxyUnconfiguredBaseURLReturns503(t *testing.T) {
 	}
 }
 
-// End-to-end proof that a gateway's configured ForwardHeaders reaches the
-// upstream: the units in headers_test.go only cover copyForwardHeaders, not
-// that buildUpstreamRequest actually feeds the configured list into it.
 func TestProxyForwardsConfiguredGrokHeaders(t *testing.T) {
 	var gotDoomLoop, gotUserID, gotAuth string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -862,7 +828,6 @@ func TestProxyForwardsConfiguredGrokHeaders(t *testing.T) {
 	}
 }
 
-// Without configuration the same request must leak nothing to the upstream.
 func TestProxyDropsGrokHeadersWithoutConfiguration(t *testing.T) {
 	var gotDoomLoop, gotConvID string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -894,10 +859,6 @@ func TestProxyDropsGrokHeadersWithoutConfiguration(t *testing.T) {
 	}
 }
 
-// An upstream that hangs up mid-stream answered 200 but never delivered a
-// complete response, so it must not be logged as a success: the dashboard's
-// success rate and token totals would otherwise count half an answer as a
-// whole one.
 func TestProxyRecordsMidStreamFailureAsFailure(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -906,7 +867,7 @@ func TestProxyRecordsMidStreamFailureAsFailure(t *testing.T) {
 			return
 		}
 		w.(http.Flusher).Flush()
-		// Hang up mid-stream instead of terminating the event stream.
+
 		conn, _, err := w.(http.Hijacker).Hijack()
 		if err != nil {
 			return
@@ -942,10 +903,6 @@ func TestProxyRecordsMidStreamFailureAsFailure(t *testing.T) {
 	}
 }
 
-// config documents body_capture_limit_kb: 0 as "capture everything", so it
-// must not silently fall back to the default cap. It is still bounded by
-// maxBodyBytes — an opt-out must not become an unbounded write to
-// SQLite — but a 300KB body sits far below that ceiling and is stored whole.
 func TestProxyCaptureLimitZeroDisablesTruncation(t *testing.T) {
 	body := []byte(`{"id":"ok","choices":[{"text":"` + strings.Repeat("x", 300*1024) + `"}]}`)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1114,9 +1071,6 @@ func TestResponseBodyLimitZeroFallsBackToSafetyCeiling(t *testing.T) {
 	}
 }
 
-// capBody is the shared truncation helper for the request, upstream and error
-// bodies; a zero limit has to mean "keep everything" at this level too, with
-// the ceiling applied by the caller.
 func TestCapBodyHonoursLimit(t *testing.T) {
 	body := []byte(strings.Repeat("z", 4096))
 	if got := capBody(body, 0); len(got) != len(body) {
@@ -1130,13 +1084,9 @@ func TestCapBodyHonoursLimit(t *testing.T) {
 	}
 }
 
-// Routing must pick the most specific prefix, not whichever gateway the map
-// happens to yield first. Prefixes are not required to be disjoint, and Go
-// randomizes map iteration order, so a first-match-wins scan would route the
-// same path to different gateways across restarts.
 func TestRoutePrefersLongestPrefix(t *testing.T) {
 	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
-	// Deliberately overlapping prefixes: /std is nested inside /s.
+
 	cfg.Gateways = map[string]config.GatewayConfig{
 		"s":   {ID: "s", Prefix: "/s", Protocol: config.ProtocolChat, Enabled: true},
 		"std": {ID: "std", Prefix: "/std", Protocol: config.ProtocolResponses, Enabled: true},
@@ -1152,12 +1102,11 @@ func TestRoutePrefersLongestPrefix(t *testing.T) {
 		{path: "/std/chat/completions", gateway: "std", subpath: "/chat/completions", resolved: true},
 		{path: "/std", gateway: "std", subpath: "", resolved: true},
 		{path: "/s/chat/completions", gateway: "s", subpath: "/chat/completions", resolved: true},
-		// Path-component aware: /static must not match /s.
+
 		{path: "/static/app.js", resolved: false},
 		{path: "/status", resolved: false},
 	}
-	// Repeat because the failure mode is order-dependent and only shows up
-	// for some map iteration orders.
+
 	for attempt := 0; attempt < 50; attempt++ {
 		for _, test := range tests {
 			gateway, subpath, ok := p.Config.MatchGateway(test.path)
@@ -1175,9 +1124,6 @@ func TestRoutePrefersLongestPrefix(t *testing.T) {
 	}
 }
 
-// A request body that cannot be read must leave the same audit trail as the
-// other error paths: a row with only a bare 400 status and an empty error
-// field gives nothing to debug from.
 func TestReadRequestBodyRecordsFailureInLogEntry(t *testing.T) {
 	p := &Proxy{Logger: slog.Default()}
 	failing := &failingBody{}
@@ -1205,9 +1151,6 @@ func (failingBody) Read([]byte) (int, error) {
 	return 0, fmt.Errorf("simulated read failure")
 }
 
-// A body declared larger than the cap is refused without reading it: the old
-// code buffered maxBodyBytes+1 first and only then decided, so the size
-// that should have been free to reject cost the full ceiling in memory.
 func TestRequestBodyRejectedFromDeclaredLengthAlone(t *testing.T) {
 	p := &Proxy{Logger: slog.Default()}
 	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/ds/responses", strings.NewReader(`{}`))
@@ -1224,17 +1167,12 @@ func TestRequestBodyRejectedFromDeclaredLengthAlone(t *testing.T) {
 	if recorder.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("client status = %d, want %d", recorder.Code, http.StatusRequestEntityTooLarge)
 	}
-	// The body was never consumed, so a client that lied about its length
-	// still has the bytes in flight — but the declared case costs nothing.
+
 	if logEntry.RequestBody != nil {
 		t.Fatalf("a rejected body was still captured: %q", logEntry.RequestBody)
 	}
 }
 
-// grok-build's x-grok-* internal headers must be translated to the standard
-// external equivalents any OpenAI-compatible upstream understands. Raw
-// x-grok-* are never leaked; only the translated standards reach the
-// upstream, and existing standards are preserved.
 func TestProxyTranslatesGrokHeadersToStandard(t *testing.T) {
 	var gotClientReq, gotSessionLower, gotSessionUpper, gotReqID, gotCorr, gotUA, gotAccept string
 	var gotGrokConv, gotGrokReq string
@@ -1281,13 +1219,11 @@ func TestProxyTranslatesGrokHeadersToStandard(t *testing.T) {
 	if gotSessionLower != "sess-123" {
 		t.Fatalf("session_id not translated: %q", gotSessionLower)
 	}
-	// The OpenAI dialect is the default, so the OpenRouter spelling stays off
-	// the wire.
+
 	if gotSessionUpper != "" {
 		t.Fatalf("X-Session-Id sent under the OpenAI dialect: %q", gotSessionUpper)
 	}
-	// The upstream is told the audit row's id, which is also what the console
-	// shows in X-Request-Id — the two sides of one request agree.
+
 	if want := rec.Header().Get("X-Request-Id"); gotReqID != want {
 		t.Fatalf("X-Request-Id = %q, want the audit id %q", gotReqID, want)
 	}
@@ -1358,7 +1294,7 @@ func TestProxyInjectsPromptCacheKeyFromGrokHeader(t *testing.T) {
 	if upstreamBody["prompt_cache_key"] != "sess-cache-123" {
 		t.Fatalf("prompt_cache_key not injected: %+v", upstreamBody)
 	}
-	// Ensure the audit log also sees the injected body.
+
 	logs, err := st.List(context.Background(), store.LogFilter{Limit: 1})
 	if err != nil || len(logs) != 1 {
 		t.Fatalf("expected one log, got %d", len(logs))
@@ -1421,7 +1357,7 @@ func TestProxyEnsuresStandardDefaults(t *testing.T) {
 	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
 	gateway := cfg.Gateways["std"]
 	gateway.BaseURL = upstream.URL
-	// Restrictive allowlist that omits auth — translation must still ensure it.
+
 	gateway.ForwardHeaders = []string{"Accept"}
 	cfg.Gateways["std"] = gateway
 	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: upstream.Client()}
@@ -1429,7 +1365,7 @@ func TestProxyEnsuresStandardDefaults(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/std/responses", strings.NewReader(`{"model":"m","input":"hi"}`))
 	req.Header.Set("Authorization", "Bearer secret")
 	req.Header.Set("X-Api-Key", "key-123")
-	// No User-Agent or Accept sent.
+
 	p.ServeHTTP(httptest.NewRecorder(), req)
 
 	if gotUA == "" {
@@ -1445,3 +1381,53 @@ func TestProxyEnsuresStandardDefaults(t *testing.T) {
 		t.Fatalf("X-Api-Key not ensured: %q", gotAPIKey)
 	}
 }
+
+func TestProxyOpenCodeBaseURLInjectsSessionHeader(t *testing.T) {
+	var gotOpenCodeSession string
+	var gotUA string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotOpenCodeSession = r.Header.Get("x-opencode-session")
+		gotUA = r.Header.Get("User-Agent")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","object":"response","model":"m","status":"completed","output":[]}`))
+	}))
+	defer upstream.Close()
+
+	st, err := store.OpenStore(t.TempDir() + "/proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	cfg := config.DefaultConfig(t.TempDir() + "/config.json")
+	gateway := cfg.Gateways["std"]
+	gateway.BaseURL = "http://opencode.ai/v1"
+	cfg.Gateways["std"] = gateway
+
+	customClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return net.Dial(network, upstream.Listener.Addr().String())
+			},
+		},
+	}
+
+	p := &Proxy{Config: cfg, Store: st, Logger: slog.Default(), Client: customClient}
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/std/responses", strings.NewReader(`{"model":"m","input":"hi"}`))
+	req.Header.Set("X-Grok-Conv-Id", "conv-grok-stable-1")
+	req.Header.Set("User-Agent", "grok-pager/1.0.13 grok-shell/1.0.13 (windows; x86_64)")
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if gotOpenCodeSession != "conv-grok-stable-1" {
+		t.Fatalf("x-opencode-session = %q, want %q", gotOpenCodeSession, "conv-grok-stable-1")
+	}
+	if gotUA != "grok-pager/1.0.13 grok-shell/1.0.13 (windows; x86_64)" {
+		t.Fatalf("User-Agent = %q, want grok UA preserved", gotUA)
+	}
+}
+

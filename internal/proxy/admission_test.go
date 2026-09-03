@@ -15,8 +15,6 @@ import (
 	"grok-gateway-proxy/internal/store"
 )
 
-// The budget is only worth having if the bytes come back: a reservation that
-// leaked would throttle the process to a stop one request at a time.
 func TestBodyAdmissionChargesAndReturns(t *testing.T) {
 	budget := newBodyAdmission(10)
 	if err := budget.reserve(context.Background(), 6); err != nil {
@@ -31,8 +29,6 @@ func TestBodyAdmissionChargesAndReturns(t *testing.T) {
 	}
 }
 
-// A request that arrives while the pool is empty is queued, not refused: the
-// whole point of waiting is that the bytes are on their way back.
 func TestBodyAdmissionWakesWhenBytesComeBack(t *testing.T) {
 	budget := newBodyAdmission(10)
 	if err := budget.reserve(context.Background(), 10); err != nil {
@@ -57,15 +53,12 @@ func TestBodyAdmissionWakesWhenBytesComeBack(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("a release did not wake a queued reservation")
 	}
-	// 8 of the 10 are held: the first caller gave back 6 and the queued one
-	// took 4 of those. What must not happen is the release going unclaimed.
+
 	if free := heldFree(budget); free != 2 {
 		t.Fatalf("free = %d, want 2 of a 10-byte budget", free)
 	}
 }
 
-// The wait must end when the client hangs up, or a queue of disconnected
-// requests would hold the budget open for callers that are already gone.
 func TestBodyAdmissionGivesUpWhenTheCallerLeaves(t *testing.T) {
 	budget := newBodyAdmission(4)
 	if err := budget.reserve(context.Background(), 4); err != nil {
@@ -75,7 +68,6 @@ func TestBodyAdmissionGivesUpWhenTheCallerLeaves(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- budget.reserve(ctx, 1) }()
 
-	// Cancelled after the goroutine is queued: cancel is what must wake it.
 	time.AfterFunc(30*time.Millisecond, cancel)
 	select {
 	case err := <-done:
@@ -87,8 +79,6 @@ func TestBodyAdmissionGivesUpWhenTheCallerLeaves(t *testing.T) {
 	}
 }
 
-// A Proxy assembled as a struct literal has no budget, and that must mean "no
-// gate here" rather than a nil-pointer panic on the request path.
 func TestBodyAdmissionNilAdmitsEverything(t *testing.T) {
 	var budget *bodyAdmission
 	if err := budget.reserve(context.Background(), maxBodyBytes); err != nil {
@@ -97,10 +87,6 @@ func TestBodyAdmissionNilAdmitsEverything(t *testing.T) {
 	budget.release(maxBodyBytes)
 }
 
-// The charge is what makes the bound mean anything: a declared length is
-// charged as itself because the read will not exceed it, and an undeclared one
-// (chunked, or no Content-Length) is charged the cap because the unknown must
-// not be the case that gets in cheapest.
 func TestChargeForBody(t *testing.T) {
 	for _, test := range []struct {
 		name     string
@@ -111,8 +97,7 @@ func TestChargeForBody(t *testing.T) {
 		{"empty body", 0, maxBodyBytes},
 		{"ordinary prompt", 40 << 10, 40 << 10},
 		{"at the cap", maxBodyBytes, maxBodyBytes},
-		// A lie about size cannot buy a cheaper reservation than the cap the
-		// read enforces anyway.
+
 		{"over the cap", maxBodyBytes * 3, maxBodyBytes},
 	} {
 		if got := chargeForBody(test.declared); got != test.want {
@@ -121,9 +106,6 @@ func TestChargeForBody(t *testing.T) {
 	}
 }
 
-// An admission failure has to reach the client as a 503 and the audit log as a
-// recorded failure, without a byte of the body read and without an upstream
-// call — the request never got that far.
 func TestServeHTTPRefusesWhenTheBodyBudgetIsGone(t *testing.T) {
 	st, err := store.OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
 	if err != nil {
@@ -132,9 +114,7 @@ func TestServeHTTPRefusesWhenTheBodyBudgetIsGone(t *testing.T) {
 	defer st.Close()
 
 	called := false
-	// HTTPS because that is all config accepts for a built-in gateway. Nothing
-	// dials it: the request must be refused before routing, and the server's
-	// only job is to say whether that happened.
+
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
 	defer upstream.Close()
 
@@ -143,8 +123,7 @@ func TestServeHTTPRefusesWhenTheBodyBudgetIsGone(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := NewProxy(cfg, st, slog.Default())
-	// Everything reserved: the next caller has nowhere to go, and a cancelled
-	// context stands in for the 30-second queue without the test waiting it out.
+
 	if err := p.bodies.reserve(context.Background(), inFlightBodyBudget); err != nil {
 		t.Fatal(err)
 	}
@@ -177,8 +156,6 @@ func TestServeHTTPRefusesWhenTheBodyBudgetIsGone(t *testing.T) {
 	}
 }
 
-// heldFree reads the remaining budget the way the semaphore itself would: the
-// accounting is only meaningful under the lock that guards it.
 func heldFree(b *bodyAdmission) int64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()

@@ -28,6 +28,9 @@ func (DeepSeekResponsesAdapter) TransformSSE(reader io.Reader) io.Reader {
 	return newResponsesSSEFilter(reader)
 }
 
+// adaptResponsesRequestForDeepSeek 做 DeepSeek 方言对齐：移除 include、
+// 清理 reasoning 的 summary/encrypted_content、minimal effort 降级为 low。
+// 增量字节编辑，保留客户端正文的键序与字面量（同 sanitizeResponsesRequest）。
 func adaptResponsesRequestForDeepSeek(body []byte) ([]byte, error) {
 	hasInclude := bytes.Contains(body, []byte(`"include"`))
 	hasReasoning := bytes.Contains(body, []byte(`"reasoning"`))
@@ -38,31 +41,29 @@ func adaptResponsesRequestForDeepSeek(body []byte) ([]byte, error) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return body, nil
 	}
-	changed := false
+	var edits []topLevelMemberEdit
 	if hasInclude {
 		if _, ok := payload["include"]; ok {
-			delete(payload, "include")
-			changed = true
+			edits = append(edits, topLevelMemberEdit{key: "include", delete: true})
 		}
 	}
 	if hasReasoning {
 		if raw, ok := payload["reasoning"]; ok {
 			if mapped, effortChanged := mapDeepSeekReasoningEffort(raw); effortChanged {
-				payload["reasoning"] = mapped
-				changed = true
+				edits = append(edits, topLevelMemberEdit{key: "reasoning", value: mapped})
 			}
 		}
 		if raw, ok := payload["input"]; ok {
 			if cleaned, inputChanged := stripUnsupportedReasoningFields(raw); inputChanged {
-				payload["input"] = cleaned
-				changed = true
+				edits = append(edits, topLevelMemberEdit{key: "input", value: cleaned})
 			}
 		}
 	}
+	out, changed := applyTopLevelMemberEdits(body, edits)
 	if !changed {
 		return body, nil
 	}
-	return marshalJSONNoEscape(payload)
+	return out, nil
 }
 
 var deepSeekEffortClamps = map[string]string{

@@ -7,9 +7,6 @@ import (
 	"testing"
 )
 
-// BenchmarkSSEPassThrough measures the cost of streaming a typical SSE
-// response through the transformer with no per-line transform (Responses
-// event filtering: ping and unknown-type event dropping).
 func BenchmarkSSEPassThrough(b *testing.B) {
 	stream := buildBenchmarkSSEStream(200, false)
 	b.SetBytes(int64(len(stream)))
@@ -21,8 +18,6 @@ func BenchmarkSSEPassThrough(b *testing.B) {
 	}
 }
 
-// BenchmarkSSEWithTransform measures the cost of streaming with a per-line
-// transform (Responses mode: reasoning event renaming + ping filtering).
 func BenchmarkSSEWithTransform(b *testing.B) {
 	stream := buildBenchmarkSSEStream(200, true)
 	b.SetBytes(int64(len(stream)))
@@ -34,9 +29,6 @@ func BenchmarkSSEWithTransform(b *testing.B) {
 	}
 }
 
-// BenchmarkSSESenseNovaTransform measures the cost of the SenseNova per-line
-// JSON rewrite (tool_calls type conversion + field stripping) on a chunk that
-// needs nothing from it: the pre-filters have to reject it without a parse.
 func BenchmarkSSESenseNovaTransform(b *testing.B) {
 	line := []byte(`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}]}` + "\n")
 	b.SetBytes(int64(len(line)))
@@ -47,9 +39,6 @@ func BenchmarkSSESenseNovaTransform(b *testing.B) {
 	}
 }
 
-// BenchmarkSSESenseNovaContinuation is the same line as it arrives after the
-// first chunk of a tool call: the echoed identity is empty, so this is the case
-// that really edits the payload rather than scanning past it.
 func BenchmarkSSESenseNovaContinuation(b *testing.B) {
 	line := []byte(`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","type":"function","function":{"name":"","arguments":"x"}}]},"finish_reason":""}]}` + "\n")
 	b.SetBytes(int64(len(line)))
@@ -76,8 +65,6 @@ func buildBenchmarkSSEStream(events int, includeReasoning bool) []byte {
 	return buf.Bytes()
 }
 
-// Verify that ping filtering actually reduces output size so the benchmark
-// is measuring real work.
 func TestSSEPingFilteringRemovesPings(t *testing.T) {
 	stream := []byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"a\"}\n\n" +
 		"data: ping\n\n" +
@@ -96,7 +83,6 @@ func TestSSEPingFilteringRemovesPings(t *testing.T) {
 	}
 }
 
-// Verify that the legacy reasoning rename works on a full stream.
 func TestSSEReasoningRenameEndToEnd(t *testing.T) {
 	stream := []byte("event: response.reasoning.delta\ndata: {\"type\":\"response.reasoning.delta\",\"delta\":\"x\"}\n\n")
 	r := newResponsesSSEFilter(bytes.NewReader(stream))

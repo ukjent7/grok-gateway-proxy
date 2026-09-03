@@ -39,12 +39,6 @@ func ExtractUsage(body []byte, protocol config.Protocol) store.UsageMetrics {
 	return last
 }
 
-// maxUsageTailBytes caps the fragment held between observe() calls while
-// waiting for a newline. It is deliberately independent of maxBodyBytes
-// (32 MiB) and the per-column capture limit (256 KiB): it guards the
-// streaming line splitter, not audit storage. A single SSE data line larger
-// than 4 MiB cannot be a usage event (usage JSON is < 2 KiB); holding more
-// would pin arbitrary upstream payload. Must stay < maxBodyBytes.
 const maxUsageTailBytes = 4 << 20
 
 type usageTracker struct {
@@ -58,7 +52,6 @@ func newUsageTracker(protocol config.Protocol) *usageTracker {
 	return &usageTracker{protocol: protocol}
 }
 
-// observe feeds the next chunk of stream bytes, splitting it into lines.
 func (t *usageTracker) observe(chunk []byte) {
 	buf := chunk
 	if len(t.tail) > 0 {
@@ -79,16 +72,11 @@ func (t *usageTracker) observe(chunk []byte) {
 	}
 	remaining := buf[consumed:]
 	if len(remaining) > maxUsageTailBytes {
-		// A fragment this far past the cap has no newline in sight, so drop
-		// it and skip to the end of the line it belongs to. A single frame
-		// that large cannot carry a usage object anyone can act on, and
-		// skipping only that line leaves the rest of the stream metered —
-		// bailing out for good would silently zero an otherwise fine request.
+
 		remaining = nil
 		t.skipping = true
 	}
-	// Carry the trailing fragment. buf may alias t.tail here; append writes
-	// forward through copy, which tolerates the overlap.
+
 	t.tail = append(t.tail[:0], remaining...)
 }
 
@@ -110,8 +98,6 @@ func (t *usageTracker) observeLine(line []byte) {
 	}
 }
 
-// usage returns the metrics of the last usage-bearing event seen, the same
-// "terminal event wins" rule ExtractUsage applies to buffered bodies.
 func (t *usageTracker) usage() store.UsageMetrics { return t.last }
 
 func extractUsageFromRoot(root map[string]any, protocol config.Protocol) store.UsageMetrics {
@@ -137,9 +123,12 @@ func extractUsageFromRoot(root map[string]any, protocol config.Protocol) store.U
 		result.ReasoningTokens = firstNestedNumber(usage, "completion_tokens_details", "reasoning_tokens")
 	}
 
-	if protocol == config.ProtocolChat {
+	switch protocol {
+	case config.ProtocolChat, config.ProtocolOpenAICompatible:
 		result = extractChatUsage(usage, result)
-	} else {
+	case config.ProtocolAnthropic:
+		result = extractAnthropicUsage(usage, result)
+	default:
 		result = extractResponsesUsage(usage, result)
 	}
 	result.PromptTokens = result.InputTokens + result.CacheReadTokens + result.CacheWriteTokens
@@ -185,6 +174,26 @@ func extractChatUsage(usage map[string]any, result store.UsageMetrics) store.Usa
 	return result
 }
 
+func extractAnthropicUsage(usage map[string]any, result store.UsageMetrics) store.UsageMetrics {
+	total, totalOK := firstNumberOK(usage, "input_tokens", "prompt_tokens")
+	hit, hitOK := firstNumberOK(usage, "cache_read_input_tokens", "cache_read_tokens", "cached_tokens")
+	write, writeOK := firstNumberOK(usage, "cache_creation_input_tokens", "cache_write_tokens")
+	if totalOK {
+		result.InputTokens = total
+	}
+	if hitOK {
+		result.CacheReadTokens = hit
+	}
+	if writeOK {
+		result.CacheWriteTokens = write
+	}
+	if totalOK && (hitOK || writeOK) {
+		result.CacheSupported = true
+		result.CacheSource = "anthropic.input_tokens"
+	}
+	return result
+}
+
 func extractResponsesUsage(usage map[string]any, result store.UsageMetrics) store.UsageMetrics {
 	total, totalOK := firstNumberOK(usage, "input_tokens", "prompt_tokens")
 	hit, hitOK := firstNumberOK(usage, "cache_read_input_tokens", "cache_read_tokens")
@@ -214,16 +223,11 @@ func extractResponsesUsage(usage map[string]any, result store.UsageMetrics) stor
 	return result
 }
 
-// firstNumber returns the first numeric value found under the given keys, or
-// zero when none of them carries one.
 func firstNumber(m map[string]any, keys ...string) int64 {
 	n, _ := firstNumberOK(m, keys...)
 	return n
 }
 
-// firstNumberOK returns the first present numeric value and whether it was
-// found. It accepts float64 (the default json numbers), json.Number, int and
-// int64 so callers do not need to handle type switches themselves.
 func firstNumberOK(m map[string]any, keys ...string) (int64, bool) {
 	for _, key := range keys {
 		value, ok := m[key]
@@ -234,8 +238,7 @@ func firstNumberOK(m map[string]any, keys ...string) (int64, bool) {
 		case float64:
 			return int64(n), true
 		case json.Number:
-			// A fractional or out-of-range json.Number is skipped rather than
-			// truncated, so the search falls through to the next candidate key.
+
 			if parsed, err := n.Int64(); err == nil {
 				return parsed, true
 			}

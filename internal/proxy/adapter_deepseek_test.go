@@ -7,7 +7,6 @@ import (
 	"testing"
 )
 
-// DeepSeek 不支持任何 include 值（reasoning 恒以明文返回），整个字段移除。
 func TestDeepSeekDropsIncludeEntirely(t *testing.T) {
 	body := []byte(`{"model":"deepseek-v4-flash","include":["reasoning.encrypted_content"],"input":"hi"}`)
 	out, err := DeepSeekResponsesAdapter{}.TransformRequestBody(body)
@@ -22,9 +21,6 @@ func TestDeepSeekDropsIncludeEntirely(t *testing.T) {
 	}
 }
 
-// reasoning 输入项：明文 content（reasoning_content 的载体）必须保留——
-// 带 tools 的请求要求完整回传思维链，否则 DeepSeek 返回 400；
-// summary 与 encrypted_content 不受支持，剔除。
 func TestDeepSeekKeepsReasoningContentButStripsUnsupportedFields(t *testing.T) {
 	body := []byte(`{"input":[` +
 		`{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"sum"}],"content":[{"type":"reasoning_text","text":"chain of thought"}],"encrypted_content":"gAAAA"},` +
@@ -55,9 +51,6 @@ func TestDeepSeekKeepsReasoningContentButStripsUnsupportedFields(t *testing.T) {
 	}
 }
 
-// reasoning.effort 由 DeepSeek 自行映射：其文档映射表覆盖的取值
-// （none/low/medium/high/xhigh/max）逐字节原样透传；DeepSeek 未定义的
-// minimal 收敛为它支持的最低档 low，而不是丢给上游一个没有定义的拼写。
 func TestDeepSeekPassesKnownEffortsAndClampsUnknownTier(t *testing.T) {
 	for _, effort := range []string{"none", "low", "medium", "high", "xhigh", "max"} {
 		body := []byte(`{"model":"deepseek-v4-pro","reasoning":{"effort":"` + effort + `"},"input":"hi"}`)
@@ -79,8 +72,6 @@ func TestDeepSeekPassesKnownEffortsAndClampsUnknownTier(t *testing.T) {
 		t.Fatalf("minimal was not clamped to low: %s", out)
 	}
 
-	// The clamp is a table, not a fallback: a value neither spec defines is
-	// left for the upstream to judge, exactly as an unmapped but known tier is.
 	unknown := []byte(`{"model":"deepseek-v4-pro","reasoning":{"effort":"ultra"},"input":"hi"}`)
 	out, err = DeepSeekResponsesAdapter{}.TransformRequestBody(unknown)
 	if err != nil {
@@ -91,9 +82,6 @@ func TestDeepSeekPassesKnownEffortsAndClampsUnknownTier(t *testing.T) {
 	}
 }
 
-// 共享的标准净化在 DeepSeek 网关同样生效：stream_tool_calls、x_search 一并
-// 剔除，web_search 的 excluded_domains 重命名为 blocked_domains；无违规字段
-// 的请求逐字节透传。
 func TestDeepSeekAppliesStandardSanitization(t *testing.T) {
 	adapter := DeepSeekResponsesAdapter{}
 	body := []byte(`{"model":"deepseek-v4-flash","stream_tool_calls":true,` +
@@ -121,8 +109,6 @@ func TestDeepSeekAppliesStandardSanitization(t *testing.T) {
 	}
 }
 
-// DeepSeek 的事件名全部落在客户端词汇表内（含 custom_tool_call_input.delta、
-// web_search_call 状态事件），流末尾没有 data: [DONE]——按 EOF 收尾，原样保留。
 func TestDeepSeekSSEPassesKnownEventsWithoutDONE(t *testing.T) {
 	adapter := DeepSeekResponsesAdapter{}
 	input := "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r1\",\"object\":\"response\",\"created_at\":1,\"status\":\"in_progress\",\"model\":\"m\",\"output\":[]}}\n\n" +

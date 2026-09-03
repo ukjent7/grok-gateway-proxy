@@ -10,14 +10,11 @@ import (
 	"grok-gateway-proxy/internal/config"
 )
 
-// Dropping an event must not swallow the blank line that terminates a *kept*
-// event. Without that terminator the client never dispatches the kept event,
-// so a dropped ping silently takes the next real event down with it.
 func TestResponsesFilterKeepsTerminatorAfterDroppedEvent(t *testing.T) {
 	for _, input := range []string{
-		// Dropped data line followed by a kept one in the same event block.
+
 		"data: ping\ndata: {\"type\":\"response.completed\"}\n\n",
-		// Dropped event, then a kept event introduced by its own event: line.
+
 		"data: ping\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
 	} {
 		out, err := io.ReadAll(newResponsesSSEFilter(strings.NewReader(input)))
@@ -33,8 +30,6 @@ func TestResponsesFilterKeepsTerminatorAfterDroppedEvent(t *testing.T) {
 	}
 }
 
-// The sanitizer must return conformant bodies byte-for-byte so standard
-// clients pay no rewrite cost and logged request bytes stay comparable.
 func TestSanitizeResponsesRequestNoopIsByteIdentical(t *testing.T) {
 	bodies := []string{
 		`{"model":"m","input":"hi"}`,
@@ -79,9 +74,6 @@ func TestSanitizeResponsesRequestDropsXSearchTool(t *testing.T) {
 	}
 }
 
-// The xAI `excluded_domains` filter is the standard `blocked_domains` under a
-// different name, so it is renamed rather than dropped: dropping the tool
-// would silently widen the caller's blocked-scope search to unbounded.
 func TestSanitizeResponsesRequestRenamesExcludedDomainsToBlocked(t *testing.T) {
 	out, err := sanitizeResponsesRequest([]byte(`{"tools":[{"type":"web_search","filters":{"excluded_domains":["evil.example"]}}]}`))
 	if err != nil {
@@ -98,8 +90,6 @@ func TestSanitizeResponsesRequestRenamesExcludedDomainsToBlocked(t *testing.T) {
 	}
 }
 
-// Renaming must not disturb the sibling `allowed_domains` filter or any other
-// field of the tool: the rewrite runs on raw JSON for exactly this reason.
 func TestSanitizeResponsesRequestRenamesExcludedDomainsKeepsAllowed(t *testing.T) {
 	out, err := sanitizeResponsesRequest([]byte(`{"tools":[{"type":"web_search","filters":{"allowed_domains":["docs.example"],"excluded_domains":["evil.example"]},"search_context_size":"low"}]}`))
 	if err != nil {
@@ -122,7 +112,6 @@ func TestSanitizeResponsesRequestRenamesExcludedDomainsKeepsAllowed(t *testing.T
 	}
 }
 
-// A body already using the standard spelling must pass through untouched.
 func TestSanitizeResponsesRequestKeepsBlockedDomainWebSearch(t *testing.T) {
 	body := `{"tools":[{"type":"web_search","filters":{"blocked_domains":["evil.example"]}}]}`
 	out, err := sanitizeResponsesRequest([]byte(body))
@@ -145,8 +134,6 @@ func TestSanitizeResponsesRequestKeepsAllowedDomainWebSearch(t *testing.T) {
 	}
 }
 
-// A bare web_search entry (no filters) is the common unbounded-search form
-// and must pass through untouched — and not panic on the absent filters.
 func TestSanitizeResponsesRequestKeepsBareWebSearch(t *testing.T) {
 	body := `{"tools":[{"type":"web_search"},{"type":"x_search"}]}`
 	out, err := sanitizeResponsesRequest([]byte(body))
@@ -174,17 +161,6 @@ func TestSanitizeResponsesRequestStripsNonStandardInclude(t *testing.T) {
 	}
 }
 
-// Unparseable non-JSON payloads pass through, because `ping` and `[DONE]` are
-// SSE protocol elements the client's decoder handles before any typed parsing.
-//
-// Everything the client cannot deserialize is dropped: a JSON object with no
-// or unknown `type`, a malformed object, and valid JSON that is not an object.
-// async-openai's ResponseStreamEvent is a `#[serde(tag = "type")]` enum with
-// no untagged or catch-all variant, so all of those fail the stream exactly
-// like an unknown type does.
-//
-// Events in responsesClientInterceptedEventTypes are not unknown: grok-build
-// consumes them through raw-JSON hooks ahead of typed deserialization.
 func TestUnknownResponsesEventPayloadClassification(t *testing.T) {
 	cases := []struct {
 		payload string
@@ -195,16 +171,13 @@ func TestUnknownResponsesEventPayloadClassification(t *testing.T) {
 		{`{"type":"response.doom_loop_check","doom_loop_check":{}}`, false},
 		{`{"delta":"no type field"}`, true},
 		{`{}`, true},
-		// A malformed object cannot be deserialized by the client either, so
-		// forwarding it would fail the entire stream where dropping keeps it
-		// alive.
+
 		{`{"type":"response.created`, true},
 		{`not json`, false},
-		// Valid JSON that is not an object fails the tagged-enum
-		// deserialization just like an unknown type does.
+
 		{`[1,2]`, true},
 		{`null`, true},
-		// SSE protocol elements must keep passing through.
+
 		{`ping`, false},
 		{`[DONE]`, false},
 	}
@@ -215,10 +188,6 @@ func TestUnknownResponsesEventPayloadClassification(t *testing.T) {
 	}
 }
 
-// The doom-loop check frame must survive the whole filter, `event:` line
-// included: grok-build's is_check_event matches either the `event:` name or
-// the payload `type`, and the filter buffers the `event:` line separately
-// from the `data:` line that decides whether the frame is dropped.
 func TestResponsesSSEFilterForwardsDoomLoopCheckEvent(t *testing.T) {
 	stream := "event: response.doom_loop_check\n" +
 		`data: {"type":"response.doom_loop_check","doom_loop_check":{"triggers":["tail_repetition:4@response"]}}` + "\n\n" +
@@ -241,9 +210,6 @@ func TestResponsesSSEFilterForwardsDoomLoopCheckEvent(t *testing.T) {
 	}
 }
 
-// Rewriting a body must not HTML-escape it: `<`, `>` and `&` are everywhere in
-// source code, and escaping them triples those bytes while making the logged
-// upstream body diverge from what the client sent.
 func TestSanitizeResponsesRequestDoesNotHTMLEscape(t *testing.T) {
 	body := []byte(`{"model":"m","input":"if (a < b && c > d) { f(&x); }","include":["no_inline_citations"]}`)
 	out, err := sanitizeResponsesRequest(body)
@@ -258,13 +224,12 @@ func TestSanitizeResponsesRequestDoesNotHTMLEscape(t *testing.T) {
 	if !strings.Contains(string(out), "a < b && c > d") {
 		t.Fatalf("source-code characters were mangled: %s", out)
 	}
-	// The rewrite still has to happen.
+
 	if strings.Contains(string(out), "no_inline_citations") {
 		t.Fatalf("non-standard include survived: %s", out)
 	}
 }
 
-// Same guarantee for the DeepSeek cleanups, which rewrite `input` items.
 func TestDeepSeekAdaptationDoesNotHTMLEscape(t *testing.T) {
 	body := []byte(`{"model":"m","input":[{"type":"reasoning","content":"a<b && c>d","summary":[{"type":"summary_text","text":"s"}]}],"include":["no_inline_citations"]}`)
 	out, err := adaptResponsesRequestForDeepSeek([]byte(sanitizeIgnoreError(t, body)))
@@ -291,10 +256,6 @@ func sanitizeIgnoreError(t *testing.T, body []byte) string {
 	return string(out)
 }
 
-// The fast-path markers must match member names only. An unquoted
-// "stream_tool_calls" search also matches the same text inside a value — a
-// user message asking about the option — which would parse and reserialize a
-// body that needs no changes at all.
 func TestSanitizeResponsesRequestFastPathIgnoresMarkerInsideValue(t *testing.T) {
 	body := []byte(`{"model":"deepseek-chat","input":"what does stream_tool_calls do?"}`)
 	got, err := sanitizeResponsesRequest(body)
@@ -314,8 +275,6 @@ func TestSanitizeResponsesRequestFastPathIgnoresMarkerInsideValue(t *testing.T) 
 	}
 }
 
-// A real stream_tool_calls member must still be stripped, whatever its
-// position or the surrounding formatting.
 func TestSanitizeResponsesRequestStripsStreamToolCallsWhenSpaced(t *testing.T) {
 	body := []byte(`{"model": "deepseek-chat", "stream_tool_calls" : true, "input": []}`)
 	got, err := sanitizeResponsesRequest(body)
@@ -327,10 +286,6 @@ func TestSanitizeResponsesRequestStripsStreamToolCallsWhenSpaced(t *testing.T) {
 	}
 }
 
-// A tool entry the probe cannot read is not evidence of a non-standard type.
-// Dropping it would delete a capability the caller declared — the exact
-// failure the excluded_domains rename above exists to avoid — so anything that
-// cannot be classified is forwarded and left for the upstream to judge.
 func TestSanitizeResponsesRequestKeepsToolEntriesItCannotParse(t *testing.T) {
 	for _, body := range []string{
 		`{"model":"m","tools":["web_search"]}`,
@@ -345,7 +300,6 @@ func TestSanitizeResponsesRequestKeepsToolEntriesItCannotParse(t *testing.T) {
 		}
 	}
 
-	// A type the vocabulary really does not list is still stripped.
 	got, err := sanitizeResponsesRequest([]byte(`{"model":"m","tools":[{"type":"x_search"},{"type":"function","name":"f"}]}`))
 	if err != nil {
 		t.Fatal(err)
@@ -358,10 +312,6 @@ func TestSanitizeResponsesRequestKeepsToolEntriesItCannotParse(t *testing.T) {
 	}
 }
 
-// What a stream's filter removed is attributed to that stream. Process-wide
-// counters could only report a total that any concurrent stream might have
-// moved, so two streams finishing near each other each logged the other's
-// drops.
 func TestSSEFilterStatsArePerStream(t *testing.T) {
 	stream := "data: ping\n\n" +
 		"event: response.reasoning.delta\ndata: {\"type\":\"response.reasoning.delta\",\"delta\":\"x\"}\n\n" +
@@ -396,13 +346,11 @@ func TestSSEFilterStatsArePerStream(t *testing.T) {
 	}
 }
 
-// Unknown event types are dropped as a two-line frame (event: + data:).
-// The following valid event must survive with its terminator intact.
 func TestSSETwoLineFramingDropsEventAndData(t *testing.T) {
 	stream := "" +
 		"event: response.created\ndata: {\"type\":\"response.created\"}\n\n" +
 		"event: response.unknown_foobar\ndata: {\"type\":\"response.unknown_foobar\",\"delta\":\"x\"}\n\n" +
-		"data: \n\n" + // empty data: line is also dropped
+		"data: \n\n" +
 		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n" +
 		"data: [DONE]\n\n"
 	out, err := io.ReadAll(newResponsesSSEFilter(strings.NewReader(stream)))
@@ -422,7 +370,7 @@ func TestSSETwoLineFramingDropsEventAndData(t *testing.T) {
 	if !strings.Contains(got, "[DONE]") {
 		t.Fatalf("[DONE] sentinel lost: %q", got)
 	}
-	// Ensure stats counted both unknown and empty as droppedUnknown (2)
+
 	reader := newResponsesSSEFilter(strings.NewReader(stream))
 	filter, ok := reader.(streamStatsReporter)
 	if !ok {
@@ -437,9 +385,6 @@ func TestSSETwoLineFramingDropsEventAndData(t *testing.T) {
 	}
 }
 
-// SessionAffinityOff must not emit any session header, verified via the
-// single-entry helper buildUpstreamHeaders which is the canonical header
-// construction path. Non-browser clients without Origin must pass sameOriginGuard.
 func TestBuildUpstreamHeadersSessionAffinityOff(t *testing.T) {
 	src := http.Header{}
 	src.Set("X-Grok-Session-Id", "sess-999")

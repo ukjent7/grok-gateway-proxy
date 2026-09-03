@@ -94,8 +94,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstreamCtx, cancel := p.upstreamContext(r, logEntry.Stream)
+	upstreamCtx, cancel, upstreamTimeout, timeoutOverridden := p.upstreamContext(r, logEntry.Stream)
 	defer cancel()
+	if timeoutOverridden {
+		// 客户端可覆盖上游超时；写入审计日志，否则排障时看不出本次请求为何超时阈值不同。
+		logEntry.UpstreamTimeoutMS = upstreamTimeout.Milliseconds()
+	}
 
 	upstreamRequest, err := p.buildUpstreamRequest(upstreamCtx, r, gateway, subpath, adapter, requestBody, bodyLimit, &logEntry)
 	if err != nil {
@@ -176,15 +180,16 @@ func (p *Proxy) populateLogGateway(logEntry *store.RequestLog, gateway config.Ga
 	}
 }
 
-func (p *Proxy) upstreamContext(r *http.Request, stream bool) (context.Context, context.CancelFunc) {
+func (p *Proxy) upstreamContext(r *http.Request, stream bool) (context.Context, context.CancelFunc, time.Duration, bool) {
 	if stream {
-		// Streaming requests cancel when client disconnects; header wait is bounded by ResponseHeaderTimeout.
-		return r.Context(), func() {}
+		// 流式响应无超时：一旦开始吐事件，超时会在事件间隙掐断长回复。
+		return r.Context(), func() {}, 0, false
 	}
-	return context.WithTimeout(r.Context(), p.upstreamTimeout(r))
+	t, overridden := p.upstreamTimeout(r)
+	ctx, cancel := context.WithTimeout(r.Context(), t)
+	return ctx, cancel, t, overridden
 }
 
-// resolveGateway maps the inbound path to a gateway + adapter and validates
 func (p *Proxy) resolveGateway(r *http.Request, body []byte) (config.GatewayConfig, string, GatewayAdapter, error) {
 	gateway, subpath, ok := p.Config.MatchGateway(r.URL.Path)
 	if !ok {
@@ -213,7 +218,12 @@ func (p *Proxy) buildUpstreamRequest(ctx context.Context, r *http.Request, gatew
 	if strings.TrimSpace(gateway.BaseURL) == "" {
 		return nil, &statusError{status: http.StatusServiceUnavailable, message: fmt.Sprintf("gateway %q has no base URL configured; set it in the console", gateway.ID)}
 	}
-	upstreamURL, err := joinUpstreamURL(gateway.BaseURL, subpath, r.URL.RawQuery)
+	upstreamPath := adapter.EndpointPath()
+
+	if upstreamPath == "" {
+		upstreamPath = subpath
+	}
+	upstreamURL, err := joinUpstreamURL(gateway.BaseURL, upstreamPath, r.URL.RawQuery)
 	if err != nil {
 		return nil, &statusError{status: http.StatusBadGateway, message: err.Error()}
 	}
@@ -345,7 +355,9 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 		logEntry.ResponseTruncated = rawResponse.truncated
 		if reporter, ok := responseReader.(streamStatsReporter); ok {
 			if stats := reporter.stats(); !stats.isZero() {
-				slog.Debug("sse filter stats", "request_id", logEntry.ID, "stats", stats.String())
+				// 丢弃统计用 Info 级别：未知事件被静默丢掉是最难排障的故障形态，
+				// 上游新增事件类型时必须能在默认日志级别看到计数。
+				slog.Info("sse filter stats", "request_id", logEntry.ID, "stats", stats.String())
 			}
 		}
 	} else {
@@ -379,25 +391,23 @@ func (p *Proxy) forwardUpstreamResponse(w http.ResponseWriter, logEntry *store.R
 	return copyErr
 }
 
-func (p *Proxy) upstreamTimeout(r *http.Request) time.Duration {
+func (p *Proxy) upstreamTimeout(r *http.Request) (time.Duration, bool) {
 	t := config.DefaultUpstreamTimeout
 	if p.Config != nil {
 		t = p.Config.GetUpstreamTimeout()
 	}
 	if v := r.Header.Get("X-Proxy-Timeout"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 && d <= maxUpstreamTimeout {
-			t = d
+			return d, true
 		}
 	}
-	return t
+	return t, false
 }
 
-// responseBodyLimit returns the effective per-column capture cap in bytes.
 func (p *Proxy) responseBodyLimit() int64 {
 	return resolveBodyLimit(p.ResponseBodySize, p.Config)
 }
 
-// resolveBodyLimit computes the effective body capture limit in bytes.
 func resolveBodyLimit(override int64, cfg *config.Config) int64 {
 	if override > 0 {
 		return override
@@ -455,19 +465,67 @@ func writeResponseStatusAndHeaders(w http.ResponseWriter, resp *http.Response) {
 }
 
 func joinUpstreamURL(base, path, rawQuery string) (string, error) {
-	parsed, err := url.Parse(strings.TrimRight(base, "/") + path)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+	baseTrim := strings.TrimRight(base, "/")
+	parsedBase, err := url.Parse(baseTrim)
+	if err != nil || parsedBase.Scheme == "" || parsedBase.Host == "" {
 		return "", fmt.Errorf("invalid upstream URL: %s", base)
 	}
-	parsed.RawQuery = rawQuery
-	return parsed.String(), nil
+	basePath := parsedBase.Path
+	effectivePath := path
+	if basePath != "" && effectivePath != "" {
+		trimmedBase := strings.Trim(basePath, "/")
+		trimmedPath := strings.Trim(effectivePath, "/")
+		var baseSegs []string
+		var pathSegs []string
+		if trimmedBase != "" {
+			baseSegs = strings.Split(trimmedBase, "/")
+		}
+		if trimmedPath != "" {
+			pathSegs = strings.Split(trimmedPath, "/")
+		}
+		max := len(baseSegs)
+		if len(pathSegs) < max {
+			max = len(pathSegs)
+		}
+		overlap := 0
+		for n := max; n > 0; n-- {
+			matched := true
+			for i := 0; i < n; i++ {
+				if baseSegs[len(baseSegs)-n+i] != pathSegs[i] {
+					matched = false
+					break
+				}
+			}
+			if matched {
+				overlap = n
+				break
+			}
+		}
+		if overlap > 0 {
+			remaining := pathSegs[overlap:]
+			if len(remaining) == 0 {
+				effectivePath = ""
+			} else {
+				effectivePath = "/" + strings.Join(remaining, "/")
+			}
+		}
+	}
+	parsedBase.Path = strings.TrimRight(basePath, "/") + effectivePath
+	parsedBase.RawQuery = rawQuery
+	return parsedBase.String(), nil
 }
 
 func protocolForPath(path string) config.Protocol {
-	if path == "/responses" {
+	switch path {
+	case "/responses":
 		return config.ProtocolResponses
+	case "/chat/completions":
+		return config.ProtocolChat
+	case "/v1/messages", "/messages":
+		return config.ProtocolAnthropic
+	default:
+		return config.ProtocolChat
 	}
-	return config.ProtocolChat
 }
 
 func requestStream(body []byte) bool {

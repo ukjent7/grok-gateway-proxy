@@ -9,11 +9,6 @@ import (
 	"grok-gateway-proxy/internal/config"
 )
 
-// Streaming and non-streaming requests need different header-wait bounds: a
-// stream's context has no deadline, so the transport must cap the wait for a
-// hung upstream, while a non-streaming request's context deadline is the whole
-// budget and a transport-level cap below it would silently shrink that budget
-// (a reasoning model can take minutes to produce a non-streaming response).
 func TestClientTransportsSplitByRequestMode(t *testing.T) {
 	p := NewProxy(config.DefaultConfig(t.TempDir()+"/config.json"), nil, nil)
 
@@ -73,8 +68,6 @@ func TestClientForSelectsByModeAndProxySetting(t *testing.T) {
 	}
 }
 
-// Proxies built as test literals may only carry the sync pair; the streaming
-// lookups must fall back to it instead of panicking or returning nil.
 func TestClientForFallsBackWhenStreamClientsAbsent(t *testing.T) {
 	p := &Proxy{Client: &http.Client{}, DirectClient: &http.Client{}}
 	gateway := config.GatewayConfig{UseProxy: true}
@@ -87,9 +80,6 @@ func TestClientForFallsBackWhenStreamClientsAbsent(t *testing.T) {
 	}
 }
 
-// SetProxyURL swaps every transport so the saved address applies to the
-// proxied pair in both request modes while the direct pair stays direct, and
-// retires the old pools' idle connections.
 func TestSetProxyURLReplacesAllClients(t *testing.T) {
 	p := NewProxy(config.DefaultConfig(t.TempDir()+"/config.json"), nil, nil)
 	old := [4]*http.Client{p.Client, p.DirectClient, p.StreamClient, p.StreamDirectClient}
@@ -105,8 +95,7 @@ func TestSetProxyURLReplacesAllClients(t *testing.T) {
 			t.Fatalf("client %d was not replaced", i)
 		}
 		transport := client.Transport.(*http.Transport)
-		// Indices 0 and 2 are the configured-proxy pair (sync + stream);
-		// indices 1 and 3 are the direct pair and must stay proxyless.
+
 		shouldProxy := i == 0 || i == 2
 		if !shouldProxy {
 			if transport.Proxy != nil {

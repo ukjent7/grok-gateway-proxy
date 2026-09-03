@@ -1,17 +1,5 @@
 package proxy
 
-// jsonrewrite holds the span-preserving JSON member rewriter used for SSE
-// payloads. It rewrites only the value of a specific member (e.g. "type")
-// in place via byte splices, preserving key order, whitespace, and every
-// other member's bytes. A typed map[string]any decode+marshal would lose that
-// (see TestStandardRenameHandlesSpacedAndNestedSerialization) and would also
-// pay a decode for every streaming chunk that the byte prefilter currently
-// skips (BenchmarkSSESenseNovaTransform: 151 ns / 0 alloc vs ~20µs/149 allocs
-// for a real edit). The generic machinery (docMayMatch prefilter, decoder
-// offset framing) is the cost of that span preservation — keep it limited to
-// the two SSE rewrite tables (legacyReasoningEventRenames,
-// senseNovaResponseRewrites) and the SenseNova delta-field stripper.
-
 import (
 	"bytes"
 	"encoding/json"
@@ -73,7 +61,7 @@ func applyJSONMemberRewrites(doc []byte, rewrites ...jsonMemberRewrite) ([]byte,
 	case token == json.Delim('['):
 		rewriter.array(false)
 	default:
-		// A scalar root has no members to edit.
+
 		return doc, false
 	}
 	if rewriter.failed || len(rewriter.edits) == 0 {
@@ -81,9 +69,6 @@ func applyJSONMemberRewrites(doc []byte, rewrites ...jsonMemberRewrite) ([]byte,
 	}
 	edits := rewriter.edits
 
-	// The walk follows the source, so the edits are already ascending and
-	// disjoint: a matched value is always a string, and a string has no
-	// members for a second edit to live in.
 	out := make([]byte, 0, len(doc))
 	var copied int
 	for _, edit := range edits {
@@ -94,8 +79,6 @@ func applyJSONMemberRewrites(doc []byte, rewrites ...jsonMemberRewrite) ([]byte,
 	return append(out, doc[copied:]...), true
 }
 
-// object walks the members of an object whose '{' has been consumed. inToolCalls
-// says whether this object sits below a "tool_calls" member.
 func (r *jsonRewriter) object(inToolCalls bool) {
 	for !r.failed && r.decoder.More() {
 		name, err := r.decoder.Token()
@@ -110,32 +93,21 @@ func (r *jsonRewriter) object(inToolCalls bool) {
 		}
 		r.value(key, int(r.decoder.InputOffset()), inToolCalls || key == toolCallsKey)
 	}
-	if _, err := r.decoder.Token(); err != nil { // the closing '}'
+	if _, err := r.decoder.Token(); err != nil {
 		r.failed = true
 	}
 }
 
-// array walks the elements of an array whose '[' has been consumed. Being
-// below a tool_calls member is what the scope means; the array itself is the
-// member, so its elements inherit it.
 func (r *jsonRewriter) array(inToolCalls bool) {
 	cursor := int(r.decoder.InputOffset())
 	for !r.failed && r.decoder.More() {
 		cursor = r.value("", cursor, inToolCalls)
 	}
-	if _, err := r.decoder.Token(); err != nil { // the closing ']'
+	if _, err := r.decoder.Token(); err != nil {
 		r.failed = true
 	}
 }
 
-// value consumes the value that begins at the current decoder position,
-// recording an edit if one of the rewrites matches it. framingEnd is where the
-// bytes before the value started to be read: the value's own offset is the
-// first byte after the whitespace, colon or comma that separates it, which is
-// what lets the edit splice into the original document.
-//
-// It returns the end of the value it read, which is where the next element of
-// an array begins.
 func (r *jsonRewriter) value(key string, framingEnd int, inToolCalls bool) int {
 	start := nextJSONToken(r.src, framingEnd)
 	token, err := r.decoder.Token()
@@ -165,8 +137,6 @@ func (r *jsonRewriter) value(key string, framingEnd int, inToolCalls bool) int {
 	return end
 }
 
-// nextJSONToken returns the offset of the first byte of the next value at or
-// after from, skipping the whitespace and the ':' or ',' that frame it.
 func nextJSONToken(src []byte, from int) int {
 	at := skipJSONWhitespace(src, from)
 	if at < len(src) && (src[at] == ':' || src[at] == ',') {
@@ -175,11 +145,6 @@ func nextJSONToken(src []byte, from int) int {
 	return at
 }
 
-// docMayMatch is the whole-document prefilter: no rewrite can fire unless some
-// member name and some value it rewrites from appear in the bytes at all. It
-// over-approximates — a document that carries both tokens in unrelated places
-// still gets walked — because missing a match would forward the payload this
-// rewrite exists to fix.
 func docMayMatch(doc []byte, rewrites []jsonMemberRewrite) bool {
 	for _, rewrite := range rewrites {
 		if rewrite.inToolCallsOnly && !bytes.Contains(doc, toolCallsKeyToken) {
@@ -192,13 +157,6 @@ func docMayMatch(doc []byte, rewrites []jsonMemberRewrite) bool {
 	return false
 }
 
-// marshalJSONNoEscape marshals v compactly, leaving <, > and & unescaped.
-// encoding/json rewrites them to \u003c / \u003e / \u0026 by default, which
-// inflates every rewritten request body (a bare "<" triples in size) and makes
-// the logged upstream body diverge from the bytes the client actually sent.
-// Both matter for this proxy: prompts are mostly source code, and comparing the
-// two bodies is what the audit log is for. The result goes to a JSON API over
-// the wire and is never embedded in HTML, so dropping the escaping is safe.
 func marshalJSONNoEscape(value any) ([]byte, error) {
 	var out bytes.Buffer
 	encoder := json.NewEncoder(&out)
@@ -206,16 +164,10 @@ func marshalJSONNoEscape(value any) ([]byte, error) {
 	if err := encoder.Encode(value); err != nil {
 		return nil, err
 	}
-	// Encoder.Encode appends a trailing newline; Marshal would not.
+
 	return bytes.TrimRight(out.Bytes(), "\n"), nil
 }
 
-// decodeJSONDocument unmarshals a JSON document into a generic value while
-// keeping number literals as text. encoding/json decodes every number into
-// float64 by default, so a document that only needs some unrelated field
-// renamed comes back with its numbers rewritten: 9007199254740992 for
-// 9007199254740993, `1` for `1.0`, `1000` for `1e3`. UseNumber leaves the
-// original spelling of every number we do not touch alone.
 func decodeJSONDocument(body []byte) (any, error) {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
@@ -226,22 +178,13 @@ func decodeJSONDocument(body []byte) (any, error) {
 	return value, nil
 }
 
-// transformToolCallType rewrites the "type" of every entry in a tool_calls
-// array from one variant to another. Everything else is untouched, including
-// the `type` of a tool definition, which is the same word meaning something
-// else.
 func transformToolCallType(body []byte, from, to string) []byte {
 	rewritten, _ := applyJSONMemberRewrites(body, newJSONMemberRewrite(typeKey, from, []byte(strconv.Quote(to)), true))
 	return rewritten
 }
 
-// sanitizeSenseNovaToolCallHistory removes incomplete tool-call records from
-// the request history. A partially emitted client-side tool call has no
-// function name to execute, so forwarding it makes SenseNova reject the
-// entire request with "function/name/arguments cannot be empty". Its matching
-// tool result is removed as well because it would otherwise be an orphan.
 func sanitizeSenseNovaToolCallHistory(body []byte) ([]byte, error) {
-	// Fast path: body without tool_calls or messages cannot need cleaning.
+
 	if !bytes.Contains(body, toolCallsKeyToken) && !bytes.Contains(body, []byte(`"messages"`)) {
 		return body, nil
 	}
@@ -344,20 +287,13 @@ func nonEmptyString(value any) (string, bool) {
 	return text, text != ""
 }
 
-// senseNovaResponseRewrites are the two ways a SenseNova answer departs from
-// the Chat Completions the client speaks. Its history decoder names the
-// tool-call variant `function_call`, and it serialises an unset finish_reason
-// as `""` where the protocol says `null`.
 var senseNovaResponseRewrites = []jsonMemberRewrite{
 	newJSONMemberRewrite(typeKey, "function_call", []byte(`"function"`), true),
 	newJSONMemberRewrite("finish_reason", "", []byte("null"), false),
 }
 
-// transformSenseNovaResponseBody normalises a complete SenseNova answer.
 func transformSenseNovaResponseBody(body []byte) []byte {
-	// Both rewrites need the member they edit to be in the body at all, and
-	// the audit-captured body can be large; the scan is what keeps a reply
-	// with nothing to normalise from being walked container by container.
+
 	if !bytes.Contains(body, []byte("function_call")) && !bytes.Contains(body, []byte("finish_reason")) {
 		return body
 	}
@@ -365,26 +301,12 @@ func transformSenseNovaResponseBody(body []byte) []byte {
 	return rewritten
 }
 
-// transformSenseNovaPayload normalises one streamed chunk. Both passes edit the
-// same payload, so they run in sequence here and the line framing happens
-// once, in the caller.
 func transformSenseNovaPayload(payload []byte) []byte {
 	return stripEmptySenseNovaToolCallDeltaFields(transformSenseNovaResponseBody(payload))
 }
 
-// stripEmptySenseNovaToolCallDeltaFields removes the empty id and function.name
-// fields SenseNova repeats on tool-call continuation chunks. A continuation
-// carries only an argument fragment, so the identity it echoes as "" is not
-// merely redundant: SenseNova rejects a tool call whose function has an empty
-// name, which is a working stream turning into an error at the second chunk.
 func stripEmptySenseNovaToolCallDeltaFields(body []byte) []byte {
-	// A payload can only hold one of the fields this deletes if it carries a
-	// tool_calls member and an empty string, so two scans are the entire
-	// pre-filter — and the parse below is worth skipping, because a stream
-	// calls this on every tool-call chunk. The scans over-approximate: an
-	// empty `arguments` or a `""` in some other field costs one walk that
-	// changes nothing, while missing a real one would forward the payload the
-	// client is about to reject.
+
 	if !bytes.Contains(body, toolCallsKeyToken) || !bytes.Contains(body, emptyStringToken) {
 		return body
 	}
@@ -395,11 +317,6 @@ func stripEmptySenseNovaToolCallDeltaFields(body []byte) []byte {
 	return stripped
 }
 
-// stripEmptyToolCallFields walks one JSON value, rebuilding only the containers
-// where a field actually went away. Decoding into map[string]json.RawMessage
-// rather than any is the point: an untouched member keeps the bytes it arrived
-// in, so editing a leaf re-serialises the objects above it and nothing beside
-// it.
 func stripEmptyToolCallFields(raw json.RawMessage) (json.RawMessage, bool) {
 	switch firstNonSpace(raw) {
 	case '[':
@@ -444,8 +361,6 @@ func stripEmptyToolCallFields(raw json.RawMessage) (json.RawMessage, bool) {
 	return raw, false
 }
 
-// cleanToolCallEntries drops the echoed identity fields from each entry of a
-// tool_calls array.
 func cleanToolCallEntries(raw json.RawMessage) (json.RawMessage, bool) {
 	var entries []json.RawMessage
 	if json.Unmarshal(raw, &entries) != nil {
@@ -476,9 +391,6 @@ func cleanToolCallEntries(raw json.RawMessage) (json.RawMessage, bool) {
 	return rebuild(entries, raw), true
 }
 
-// deleteEmptyStringMember removes key from members when its value is the JSON
-// string "". The value has already been parsed by the time this runs, so a
-// serialization that puts a space after the colon is handled for free.
 func deleteEmptyStringMember(members map[string]json.RawMessage, key string) bool {
 	var text string
 	raw, ok := members[key]
@@ -489,8 +401,6 @@ func deleteEmptyStringMember(members map[string]json.RawMessage, key string) boo
 	return true
 }
 
-// rebuild re-serialises a value the walk changed, falling back to the original
-// bytes if that fails so a normalisation can never answer with nothing.
 func rebuild(value any, fallback json.RawMessage) json.RawMessage {
 	out, err := marshalJSONNoEscape(value)
 	if err != nil {
@@ -499,8 +409,329 @@ func rebuild(value any, fallback json.RawMessage) json.RawMessage {
 	return out
 }
 
-// skipJSONWhitespace returns the index of the first byte at or after start
-// that is not JSON whitespace.
+// insertTopLevelJSONMember 在 JSON 顶层对象的末尾追加一个成员，**不改动其余任何字节**。
+//
+// 与"反序列化进 map 再序列化"的区别至关重要：Go 序列化 map 时会按字母序重排所有键，
+// 导致上游收到的正文字节序与客户端发出的完全不同。本函数只在 '}' 之前插入，
+// 因此键序、空白、数字字面量、字符串转义全部原样保留。
+//
+// key 已存在时不做任何改动（返回 changed=false），保证绝不重写现有值。
+// 输入不是合法的 JSON 对象时同样原样返回，交给调用方决定如何处理。
+func insertTopLevelJSONMember(doc []byte, key string, value json.RawMessage) ([]byte, bool) {
+	trimmed := bytes.TrimSpace(doc)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return doc, false
+	}
+	end, ok, hasMembers := topLevelObjectEnd(doc)
+	if !ok {
+		return doc, false
+	}
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(doc, &probe); err != nil {
+		return doc, false
+	}
+	if _, exists := probe[key]; exists {
+		return doc, false
+	}
+	insertAt := end
+	for insertAt > 0 && isJSONWhitespace(doc[insertAt-1]) {
+		insertAt--
+	}
+	out := make([]byte, 0, len(doc)+len(key)+len(value)+4)
+	out = append(out, doc[:insertAt]...)
+	if hasMembers {
+		out = append(out, ',')
+	}
+	out = append(out, '"')
+	out = append(out, key...)
+	out = append(out, '"', ':')
+	out = append(out, value...)
+	out = append(out, doc[insertAt:]...)
+	return out, true
+}
+
+// topLevelObjectEnd 返回顶层对象右花括号的下标、是否找到、以及对象体内是否已有成员。
+// 扫描时跟踪字符串与转义，因此字符串内部的 '{' / '}' 不会误判。
+func topLevelObjectEnd(doc []byte) (end int, ok bool, hasMembers bool) {
+	start := -1
+	for i, b := range doc {
+		if isJSONWhitespace(b) {
+			continue
+		}
+		if b == '{' {
+			start = i
+		}
+		break
+	}
+	if start < 0 {
+		return 0, false, false
+	}
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(doc); i++ {
+		c := doc[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			switch c {
+			case '\\':
+				escaped = true
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i, true, len(bytes.TrimSpace(doc[start+1:i])) > 0
+			}
+		}
+	}
+	return 0, false, false
+}
+
+// topLevelMemberSpan 描述顶层对象中一个成员的字节位置。
+type topLevelMemberSpan struct {
+	key        string
+	keyStart   int // 键的起始 '"' 位置
+	valueStart int // 值的首个非空白字节
+	valueEnd   int // 值的最后一个字节之后
+}
+
+// topLevelMemberSpans 枚举顶层对象的成员及字节位置。
+// 只扫描第一层；嵌套结构由 scanJSONValue 整体跳过（含字符串与转义）。
+func topLevelMemberSpans(doc []byte) ([]topLevelMemberSpan, bool) {
+	start := -1
+	for i, b := range doc {
+		if isJSONWhitespace(b) {
+			continue
+		}
+		if b == '{' {
+			start = i
+		}
+		break
+	}
+	if start < 0 {
+		return nil, false
+	}
+	i := start + 1
+	var members []topLevelMemberSpan
+	for {
+		for i < len(doc) && isJSONWhitespace(doc[i]) {
+			i++
+		}
+		if i >= len(doc) {
+			return nil, false
+		}
+		if doc[i] == '}' {
+			return members, true
+		}
+		if doc[i] != '"' {
+			return nil, false
+		}
+		keyStart := i
+		end, ok := scanJSONString(doc, i)
+		if !ok {
+			return nil, false
+		}
+		var key string
+		if err := json.Unmarshal(doc[keyStart:end], &key); err != nil {
+			return nil, false
+		}
+		i = end
+		for i < len(doc) && isJSONWhitespace(doc[i]) {
+			i++
+		}
+		if i >= len(doc) || doc[i] != ':' {
+			return nil, false
+		}
+		i++
+		for i < len(doc) && isJSONWhitespace(doc[i]) {
+			i++
+		}
+		valueStart := i
+		valueEnd, ok := scanJSONValue(doc, i)
+		if !ok {
+			return nil, false
+		}
+		members = append(members, topLevelMemberSpan{key: key, keyStart: keyStart, valueStart: valueStart, valueEnd: valueEnd})
+		i = valueEnd
+		for i < len(doc) && isJSONWhitespace(doc[i]) {
+			i++
+		}
+		if i < len(doc) && doc[i] == ',' {
+			i++
+			continue
+		}
+		// '}' 或非法输入交给下一轮循环判定
+	}
+}
+
+func scanJSONString(doc []byte, i int) (int, bool) {
+	if i >= len(doc) || doc[i] != '"' {
+		return 0, false
+	}
+	i++
+	for i < len(doc) {
+		switch doc[i] {
+		case '\\':
+			i += 2
+		case '"':
+			return i + 1, true
+		default:
+			i++
+		}
+	}
+	return 0, false
+}
+
+// scanJSONValue 返回从 i 开始的任意 JSON 值的结束位置（不含）。
+func scanJSONValue(doc []byte, i int) (int, bool) {
+	for i < len(doc) && isJSONWhitespace(doc[i]) {
+		i++
+	}
+	if i >= len(doc) {
+		return 0, false
+	}
+	switch doc[i] {
+	case '"':
+		return scanJSONString(doc, i)
+	case '{', '[':
+		open, closeCh := doc[i], byte('}')
+		if doc[i] == '[' {
+			closeCh = ']'
+		}
+		depth := 0
+		inString, escaped := false, false
+		for ; i < len(doc); i++ {
+			c := doc[i]
+			if inString {
+				if escaped {
+					escaped = false
+				} else if c == '\\' {
+					escaped = true
+				} else if c == '"' {
+					inString = false
+				}
+				continue
+			}
+			switch c {
+			case '"':
+				inString = true
+			case open:
+				depth++
+			case closeCh:
+				depth--
+				if depth == 0 {
+					return i + 1, true
+				}
+			}
+		}
+		return 0, false
+	default:
+		// 标量：数字 / true / false / null
+		for i < len(doc) {
+			c := doc[i]
+			if c == ',' || c == '}' || c == ']' || isJSONWhitespace(c) {
+				return i, true
+			}
+			i++
+		}
+		return i, true
+	}
+}
+
+// topLevelMemberEdit 描述对顶层成员的一次修改。
+type topLevelMemberEdit struct {
+	key    string
+	delete bool
+	value  json.RawMessage // delete=false 时生效
+}
+
+// applyTopLevelMemberEdits 以成员级重拼的方式修改顶层对象：
+// 每个成员的原始字节（键、冒号、空白）原样保留，被删除的成员整段跳过，
+// 成员之间的原始分隔符（",\n  " 这类）也原样保留。因此未被修改的成员
+// 在输出中与输入逐字节相同，且不会产生悬空逗号。
+// 成员不存在时跳过（本函数只修改已存在的成员，不新增）。
+func applyTopLevelMemberEdits(doc []byte, edits []topLevelMemberEdit) ([]byte, bool) {
+	if len(edits) == 0 {
+		return doc, false
+	}
+	members, ok := topLevelMemberSpans(doc)
+	if !ok || len(members) == 0 {
+		return doc, false
+	}
+	end, okEnd, _ := topLevelObjectEnd(doc)
+	if !okEnd {
+		return doc, false
+	}
+	editsByKey := make(map[string]topLevelMemberEdit, len(edits))
+	for _, e := range edits {
+		editsByKey[e.key] = e
+	}
+	changed := false
+	for _, m := range members {
+		if _, hit := editsByKey[m.key]; hit {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return doc, false
+	}
+
+	out := make([]byte, 0, len(doc))
+	// 对象开头（"{" 及其后的空白）保留到第一个成员之前。
+	out = append(out, doc[:members[0].keyStart]...)
+	prevKept := -1
+	for i, m := range members {
+		e, hasEdit := editsByKey[m.key]
+		if hasEdit && e.delete {
+			continue
+		}
+		if prevKept >= 0 {
+			// 前一个保留成员的原始分隔符（",\n  " 等）。注意不能直接取
+			// doc[prev.valueEnd : m.keyStart]——中间若有被删成员，其字节会混进分隔符；
+			// 因此只取到原始逗号及其后的空白为止。
+			sepStart := members[prevKept].valueEnd
+			sepEnd := sepStart
+			for sepEnd < len(doc) && isJSONWhitespace(doc[sepEnd]) {
+				sepEnd++
+			}
+			if sepEnd < len(doc) && doc[sepEnd] == ',' {
+				sepEnd++
+				for sepEnd < len(doc) && isJSONWhitespace(doc[sepEnd]) {
+					sepEnd++
+				}
+				out = append(out, doc[sepStart:sepEnd]...)
+			} else {
+				out = append(out, ',')
+			}
+		}
+		if hasEdit {
+			// 键与冒号原样，仅替换值。
+			out = append(out, doc[m.keyStart:m.valueStart]...)
+			out = append(out, e.value...)
+		} else {
+			out = append(out, doc[m.keyStart:m.valueEnd]...)
+		}
+		prevKept = i
+	}
+	// 最后一个成员之后到 '}' 之间的原始字节（通常为空或换行缩进），再加 '}' 及其后缀。
+	out = append(out, doc[members[len(members)-1].valueEnd:end]...)
+	out = append(out, doc[end:]...)
+	return out, true
+}
+
 func skipJSONWhitespace(body []byte, start int) int {
 	for start < len(body) {
 		if !isJSONWhitespace(body[start]) {
@@ -511,14 +742,10 @@ func skipJSONWhitespace(body []byte, start int) int {
 	return start
 }
 
-// isJSONWhitespace reports whether b is one of the four bytes JSON allows
-// between tokens.
 func isJSONWhitespace(value byte) bool {
 	return value == ' ' || value == '\t' || value == '\r' || value == '\n'
 }
 
-// firstNonSpace reports the first byte of a JSON value that is not whitespace,
-// or 0 when it has none.
 func firstNonSpace(raw json.RawMessage) byte {
 	for _, b := range raw {
 		if !isJSONWhitespace(b) {

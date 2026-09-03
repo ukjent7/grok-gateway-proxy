@@ -8,8 +8,6 @@ import (
 	"strconv"
 )
 
-// responseCapture wraps the client-facing ResponseWriter to snapshot the
-// status, headers, and (capped) body the client actually receives.
 type responseCapture struct {
 	http.ResponseWriter
 	statusCode int
