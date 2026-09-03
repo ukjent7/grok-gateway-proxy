@@ -90,13 +90,13 @@ func (s *Store) compressExistingRows() error {
 }
 
 func (s *Store) compressColumn(column string) error {
-	// Check whether this column exists (legacy *_actual columns may not).
+
 	exists, err := s.columnExists(column)
 	if err != nil || !exists {
 		return err
 	}
 	return s.batchRewriteColumn(column, fmt.Sprintf(`AND length(%s) > 0`, column), func(raw []byte) ([]byte, bool, error) {
-		// Skip already-compressed rows, in either on-disk form.
+
 		if _, compressed := compressedPayload(raw); compressed {
 			return nil, false, nil
 		}
@@ -104,7 +104,7 @@ func (s *Store) compressColumn(column string) error {
 		if err != nil {
 			return nil, false, err
 		}
-		// Only update if compression actually saved space.
+
 		if len(compressed) >= len(raw) {
 			return nil, false, nil
 		}

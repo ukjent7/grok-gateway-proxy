@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
     response_headers TEXT NOT NULL,
     response_body BLOB NOT NULL,
     response_truncated INTEGER NOT NULL DEFAULT 0,
+    upstream_timeout_ms INTEGER NOT NULL DEFAULT 0,
     error TEXT NOT NULL DEFAULT '',
     input_tokens INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
@@ -67,6 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_request_logs_model ON request_logs(model);
 		{name: "upstream_response_headers", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "upstream_response_body", definition: "BLOB NOT NULL DEFAULT X''"},
 		{name: "response_truncated", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "upstream_timeout_ms", definition: "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := s.addColumnIfMissing(column.name, column.definition); err != nil {
 			return err
@@ -90,7 +92,6 @@ func (s *Store) migrateDataIfNeeded() error {
 		return nil
 	}
 
-	// Backfill rows written by older builds that predate the extra columns.
 	if _, err := s.db.Exec(`
 UPDATE request_logs
 SET client_response_status_code = CASE WHEN client_response_status_code = 0 THEN status_code ELSE client_response_status_code END,
@@ -101,19 +102,17 @@ WHERE client_response_status_code = 0 OR upstream_response_status_code = 0
 `); err != nil {
 		return err
 	}
-	// Scrub credentials stored before write-time sanitization existed.
+
 	if err := s.scrubStoredHeaderCredentials(); err != nil {
 		return err
 	}
-	// Compress existing rows that were written before transparent gzip
-	// compression was introduced (schema_version < 3).
+
 	if version < 3 {
 		if err := s.compressExistingRows(); err != nil {
 			return err
 		}
 	}
-	// Normalize timestamps to fixed-width 30-char format for lexicographical
-	// monotonic comparison and sorting in SQLite (schema_version < 4).
+
 	if version < 4 {
 		if err := s.normalizeTimestamps(); err != nil {
 			return err
@@ -126,20 +125,6 @@ WHERE client_response_status_code = 0 OR upstream_response_status_code = 0
 	return err
 }
 
-// batchRewriteColumn rewrites one column of every matching row, handing each
-// row's current value to rewrite, which reports the replacement and whether it
-// differs. Rows whose rewrite reports no change are left alone.
-//
-// Rows are read in bounded batches and each batch is committed as a single
-// transaction. Reading the whole table first pins every candidate row (and its
-// rewritten value) in memory at once, while issuing one UPDATE per row costs a
-// transaction — and under WAL an fsync — per row. Paging on the primary key
-// keeps the scan indexed, so the total cost stays linear in the row count.
-//
-// column and where are interpolated into SQL and must be compile-time
-// constants from this file; neither ever carries caller-supplied text.
-// rewrite reports the replacement value, whether it differs from the original,
-// or an error, which aborts the whole migration.
 func (s *Store) batchRewriteColumn(column, where string, rewrite func(value []byte) ([]byte, bool, error)) error {
 	const batchSize = 256
 	lastID := ""
@@ -155,19 +140,14 @@ func (s *Store) batchRewriteColumn(column, where string, rewrite func(value []by
 	}
 }
 
-// rewriteColumnBatch applies one batch and reports the last id it saw and
-// whether that batch was the final one.
 func (s *Store) rewriteColumnBatch(column, where, lastID string, batchSize int, rewrite func([]byte) ([]byte, bool, error)) (string, bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return "", true, err
 	}
-	// Rollback after a successful commit is a no-op returning ErrTxDone; the
-	// only reason to call it is the early returns above.
+
 	defer func() { _ = tx.Rollback() }()
 
-	// The cursor cannot advance by OFFSET: an open Rows holds the single
-	// pooled connection, so the UPDATEs have to wait for it to be closed.
 	rows, err := tx.Query(
 		fmt.Sprintf(`SELECT id, %s FROM request_logs WHERE id > ? %s ORDER BY id LIMIT ?`, column, where),
 		lastID, batchSize,
@@ -225,13 +205,6 @@ func (s *Store) rewriteColumnBatch(column, where, lastID string, batchSize int, 
 	return last, scanned < batchSize, nil
 }
 
-// normalizeTimestamps rewrites legacy rows into the fixed-width UTC format.
-// The predicate is "not exactly 30 chars" rather than "shorter than 30": a
-// nanosecond timestamp that carries a numeric offset
-// (2026-08-30T14:05:06.123456789+08:00, 35 chars) is *longer* than the target
-// format, and skipping it would leave it sorted and filtered as text against
-// UTC rows — a row whose local clock reads 20:00 is really 12:00Z, so an
-// eight-hour-skewed window would silently drop or keep it at random.
 func (s *Store) normalizeTimestamps() error {
 	return s.batchRewriteColumn("started_at", `AND length(started_at) != 30`, func(raw []byte) ([]byte, bool, error) {
 		t := parseTimestamp(string(raw))
@@ -279,18 +252,11 @@ func (s *Store) columnExists(name string) (bool, error) {
 	return false, rows.Err()
 }
 
-// storedHeaderColumns lists every stored header field that may contain
-// credentials. Current columns are sanitized on write; the legacy *_actual
-// columns predate that, so both are scrubbed during migration.
 var storedHeaderColumns = []string{
 	"request_headers", "upstream_headers", "upstream_response_headers", "response_headers",
 	"request_headers_actual", "upstream_headers_actual", "upstream_response_headers_actual", "response_headers_actual",
 }
 
-// scrubStoredHeaderCredentials replaces sensitive header values (Authorization,
-// API keys, tokens, ...) in every stored header field with "[REDACTED]". Rows
-// whose values are unchanged are left untouched; the legacy *_actual columns
-// may not exist on fresh databases and are skipped.
 func (s *Store) scrubStoredHeaderCredentials() error {
 	for _, column := range storedHeaderColumns {
 		exists, err := s.columnExists(column)
@@ -301,14 +267,13 @@ func (s *Store) scrubStoredHeaderCredentials() error {
 			continue
 		}
 		err = s.batchRewriteColumn(column, `AND `+column+` != ''`, func(raw []byte) ([]byte, bool, error) {
-			// Decompress in case a partial compression migration left rows
-			// compressed while version was not yet stamped.
+
 			text := gunzipString(raw)
 			redacted := redact.RedactStoredHeaders(text)
 			if redacted == text {
 				return nil, false, nil
 			}
-			// Re-compress the redacted value before storing.
+
 			compressed, err := gzipString(redacted)
 			if err != nil {
 				return nil, false, err

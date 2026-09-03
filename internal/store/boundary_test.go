@@ -11,9 +11,6 @@ import (
 	"grok-gateway-proxy/internal/config"
 )
 
-// Concurrent inserts from multiple goroutines must all succeed without
-// "database is locked" errors. SQLite with WAL + MaxOpenConns(1) serializes
-// writes, so this test verifies the busy_timeout is effective.
 func TestStoreConcurrentInserts(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
 	if err != nil {
@@ -59,7 +56,6 @@ func TestStoreConcurrentInserts(t *testing.T) {
 	}
 }
 
-// Concurrent reads while writes are happening must not block or corrupt data.
 func TestStoreConcurrentReadWrite(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
 	if err != nil {
@@ -67,7 +63,6 @@ func TestStoreConcurrentReadWrite(t *testing.T) {
 	}
 	defer store.Close()
 
-	// Seed with some initial data.
 	for i := 0; i < 20; i++ {
 		_ = store.Insert(context.Background(), RequestLog{
 			ID:        fmt.Sprintf("seed-%d", i),
@@ -82,7 +77,6 @@ func TestStoreConcurrentReadWrite(t *testing.T) {
 	wg.Add(writers + readers)
 	errs := make(chan error, writers+readers)
 
-	// Writers keep inserting.
 	for w := 0; w < writers; w++ {
 		go func(wid int) {
 			defer wg.Done()
@@ -98,7 +92,6 @@ func TestStoreConcurrentReadWrite(t *testing.T) {
 		}(w)
 	}
 
-	// Readers keep querying.
 	for r := 0; r < readers; r++ {
 		go func() {
 			defer wg.Done()
@@ -122,7 +115,6 @@ func TestStoreConcurrentReadWrite(t *testing.T) {
 	}
 }
 
-// Inserting a log with an empty body must not fail.
 func TestStoreInsertEmptyBody(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
 	if err != nil {
@@ -152,7 +144,6 @@ func TestStoreInsertEmptyBody(t *testing.T) {
 	}
 }
 
-// Inserting a log with a duplicate ID must fail (primary key constraint).
 func TestStoreInsertDuplicateIDFails(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
 	if err != nil {
@@ -169,8 +160,6 @@ func TestStoreInsertDuplicateIDFails(t *testing.T) {
 	}
 }
 
-// Metrics with zero rows must return zero values, not nil pointers that
-// could cause nil dereferences in the API layer.
 func TestStoreMetricsEmpty(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
 	if err != nil {
@@ -190,8 +179,6 @@ func TestStoreMetricsEmpty(t *testing.T) {
 	}
 }
 
-// List with a limit larger than the row count must return all available
-// rows without error.
 func TestStoreListLimitExceedsRowCount(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
 	if err != nil {
@@ -218,7 +205,6 @@ func TestStoreListLimitExceedsRowCount(t *testing.T) {
 	}
 }
 
-// Delete with a cutoff time before all rows must delete nothing.
 func TestStoreDeleteWithEarlyCutoff(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
 	if err != nil {
@@ -241,7 +227,6 @@ func TestStoreDeleteWithEarlyCutoff(t *testing.T) {
 	}
 }
 
-// Delete with a nil cutoff must remove all rows and return the count.
 func TestStoreDeleteAllRemovesEverything(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
 	if err != nil {
@@ -273,7 +258,6 @@ func TestStoreDeleteAllRemovesEverything(t *testing.T) {
 	}
 }
 
-// Reopening a store on an existing database must preserve all data.
 func TestStoreReopenPreservesData(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "proxy.db")
 	store1, err := OpenStore(dbPath)
@@ -318,8 +302,6 @@ func TestStoreReopenPreservesData(t *testing.T) {
 	}
 }
 
-// Subsecond timestamps across second boundaries must sort in strict chronological
-// order and must be correctly included by exact-second From/To filter boundaries.
 func TestStoreSubsecondTimeFilteringAndOrdering(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
 	if err != nil {
@@ -350,7 +332,6 @@ func TestStoreSubsecondTimeFilteringAndOrdering(t *testing.T) {
 		}
 	}
 
-	// 1. Verify descending order (latest first)
 	logs, err := store.List(context.Background(), LogFilter{Limit: 10})
 	if err != nil {
 		t.Fatal(err)
@@ -365,14 +346,13 @@ func TestStoreSubsecondTimeFilteringAndOrdering(t *testing.T) {
 		}
 	}
 
-	// 2. Verify exact second boundary filtering includes subsecond records
 	from := base
 	to := base.Add(1 * time.Second)
 	filtered, err := store.List(context.Background(), LogFilter{From: &from, To: &to, Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(filtered) != 5 { // t0, t1, t2, t3, t4
+	if len(filtered) != 5 {
 		t.Fatalf("expected 5 logs between %v and %v, got %d", from, to, len(filtered))
 	}
 }

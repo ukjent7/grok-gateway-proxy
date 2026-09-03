@@ -151,8 +151,6 @@ func TestStoreInsertPersistsAllAuditFields(t *testing.T) {
 	}
 }
 
-// A database created by an older proxy build (missing the later-added columns)
-// must be migrated on open without losing existing rows.
 func TestOpenStoreMigratesLegacySchema(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "proxy.db")
 	legacy, err := sql.Open("sqlite", dbPath)
@@ -218,7 +216,6 @@ VALUES ('legacy-1', '2026-01-01T00:00:00Z', 've', 'Vercel AI Gateway', '/ve', 'r
 		t.Fatal("legacy row must default to response_truncated=false")
 	}
 
-	// The new column must be usable for inserts after migration.
 	if err := store.Insert(context.Background(), RequestLog{
 		ID: "post-migration", StartedAt: time.Now().UTC(), GatewayID: "ve", GatewayName: "Vercel AI Gateway",
 		Prefix: "/ve", IngressProtocol: config.ProtocolResponses, UpstreamProtocol: config.ProtocolResponses,
@@ -235,20 +232,15 @@ VALUES ('legacy-1', '2026-01-01T00:00:00Z', 've', 'Vercel AI Gateway', '/ve', 'r
 	}
 }
 
-// Data migrations page through request_logs in bounded batches on the primary
-// key, so they must keep advancing past a batch that produced no updates, and
-// must not stop after the first batch. 300 rows is more than one batch.
 func TestMigrationsRewriteRowsBeyondFirstBatch(t *testing.T) {
 	const rows = 300
 
-	// shortTimestamp makes started_at narrower than the 30-char fixed-width
-	// format, which is what the timestamp migration looks for.
 	shortTimestamp := "2026-01-01T00:00:00Z"
 	fullTimestamp := formatTimestamp(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 
 	cases := []struct {
 		name string
-		// timestampFor decides which rows need rewriting.
+
 		timestampFor func(index int) string
 	}{
 		{name: "every row needs rewriting", timestampFor: func(int) string { return shortTimestamp }},
@@ -314,7 +306,7 @@ CREATE TABLE request_logs (
 				t.Fatal(err)
 			}
 			for index := 0; index < rows; index++ {
-				// Zero-padded so lexicographic id order matches insertion order.
+
 				if _, err := statement.Exec(fmt.Sprintf("legacy-%03d", index), tc.timestampFor(index)); err != nil {
 					t.Fatal(err)
 				}
@@ -335,7 +327,7 @@ CREATE TABLE request_logs (
 			if remaining != 0 {
 				t.Fatalf("%d rows were still outside the fixed timestamp format after migration", remaining)
 			}
-			// Rewriting must not have lost or duplicated a row.
+
 			var total int
 			if err := store.db.QueryRow(`SELECT COUNT(*) FROM request_logs`).Scan(&total); err != nil {
 				t.Fatal(err)
@@ -378,9 +370,7 @@ func TestStoreCountRespectsFilters(t *testing.T) {
 		{name: "status success", filter: LogFilter{Status: "success"}, want: 2},
 		{name: "status failure", filter: LogFilter{Status: "failure"}, want: 1},
 		{name: "time range", filter: LogFilter{From: ptrTime(now.Add(-90 * time.Minute))}, want: 2},
-		// A status we cannot express must match nothing: falling through
-		// unfiltered would report the whole table as a subset, which silently
-		// corrupts every count and rate derived from it.
+
 		{name: "status unrecognized", filter: LogFilter{Status: "not-a-status"}, want: 0},
 		{name: "status class", filter: LogFilter{Status: "5xx"}, want: 1},
 		{name: "status class absent", filter: LogFilter{Status: "3xx"}, want: 0},
@@ -398,8 +388,6 @@ func TestStoreCountRespectsFilters(t *testing.T) {
 	}
 }
 
-// Model filter is a substring match with LIKE wildcards escaped, so a literal
-// underscore in the query matches itself and not any single character.
 func TestStoreCountEscapesLikeWildcards(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
 	if err != nil {
@@ -413,7 +401,7 @@ func TestStoreCountEscapesLikeWildcards(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// A literal underscore must not act as a single-character wildcard.
+
 	if n, _ := store.Count(context.Background(), LogFilter{Model: "demo_x"}); n != 1 {
 		t.Fatalf("underscore not escaped: got %d, want 1", n)
 	}
@@ -442,7 +430,6 @@ func TestStorePruneOlderThan(t *testing.T) {
 		}
 	}
 
-	// Retention of zero or less disables pruning.
 	n, err := store.PruneOlderThan(context.Background(), 0)
 	if err != nil || n != 0 {
 		t.Fatalf("zero retention should be a no-op: n=%d err=%v", n, err)
@@ -466,7 +453,6 @@ func TestStorePruneOlderThan(t *testing.T) {
 	}
 }
 
-// Rows exactly at the cutoff are kept: Delete uses a strict less-than.
 func TestStoreDeleteKeepsRowsAtBoundary(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
 	if err != nil {
@@ -508,8 +494,6 @@ func TestStoreCheckpointWALIsNoError(t *testing.T) {
 	}
 }
 
-// 已带 schema_version 标记的库再次打开时，不应重复执行全表回填/脱敏扫描：
-// 手工写入的"脏"数据（缺失的派生状态码、未脱敏凭据）必须保持原样。
 func TestStoreSkipsDataMigrationWhenAlreadyMigrated(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "proxy.db")
 	store, err := OpenStore(dbPath)
@@ -520,7 +504,6 @@ func TestStoreSkipsDataMigrationWhenAlreadyMigrated(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 手工写入一行模拟"旧构建遗留"的脏数据。
 	legacy, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -542,7 +525,6 @@ func TestStoreSkipsDataMigrationWhenAlreadyMigrated(t *testing.T) {
 	}
 	legacy.Close()
 
-	// 重新打开：已有版本标记，数据迁移必须被跳过。
 	store, err = OpenStore(dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -565,8 +547,6 @@ func TestStoreSkipsDataMigrationWhenAlreadyMigrated(t *testing.T) {
 	}
 }
 
-// Databases written by an older proxy stored raw headers in the *_actual
-// columns; opening them must scrub credentials from every stored header field.
 func TestOpenStoreScrubsLegacyHeaderCredentials(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "proxy.db")
 	legacy, err := sql.Open("sqlite", dbPath)
@@ -653,7 +633,6 @@ VALUES ('leak-1', '2026-01-01T00:00:00Z', 'oc', 'OpenCode Zen', '/oc', 'response
 		t.Fatalf("non-sensitive legacy header was lost: %s", requestHeadersActual)
 	}
 
-	// Reopening must be idempotent: no error and no data corruption.
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -682,9 +661,6 @@ func containsAll(value string, parts ...string) bool {
 	return true
 }
 
-// Inserted bodies and headers must survive a compress → store → retrieve →
-// decompress round-trip. This validates the transparent gzip layer: the Go
-// code sees plain bytes, while the database stores compressed bytes.
 func TestStoreCompressionRoundTrip(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
 	if err != nil {
@@ -725,8 +701,6 @@ func TestStoreCompressionRoundTrip(t *testing.T) {
 	}
 }
 
-// The compressed bytes stored in the database must be smaller than the raw
-// input for repetitive JSON payloads — this is the whole point of compression.
 func TestStoreCompressedDataIsSmaller(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "proxy.db")
 	store, err := OpenStore(dbPath)
@@ -754,10 +728,6 @@ func TestStoreCompressedDataIsSmaller(t *testing.T) {
 	}
 }
 
-// A stored blob must be a valid gzip file on its own: the compression marker
-// rides in the gzip header's extra field, not in a prefix in front of the
-// stream. Prefixing it produced bytes that began like gzip and then failed
-// `gunzip`, leaving the stored bodies unreadable to anything but this code.
 func TestStoredBlobIsPlainGzip(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
 	if err != nil {
@@ -804,10 +774,6 @@ func TestStoredBlobIsPlainGzip(t *testing.T) {
 	}
 }
 
-// Rows written by the build that used the five-byte prefix ahead of the gzip
-// stream must still read back. The prefix's third byte is 'G' where a real
-// gzip stream carries its compression method, so the two are told apart on
-// read and no migration is needed.
 func TestStoreReadsLegacyPrefixedBlob(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "proxy.db")
 	store, err := OpenStore(dbPath)
@@ -856,9 +822,6 @@ func TestStoreReadsLegacyPrefixedBlob(t *testing.T) {
 	}
 }
 
-// Rows written by an older build (raw bytes, no compression magic) must be
-// readable after the store is opened — the Get path transparently passes
-// through data that lacks the gzip magic prefix.
 func TestStoreReadsUncompressedLegacyRows(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "proxy.db")
 	store, err := OpenStore(dbPath)
@@ -869,7 +832,6 @@ func TestStoreReadsUncompressedLegacyRows(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Write a row with raw (uncompressed) body data, simulating a pre-compression build.
 	legacy, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -883,7 +845,6 @@ func TestStoreReadsUncompressedLegacyRows(t *testing.T) {
 	}
 	legacy.Close()
 
-	// Reopen: migration should compress the old row, then Get should decompress it.
 	store, err = OpenStore(dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -899,7 +860,6 @@ func TestStoreReadsUncompressedLegacyRows(t *testing.T) {
 	}
 }
 
-// VACUUM must execute without error on a valid database.
 func TestStoreVacuumIsNoError(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
 	if err != nil {
@@ -918,7 +878,6 @@ func TestStoreVacuumIsNoError(t *testing.T) {
 		t.Fatalf("unexpected VACUUM error: %v", err)
 	}
 
-	// Data must be intact after VACUUM.
 	count, err := store.Count(context.Background(), LogFilter{})
 	if err != nil {
 		t.Fatal(err)
@@ -928,8 +887,6 @@ func TestStoreVacuumIsNoError(t *testing.T) {
 	}
 }
 
-// An empty page must marshal as [] and not null: the API hands the slice
-// straight to JSON and callers iterate it.
 func TestListEmptyResultIsNotNull(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
 	if err != nil {
@@ -956,9 +913,6 @@ func TestListEmptyResultIsNotNull(t *testing.T) {
 	}
 }
 
-// ReclaimSpace is the single delete -> vacuum -> checkpoint sequence shared by
-// startup pruning and the console's delete endpoint; it must leave the data
-// that was not deleted intact.
 func TestReclaimSpaceKeepsRemainingRows(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
 	if err != nil {
@@ -994,10 +948,6 @@ func TestReclaimSpaceKeepsRemainingRows(t *testing.T) {
 	}
 }
 
-// A legacy row whose timestamp carries a numeric UTC offset is *longer* than
-// the fixed-width format (35 chars, not fewer). Selecting only the short ones
-// left such rows pinned to their local clock, so they sorted and filtered
-// wrongly against the UTC rows they sat next to.
 func TestMigrationNormalizesOffsetBearingTimestamp(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "proxy.db")
 	store, err := OpenStore(dbPath)
@@ -1023,7 +973,7 @@ func TestMigrationNormalizesOffsetBearingTimestamp(t *testing.T) {
 	if _, err := legacy.Exec(`UPDATE request_logs SET started_at = '2026-08-30T22:05:06.123456789+08:00' WHERE id = 'legacy-offset'`); err != nil {
 		t.Fatal(err)
 	}
-	// Back the marker up so the timestamp step runs again.
+
 	if _, err := legacy.Exec(`UPDATE proxy_meta SET value = '3' WHERE key = 'schema_version'`); err != nil {
 		t.Fatal(err)
 	}
@@ -1043,7 +993,6 @@ func TestMigrationNormalizesOffsetBearingTimestamp(t *testing.T) {
 	}
 }
 
-// openTestStore opens a throwaway database for one test.
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
 	store, err := OpenStore(filepath.Join(t.TempDir(), "proxy.db"))
@@ -1054,9 +1003,6 @@ func openTestStore(t *testing.T) *Store {
 	return store
 }
 
-// The overview board asks for the newest few rows of every gateway at once. A
-// shared LIMIT would let a busy gateway crowd a quiet one out of the answer,
-// which is why this is a per-gateway window rather than one filtered list.
 func TestRecentByGatewayTakesNewestPerGateway(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
@@ -1081,14 +1027,12 @@ func TestRecentByGatewayTakesNewestPerGateway(t *testing.T) {
 	if len(recent["quiet"]) != 1 {
 		t.Fatalf("quiet gateway rows = %d, want 1", len(recent["quiet"]))
 	}
-	// Newest first, so the last two insertions rather than the first two.
+
 	if len(recent["loud"]) != 2 || recent["loud"][0].ID != "loud-4" || recent["loud"][1].ID != "loud-3" {
 		t.Fatalf("loud rows are not the newest two, newest first: %+v", recent["loud"])
 	}
 }
 
-// The window has to respect the same filters the list does, or the board would
-// show traffic the user had already filtered out.
 func TestRecentByGatewayHonoursFilters(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
@@ -1112,8 +1056,6 @@ func TestRecentByGatewayHonoursFilters(t *testing.T) {
 	}
 }
 
-// distinguishableRow has a different value in every stored column, so a read
-// that takes one column's bytes for another's cannot pass by accident.
 func distinguishableRow(id string) RequestLog {
 	return RequestLog{
 		ID: id, StartedAt: time.Now().UTC().Add(-3 * time.Second),
@@ -1139,11 +1081,6 @@ func distinguishableRow(id string) RequestLog {
 	}
 }
 
-// requestLogColumns is now the single order the insert, both reads and the
-// compression migration are derived from. These checks pin the properties that
-// derivation assumes: before it, the same order lived in four hand-written
-// places and the only mismatch anything could detect was the argument count — a
-// swap stored one column's bytes in another's and every test stayed green.
 func TestRequestLogColumnLayout(t *testing.T) {
 	seen := map[string]bool{}
 	for _, column := range requestLogColumns {
@@ -1164,8 +1101,6 @@ func TestRequestLogColumnLayout(t *testing.T) {
 	}
 }
 
-// Insert fills its arguments by column name, so the compiler can no longer see
-// a missing value: it becomes a request-path error naming the column.
 func TestInsertValuesCoverEveryColumn(t *testing.T) {
 	values, err := insertValues(distinguishableRow("insert-values"))
 	if err != nil {
@@ -1181,9 +1116,6 @@ func TestInsertValuesCoverEveryColumn(t *testing.T) {
 	}
 }
 
-// capturedValues is what the insert gzips and capturedColumns is what the
-// migration walks and a full read decompresses. If the two stop naming the same
-// columns, a payload is stored plaintext and read back as gzip garbage.
 func TestCapturedValuesKeyTheCapturedColumns(t *testing.T) {
 	values := capturedValues(distinguishableRow("captured-values"))
 	if got, want := len(values), len(capturedColumns); got != want {
@@ -1201,17 +1133,12 @@ func TestCapturedValuesKeyTheCapturedColumns(t *testing.T) {
 	}
 }
 
-// The shared aggregate and its scan destinations are two lists for one row. The
-// SELECT is built from the first, so a length mismatch mis-scans both metrics
-// queries the same way.
 func TestMetricsAggregateColumnsMatchScanTargets(t *testing.T) {
 	if got, want := len(metricsAggregates), len((&metricsAggregate{}).scanArgs()); got != want {
 		t.Fatalf("metrics SELECT has %d columns, scanArgs has %d destinations", got, want)
 	}
 }
 
-// The round trip all of the above protects: every column comes back where it
-// went, and a summary row is the full row minus the columns it never selected.
 func TestStoredRowRoundTripsByColumn(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()

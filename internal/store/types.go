@@ -38,6 +38,7 @@ type RequestLog struct {
 	Success                    bool            `json:"success"`
 	Stream                     bool            `json:"stream"`
 	DurationMS                 int64           `json:"duration_ms"`
+	UpstreamTimeoutMS          int64           `json:"upstream_timeout_ms,omitempty"`
 	RequestHeaders             string          `json:"request_headers"`
 	RequestBody                []byte          `json:"request_body"`
 	UpstreamHeaders            string          `json:"upstream_headers"`
@@ -73,8 +74,6 @@ type Metrics struct {
 	ByGateway            map[string]Metrics `json:"by_gateway,omitempty"`
 }
 
-// MarshalJSON keeps raw payloads readable in the GUI/API while the database
-// continues to store the original bytes without any protocol conversion.
 func (l RequestLog) MarshalJSON() ([]byte, error) {
 	type alias RequestLog
 	return json.Marshal(&struct {
