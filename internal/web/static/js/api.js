@@ -14,8 +14,13 @@ export async function api(endpoint, options = {}) {
     let errMsg = `HTTP ${res.status}`;
     try {
       const errJson = await res.json();
+      // WriteError answers with {error:{type,message}}; some handlers may
+      // answer with a plain string error. An object handed to Error() would
+      // stringify to "[object Object]" and hide the actual message.
       if (errJson && errJson.error) {
-        errMsg = errJson.error;
+        errMsg = typeof errJson.error === 'string'
+          ? errJson.error
+          : (errJson.error.message || JSON.stringify(errJson.error));
       }
     } catch (_) {
       const text = await res.text().catch(() => '');

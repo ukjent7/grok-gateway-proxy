@@ -198,7 +198,7 @@ export function renderGatewayCards() {
   }
 
   const upstreams = (state.health && state.health.upstreams) || {};
-  const affinityModes = (state.config && state.config.session_affinity_modes) || ['openai', 'openrouter', 'off'];
+  const affinityModes = (state.config && state.config.session_affinity_modes) || ['openai', 'openrouter', 'opencode', 'off'];
 
   container.innerHTML = ids.map(id => {
     const gw = state.gateways[id] || {};
@@ -259,6 +259,7 @@ export function renderGatewayCards() {
             <div class="gw-card-left-actions">
               <button type="button" class="btn-ghost small gw-test-btn" title="立即向该网关发起一次连通探测">测试连通</button>
               ${gw.custom ? `<button type="button" class="btn-danger small gw-delete-btn" title="删除自定义网关">删除</button>` : ''}
+              <span class="gw-test-result"></span>
             </div>
             <button type="button" class="btn-primary small gw-save-btn" disabled>保存</button>
           </div>
@@ -282,7 +283,10 @@ export function renderGatewayCards() {
     const errEl = card.querySelector('.gw-card-error');
 
     const markDirty = () => {
-      if (saveBtn) saveBtn.disabled = false;
+      if (saveBtn) {
+        saveBtn.disabled = false;
+        saveBtn.classList.add('is-dirty');
+      }
     };
 
     const runProbe = async () => {
@@ -309,6 +313,7 @@ export function renderGatewayCards() {
     if (saveBtn) {
       saveBtn.addEventListener('click', async () => {
         saveBtn.disabled = true;
+        saveBtn.classList.remove('is-dirty');
         if (errEl) errEl.hidden = true;
         try {
           const forwardHeaders = (headersInput ? headersInput.value : '')
@@ -333,6 +338,7 @@ export function renderGatewayCards() {
           showToast(`网关 ${id} 配置已保存`, 'success');
         } catch (e) {
           saveBtn.disabled = false;
+          saveBtn.classList.add('is-dirty');
           if (errEl) {
             errEl.textContent = '保存失败: ' + e.message;
             errEl.hidden = false;
@@ -348,15 +354,20 @@ export function renderGatewayCards() {
         testBtn.disabled = true;
         const orig = testBtn.textContent;
         testBtn.textContent = '探测中…';
+        const resSlot = card.querySelector('.gw-test-result');
+        if (resSlot) resSlot.innerHTML = '';
         try {
           const probe = await runProbe();
           if (probe && probe.reachable) {
             showToast(`网关 ${id} 连通正常${probe.status ? ` (HTTP ${probe.status})` : ''}`, 'success', 2000);
+            if (resSlot) resSlot.innerHTML = `<span class="text-success">${probe.status ? 'HTTP ' + probe.status : '连通正常'}</span>`;
           } else {
             showToast(`网关 ${id} 探测失败: ${(probe && probe.error) || '上游不可达'}`, 'error', 4000);
+            if (resSlot) resSlot.innerHTML = `<span class="text-danger" title="${escapeHtml((probe && probe.error) || '不可达')}">${probe && probe.status ? 'HTTP ' + probe.status : '探测失败'}</span>`;
           }
         } catch (e) {
           showToast(`网关 ${id} 探测失败: ` + e.message, 'error');
+          if (resSlot) resSlot.innerHTML = `<span class="text-danger">异常</span>`;
         } finally {
           testBtn.disabled = false;
           testBtn.textContent = orig;

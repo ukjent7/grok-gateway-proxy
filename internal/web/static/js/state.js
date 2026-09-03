@@ -12,18 +12,16 @@ export const state = {
   range: '1h',
   metrics: null,
   metricsSig: '',
-  recentLogs: [],
-  recentSig: '',
+  activity: null,
+  activitySig: '',
+
   logs: [],
   logsTotal: 0,
+  logsSig: '',
   logsOffset: 0,
-  autoRefresh: Number(localStorage.getItem('grok_auto_refresh') || '15'),
-  autoRefreshTimer: null,
   drawerLogId: null,
   drawerLog: null,
-  drawerSection: 'request',
-  drawerMode: 'diff',
-  drawerSide: 'client',
+  drawerTab: 'request-diff',
   health: null,
 };
 

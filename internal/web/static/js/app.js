@@ -8,14 +8,13 @@
    ============================================================ */
 
 import { state, loadConfig } from './state.js';
-import { $, $all } from './utils.js';
+import { $, $all, copyText } from './utils.js';
 import { showToast, initTheme, showShortcutsModal } from './ui.js';
 import { loadOverview, initOverview } from './overview.js';
 import { initLogs, loadLogs } from './logs.js';
 import { initGateways, renderGatewayCards } from './gateways.js';
 import { initSetup, loadSetup } from './setup.js';
 import { initDrawer, closeDrawer, navigateDrawer } from './drawer.js';
-import { initCmdk, openCmdk, closeCmdk } from './cmdk.js';
 import { pollHealth } from './health.js';
 
 /* ---------------- 1. 视图切换 ---------------- */
@@ -34,16 +33,11 @@ export function switchView(view) {
   if (view === 'gateways') renderGatewayCards();
   if (view === 'setup') loadSetup();
 
-  closeCmdk();
   closeMobileSidebar();
 }
 
 $all('.rail-nav-item').forEach(btn => {
   btn.addEventListener('click', () => switchView(btn.dataset.view));
-});
-
-$all('[data-goto]').forEach(btn => {
-  btn.addEventListener('click', () => switchView(btn.dataset.goto));
 });
 
 export async function refreshAll() {
@@ -70,6 +64,16 @@ export async function refreshAll() {
 const refreshBtn = $('#refreshAllBtn');
 if (refreshBtn) refreshBtn.addEventListener('click', refreshAll);
 
+const addrChip = $('.addr-chip');
+if (addrChip) {
+  addrChip.addEventListener('click', async () => {
+    const raw = state.listenAddr || '127.0.0.1:8787';
+    const text = raw.startsWith('http://') || raw.startsWith('https://') ? raw : `http://${raw}`;
+    await copyText(text);
+    showToast(`已复制监听端点: ${text}`, 'success', 1500);
+  });
+}
+
 /* ---------------- 2. 移动端侧栏 ---------------- */
 
 function toggleMobileSidebar() {
@@ -94,67 +98,57 @@ if (mobileMenuBtn) mobileMenuBtn.addEventListener('click', toggleMobileSidebar);
 const mobileOverlay = $('#mobileRailOverlay');
 if (mobileOverlay) mobileOverlay.addEventListener('click', closeMobileSidebar);
 
-/* ---------------- 3. 自动轮询调度 ---------------- */
+/* ---------------- 3. 实时刷新（SSE 推送） ---------------- */
 
-function restartAutoRefresh() {
-  if (state.autoRefreshTimer) {
-    clearInterval(state.autoRefreshTimer);
-    state.autoRefreshTimer = null;
-  }
+// 数据/配置一变，服务端就从 /api/events 推一个 change 事件过来；
+// 这里做 250ms 收尾防抖，把一次请求风暴压成一次刷新。
+// EventSource 断线自动重连，后台标签页也照常收到事件。
+let changeDebounce = null;
 
-  const intervalSec = state.autoRefresh;
-  if (intervalSec <= 0) return;
-
-  state.autoRefreshTimer = setInterval(() => {
-    if (document.hidden) return;
+function onServerChange() {
+  clearTimeout(changeDebounce);
+  changeDebounce = setTimeout(async () => {
+    try {
+      await loadConfig();
+    } catch (_) { /* 配置读取失败不影响其余刷新 */ }
     if (state.activeView === 'overview') loadOverview();
     if (state.activeView === 'logs') loadLogs({ silent: true });
+    if (state.activeView === 'gateways' && !editingGatewayCards()) renderGatewayCards();
+    if (state.activeView === 'setup') loadSetup();
     pollHealth();
-  }, intervalSec * 1000);
+  }, 250);
 }
 
-function initAutoRefreshSelector() {
-  const sel = $('#autoRefreshSelect');
-  if (sel) {
-    sel.value = String(state.autoRefresh);
-    sel.addEventListener('change', () => {
-      state.autoRefresh = Number(sel.value);
-      localStorage.setItem('grok_auto_refresh', String(state.autoRefresh));
-      restartAutoRefresh();
-      showToast(state.autoRefresh > 0 ? `已开启自动刷新 (${state.autoRefresh}s)` : '已关闭自动刷新', 'info', 1600);
-    });
-  }
+// 用户正在网关卡片里输入时不要重绘，避免输入被清掉。
+function editingGatewayCards() {
+  const grid = document.getElementById('gatewayCards');
+  const active = document.activeElement;
+  return Boolean(grid && active && grid.contains(active));
+}
+
+function connectRealtime() {
+  const source = new EventSource('/api/events');
+  source.addEventListener('change', onServerChange);
+  // 网关健康状态由服务端后台探测，变化不一定伴随日志写入，
+  // 保留一个轻量健康轮询兜底。
+  setInterval(() => {
+    if (!document.hidden) pollHealth();
+  }, 30000);
 }
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) return;
-  if (state.activeView === 'overview') loadOverview();
   pollHealth();
 });
 
 /* ---------------- 4. 键盘全局快捷键 ---------------- */
 
 document.addEventListener('keydown', (e) => {
-  // 1. Cmd/Ctrl + K -> Command Palette
-  if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
-    e.preventDefault();
-    const cmdk = $('#cmdk');
-    if (cmdk && cmdk.classList.contains('is-open')) closeCmdk();
-    else openCmdk();
-    return;
-  }
-
-  // 2. Escape -> Close drawer / modals / cmdk
+  // Escape -> Close drawer / modals
   if (e.key === 'Escape') {
-    const cmdk = $('#cmdk');
-    if (cmdk && cmdk.classList.contains('is-open')) {
-      closeCmdk();
-      return;
-    }
     const drawer = $('#logDrawer');
     if (drawer && drawer.classList.contains('is-open')) {
       closeDrawer();
-      return;
     }
     return;
   }
@@ -165,7 +159,7 @@ document.addEventListener('keydown', (e) => {
 
   if (e.metaKey || e.ctrlKey || e.altKey) return;
 
-  // 3. Views switching
+  // Views switching
   if (e.key === '1') switchView('overview');
   else if (e.key === '2') switchView('logs');
   else if (e.key === '3') switchView('gateways');
@@ -199,7 +193,6 @@ if (shortcutsHelpBtn) {
 
 async function boot() {
   initTheme();
-  initAutoRefreshSelector();
 
   try {
     await loadConfig();
@@ -209,7 +202,7 @@ async function boot() {
   }
 
   pollHealth();
-  restartAutoRefresh();
+  connectRealtime();
 }
 
 // Initialize modules
@@ -218,6 +211,5 @@ initLogs();
 initGateways();
 initSetup();
 initDrawer();
-initCmdk({ switchView, refreshAll });
 
 boot();

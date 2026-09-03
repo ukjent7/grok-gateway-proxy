@@ -136,9 +136,10 @@ export function latencyThresholds(items) {
     .map(l => l.duration_ms)
     .sort((a, b) => a - b);
   if (latencies.length < 5) return { relative: false, slow: 2000 };
-  const p90Idx = Math.floor(latencies.length * 0.9);
-  const p90 = latencies[p90Idx] || 2000;
-  return { relative: true, slow: Math.max(800, p90) };
+  // 显著离群而非分位数：p90 在数学上必然把窗口内约 10% 的成功请求判为"慢"，
+  // 阈值只会永远报警。中位数×5（下限 2s）只抓真正偏离正常水平的调用。
+  const median = latencies[Math.floor(latencies.length / 2)];
+  return { relative: true, slow: Math.max(2000, median * 5) };
 }
 
 export function latencyClass(ms, thresholds) {
@@ -154,7 +155,7 @@ export function latencyClass(ms, thresholds) {
 
 export function latencyTitle(ms, thresholds) {
   if (!thresholds || !thresholds.relative) return fmtMs(ms);
-  if (ms >= thresholds.slow) return `${fmtMs(ms)} (超过 p90 阈值 ${fmtMs(thresholds.slow)})`;
+  if (ms >= thresholds.slow) return `${fmtMs(ms)} (超过慢请求阈值 ${fmtMs(thresholds.slow)})`;
   return fmtMs(ms);
 }
 

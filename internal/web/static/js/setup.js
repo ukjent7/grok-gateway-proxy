@@ -36,6 +36,13 @@ export async function loadSetup() {
     if (copyBtn) {
       copyBtn.addEventListener('click', async () => {
         await copyText(base);
+        const orig = copyBtn.textContent;
+        copyBtn.textContent = '已复制 ✓';
+        copyBtn.classList.add('text-success');
+        setTimeout(() => {
+          copyBtn.textContent = orig;
+          copyBtn.classList.remove('text-success');
+        }, 1500);
         showToast('已复制基础端点地址', 'success', 1200);
       });
     }
@@ -78,6 +85,13 @@ export async function loadSetup() {
       btn.addEventListener('click', async () => {
         const text = btn.dataset.snippet;
         await copyText(text);
+        const orig = btn.textContent;
+        btn.textContent = '已复制 ✓';
+        btn.classList.add('text-success');
+        setTimeout(() => {
+          btn.textContent = orig;
+          btn.classList.remove('text-success');
+        }, 1500);
         showToast('配置代码已复制到剪贴板', 'success', 1200);
       });
     });

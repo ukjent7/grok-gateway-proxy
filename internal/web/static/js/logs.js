@@ -123,14 +123,19 @@ function logRowHTML(l, thresholds) {
 }
 
 export async function loadLogs(reset = false) {
+  // Auto-refresh calls loadLogs({ silent: true }): the same full reset, but
+  // without the skeleton flash, without re-rendering unchanged data, and
+  // without failure toasts — the table keeps its last good state.
+  const silent = typeof reset === 'object' && reset !== null && reset.silent === true;
+  const isReset = Boolean(reset);
   const tbody = $('#logTableBody');
   const countEl = $('#logsCount');
   const loadMoreBtn = $('#logsLoadMoreBtn');
   if (!tbody) return;
 
-  if (reset) {
+  if (isReset) {
     state.logsOffset = 0;
-    tbody.innerHTML = renderSkeletons(10);
+    if (!silent) tbody.innerHTML = renderSkeletons(10);
   }
 
   const query = filterQuery({ offset: String(state.logsOffset) });
@@ -140,7 +145,12 @@ export async function loadLogs(reset = false) {
     const items = data.items || [];
     state.logsTotal = data.total || items.length;
 
-    if (reset) {
+    const sig = state.logsTotal + '|' +
+      items.map(l => `${l.id}:${l.success ? 1 : 0}:${l.duration_ms || 0}:${l.status_code || ''}`).join(',');
+    if (silent && sig === state.logsSig) return;
+    state.logsSig = sig;
+
+    if (isReset) {
       state.logs = items;
     } else {
       state.logs = [...(state.logs || []), ...items];
@@ -150,12 +160,26 @@ export async function loadLogs(reset = false) {
       tbody.innerHTML = `
         <tr>
           <td colspan="9" class="table-empty">
-            <div class="empty-state">
-              <span>无符合筛选条件的日志记录</span>
+            <div class="empty-state" style="padding: 42px 16px;">
+              <svg viewBox="0 0 48 48" width="42" height="42" fill="none" style="opacity: 0.45; margin-bottom: 4px;">
+                <circle cx="22" cy="22" r="14" stroke="currentColor" stroke-width="2"/>
+                <path d="m32 32 10 10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                <path d="M16 22h12M22 16v12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+              </svg>
+              <span style="font-weight: 600; font-size: 14px;">未匹配到符合条件的请求记录</span>
+              <span class="muted" style="font-size: 12px;">可尝试调整模型名称搜索词、清除起止时间限制或重置网关状态</span>
+              <button type="button" class="btn-ghost small" id="resetFiltersEmptyBtn" style="margin-top: 8px;">重置全部筛选条件</button>
             </div>
           </td>
         </tr>
       `;
+      const resetEmpty = $('#resetFiltersEmptyBtn', tbody);
+      if (resetEmpty) {
+        resetEmpty.addEventListener('click', () => {
+          const clearBtn = $('#filterClearBtn');
+          if (clearBtn) clearBtn.click();
+        });
+      }
       if (countEl) countEl.textContent = '共 0 条';
       if (loadMoreBtn) loadMoreBtn.style.display = 'none';
       return;
@@ -176,10 +200,10 @@ export async function loadLogs(reset = false) {
       loadMoreBtn.style.display = state.logs.length < state.logsTotal ? 'inline-block' : 'none';
     }
   } catch (e) {
-    if (reset) {
+    if (isReset && !silent) {
       tbody.innerHTML = `<tr><td colspan="9" class="table-empty text-danger">日志载入失败: ${escapeHtml(e.message)}</td></tr>`;
     }
-    showToast('日志载入失败: ' + e.message, 'error');
+    if (!silent) showToast('日志载入失败: ' + e.message, 'error');
   }
 }
 
@@ -286,18 +310,7 @@ export function initLogs() {
       if ($('#filterGateway')) $('#filterGateway').value = '';
       if ($('#filterModel')) $('#filterModel').value = '';
       if ($('#filterStatus')) $('#filterStatus').value = '';
-      $all('.quick-filter-pill').forEach(p => p.classList.toggle('is-active', p.dataset.status === ''));
       loadLogs(true);
     });
   }
-
-  // Quick filter pills
-  $all('.quick-filter-pill').forEach(pill => {
-    pill.addEventListener('click', () => {
-      $all('.quick-filter-pill').forEach(p => p.classList.toggle('is-active', p === pill));
-      const statusSel = $('#filterStatus');
-      if (statusSel) statusSel.value = pill.dataset.status;
-      loadLogs(true);
-    });
-  });
 }

@@ -4,14 +4,22 @@ import { $, escapeHtml } from './utils.js';
 
 /* ---------------- Toast 提示栈 ---------------- */
 
+const TOAST_ICONS = {
+  success: `<svg viewBox="0 0 16 16" width="14" height="14" fill="none"><circle cx="8" cy="8" r="7" stroke="currentColor" stroke-width="1.5"/><path d="m5 8 2 2 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+  error: `<svg viewBox="0 0 16 16" width="14" height="14" fill="none"><circle cx="8" cy="8" r="7" stroke="currentColor" stroke-width="1.5"/><path d="m5.5 5.5 5 5M10.5 5.5l-5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`,
+  warning: `<svg viewBox="0 0 16 16" width="14" height="14" fill="none"><path d="M8 2.2 1.5 13.5h13L8 2.2z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M8 6.5v3M8 11.5v.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`,
+  info: `<svg viewBox="0 0 16 16" width="14" height="14" fill="none"><circle cx="8" cy="8" r="7" stroke="currentColor" stroke-width="1.5"/><path d="M8 7v4M8 5v.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`
+};
+
 export function showToast(message, type = 'info', duration = 3000) {
   const stack = $('#toastStack');
   if (!stack) return;
 
   const toast = document.createElement('div');
   toast.className = `toast toast-${type}`;
+  const icon = TOAST_ICONS[type] || TOAST_ICONS.info;
   toast.innerHTML = `
-    <span class="toast-icon"></span>
+    <span class="toast-icon">${icon}</span>
     <span class="toast-msg">${escapeHtml(message)}</span>
     <button type="button" class="toast-close" aria-label="关闭">&times;</button>
   `;
@@ -71,6 +79,9 @@ export function confirmModal(title, message, onConfirm) {
 
   okBtn.onclick = handleOk;
   cancelBtn.onclick = close;
+  modal.onclick = (e) => {
+    if (e.target === modal) close();
+  };
 }
 
 /* ---------------- 主题切换 ---------------- */
@@ -102,19 +113,18 @@ export function showShortcutsModal() {
     modal.innerHTML = `
       <div class="modal shortcuts-modal" role="dialog" aria-modal="true">
         <div class="modal-head">
-          <h3>键盘快捷键帮助</h3>
+          <h3>键盘快捷键速查</h3>
           <button type="button" class="btn-icon" id="shortcutsCloseBtn">&times;</button>
         </div>
         <div class="shortcuts-list">
-          <div class="shortcut-row"><span>切换至运行总览</span><kbd>1</kbd></div>
-          <div class="shortcut-row"><span>切换至请求日志</span><kbd>2</kbd></div>
-          <div class="shortcut-row"><span>切换至网关配置</span><kbd>3</kbd></div>
-          <div class="shortcut-row"><span>切换至接入代码</span><kbd>4</kbd></div>
-          <div class="shortcut-row"><span>打开命令面板</span><kbd>⌘ K / Ctrl+K</kbd></div>
-          <div class="shortcut-row"><span>刷新全部数据</span><kbd>R</kbd></div>
-          <div class="shortcut-row"><span>抽屉上一条/下一条</span><kbd>J / K 或 [ / ]</kbd></div>
-          <div class="shortcut-row"><span>关闭抽屉 / 弹窗</span><kbd>Esc</kbd></div>
-          <div class="shortcut-row"><span>查看本快捷键帮助</span><kbd>?</kbd></div>
+          <div class="shortcut-row"><span>切换至 运行总览</span><kbd>1</kbd></div>
+          <div class="shortcut-row"><span>切换至 请求日志</span><kbd>2</kbd></div>
+          <div class="shortcut-row"><span>切换至 网关配置</span><kbd>3</kbd></div>
+          <div class="shortcut-row"><span>切换至 接入代码</span><kbd>4</kbd></div>
+          <div class="shortcut-row"><span>刷新全部数据与连通状态</span><kbd>R</kbd></div>
+          <div class="shortcut-row"><span>抽屉 上一条 / 下一条请求</span><kbd>J / K 或 [ / ]</kbd></div>
+          <div class="shortcut-row"><span>关闭详情抽屉或弹窗</span><kbd>Esc</kbd></div>
+          <div class="shortcut-row"><span>查看本快捷键速查</span><kbd>?</kbd></div>
         </div>
       </div>
     `;
