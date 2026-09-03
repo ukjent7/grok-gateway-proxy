@@ -1430,4 +1430,3 @@ func TestProxyOpenCodeBaseURLInjectsSessionHeader(t *testing.T) {
 		t.Fatalf("User-Agent = %q, want grok UA preserved", gotUA)
 	}
 }
-

@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,7 +11,6 @@ import (
 
 	"grok-gateway-proxy/internal/config"
 	"grok-gateway-proxy/internal/store"
-	"log/slog"
 )
 
 func TestOpenAICompatibleTransformsResponsesToChat(t *testing.T) {

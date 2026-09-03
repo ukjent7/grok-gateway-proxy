@@ -165,9 +165,10 @@ func TestProxyEndToEndHeaderAndBodySimulation(t *testing.T) {
 			req.Header.Set("X-Grok-Turn-Idx", "3")
 
 			// /anth 与 /oaic 只收各自的路径
-			if tc.gatewayID == "anth" {
+			switch tc.gatewayID {
+			case "anth":
 				req.URL.Path = "/anth/v1/messages"
-			} else if tc.gatewayID == "oaic" {
+			case "oaic":
 				req.URL.Path = "/oaic/chat/completions"
 			}
 
